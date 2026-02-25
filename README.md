@@ -140,7 +140,8 @@ That is the only change needed to avoid the MPS NMS crash.
 ### Optional — Verify installation
 
 ```bash
-python -c "import torch; print('torch', torch.__version__, 'mps', torch.backends.mps.is_available())"
+# Torch + device availability
+python -c "import torch; print('torch', torch.__version__); print('cuda available:', torch.cuda.is_available()); print('mps available:', hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()); print('device count (cuda):', torch.cuda.device_count() if torch.cuda.is_available() else 0)"
 python -c "import mmcv; print('mmcv', mmcv.__version__)"
 python -c "import mmdet; print('mmdet', mmdet.__version__)"
 python -c "import mmpose; print('mmpose', mmpose.__version__)"
