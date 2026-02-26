@@ -6,7 +6,58 @@ from shapely.geometry import Polygon, Point, LineString
 from typing import List, Tuple, Dict, Optional, Any, Iterable, Union
 import math
 from shapely.ops import nearest_points
+from shapely.errors import GEOSException
 
+
+# --- Helper: safe_intersection robust to TopologyException ---
+def safe_intersection(a, b):
+    """Return a.intersection(b) but robust to invalid geometries (TopologyException).
+
+    Falls back to repairing inputs via buffer(0) and retrying.
+    """
+    if a is None or b is None:
+        return None
+
+    try:
+        return a.intersection(b)
+    except GEOSException:
+        # Attempt repair and retry. buffer(0) is a common "make valid" workaround.
+        try:
+            a2 = a.buffer(0)
+            b2 = b.buffer(0)
+            if a2.is_empty or b2.is_empty:
+                # Intersection with an empty geometry is empty.
+                return a2.intersection(b2)
+            return a2.intersection(b2)
+        except GEOSException:
+            # Still failing after repair
+            return None
+        except Exception:
+            return None
+        
+# --- Helper: safe_union robust to TopologyException ---
+def safe_union(a, b):
+    """Return a.union(b) but robust to invalid geometries (TopologyException).
+
+    Falls back to repairing inputs via buffer(0) and retrying.
+    """
+    if a is None or b is None:
+        return None
+    try:
+        return a.union(b)
+    except GEOSException:
+        try:
+            a2 = a.buffer(0)
+            b2 = b.buffer(0)
+            if a2.is_empty and b2.is_empty:
+                return a2  # empty
+            if a2.is_empty:
+                return b2
+            if b2.is_empty:
+                return a2
+            return a2.union(b2)
+        except Exception:
+            return None
 
 # ----------------------------------------------------------------------
 # Configurable Halpe26 face keypoint indices (defaults)
@@ -77,7 +128,7 @@ def compute_gaze_vector(keypoints: np.ndarray) -> Optional[Tuple[np.ndarray, np.
         3. Normalize the direction vector to unit length.
     """
     # Validate input shape
-    if keypoints.ndim != 2 or keypoints.shape[0] != 26 or keypoints.shape[1] < 2:
+    if keypoints.ndim != 2 or keypoints.shape[0] != 26 or keypoints.shape[1] < 3:
         return None
 
     def is_valid(idx: int) -> bool:
@@ -123,111 +174,6 @@ def compute_gaze_vector(keypoints: np.ndarray) -> Optional[Tuple[np.ndarray, np.
 
     return origin, direction
 
-
-# --- detect_enemy_fall ---
-def detect_enemy_fall(
-    tracker_output,
-    *,
-    enemy_ids: Optional[List[int]] = None,
-    threshold: float = 0.5,
-    px_tol: float = 10.0,
-    avg_window: int = 5,
-    conf_threshold: float = 0.3,
-    only_torso_and_below: bool = True
-) -> Dict[int, Optional[int]]:
-    """
-    Detect the first frame in which each enemy in `enemy_ids` is considered fallen.
-
-    Args:
-        tracker_output (list): List of frame dicts with 'frame' and 'objects'.
-        enemy_ids (List[int] or None): list of enemy track IDs. If None, defaults to [99].
-        threshold (float): Fraction of keypoints that must match reference pose.
-        px_tol (float): Pixel tolerance for keypoint matching.
-        avg_window (int): Number of frames to average for reference pose.
-        conf_threshold (float): Confidence threshold to consider a keypoint valid.
-        only_torso_and_below (bool): If True, restrict comparison to lower‑body keypoints.
-
-    Returns:
-        Dict[int, Optional[int]]: { enemy_id: fall_frame or None }
-    """
-    if enemy_ids is None:
-        enemy_ids = [99]
-
-    # Halpe26 indices ...
-    lower_indices = {
-        11, 12, 19,       # hips
-        13, 14,           # knees
-        15, 16,           # ankles
-        20, 21,           # big toes
-        22, 23,           # small toes
-        24, 25            # heels
-    }
-
-    # Sort frames chronologically
-    frames = sorted(tracker_output, key=lambda x: x['frame'])
-
-    # Locate solitary starts per enemy
-    solitary_starts: Dict[int, Optional[int]] = {}
-    for eid in enemy_ids:
-        last_multi_idx = None
-        for i, frame_data in enumerate(frames):
-            if len(frame_data.get('objects', [])) > 1:
-                last_multi_idx = i
-        if last_multi_idx is not None and last_multi_idx + 1 < len(frames):
-            solitary_starts[eid] = frames[last_multi_idx + 1]['frame']
-        else:
-            solitary_starts[eid] = None
-
-    fall_frames: Dict[int, Optional[int]] = {eid: None for eid in enemy_ids}
-
-    # Build reference poses and detect fall per enemy
-    for eid in enemy_ids:
-        start = solitary_starts[eid]
-        if start is None:
-            continue
-
-        # Build reference pose average
-        ref_kps = []
-        ref_scores = []
-        for fr in range(start, start + avg_window):
-            fd = next((f for f in frames if f['frame'] == fr), None)
-            if not fd:
-                continue
-            eo = next((o for o in fd['objects'] if o.get('id') == eid), None)
-            if eo and eo.get('keypoints'):
-                ref_kps.append(np.array(eo['keypoints']))
-                ref_scores.append(np.array(eo.get('keypoint_scores', [])))
-
-        if len(ref_kps) < avg_window:
-            continue  # insufficient data
-
-        ref_pose  = np.mean(np.stack(ref_kps),  axis=0)  # (26,2)
-        ref_score = np.mean(np.stack(ref_scores), axis=0)  # (26,)
-
-        conf_mask = ref_score >= conf_threshold
-        if only_torso_and_below:
-            torso_mask = np.array([i in lower_indices for i in range(ref_score.shape[0])])
-            conf_mask = conf_mask & torso_mask
-
-        num_conf = int(conf_mask.sum())
-        if num_conf == 0:
-            continue
-
-        # Scan all frames for first match
-        for fd in frames:
-            eo = next((o for o in fd.get('objects', []) if o.get('id') == eid), None)
-            if not eo or not eo.get('keypoints'):
-                continue
-            kps = np.array(eo['keypoints'])
-            if kps.shape != ref_pose.shape:
-                continue
-            dists = np.linalg.norm(kps - ref_pose, axis=1)
-            match_frac = (dists[conf_mask] <= px_tol).sum() / num_conf
-            if match_frac >= threshold:
-                fall_frames[eid] = fd['frame']
-                break
-
-    return fall_frames
 
 
 def annotate_camera_video(raw_frames: List[np.ndarray],
@@ -432,76 +378,6 @@ def annotate_camera_with_gaze_triangle(raw_frames: List[np.ndarray],
             # Blend the triangle overlay onto the frame
             cv2.addWeighted(tri_overlay, alpha, frame, 1.0, 0, dst=frame)
 
-
-        writer.write(frame)
-
-    writer.release()
-
-
-def annotate_fall_video(raw_frames: List[np.ndarray],
-                        tracker_output: List[Dict],
-                        fall_frames: Dict[int, Optional[int]] = None,
-                        frame_rate: int = 30,
-                        output_directory: str = "",
-                        video_basename: str = "",
-                        enemy_ids: List[int] = None):
-    """
-    Generate a video showing bounding boxes and IDs, and label 'FALLEN!' when the enemy falls.
-    Only saved if fall_frames is not None.
-    - raw_frames: list of original video frames (np.ndarray), indexed by frame number starting at 1
-    - tracker_output: list of dicts {'frame': int, 'objects': [{'id', 'bbox'}]}
-    - fall_frames: dict mapping enemy_id to fall_frame (frame index at which the enemy is considered fallen)
-    - frame_rate: frames per second for output video
-    - output_directory: directory to save the video
-    - video_basename: base name of the video files
-    - enemy_ids: list of enemy track IDs (default [99])
-    """
-    if fall_frames is None:
-        return
-    if enemy_ids is None:
-        enemy_ids = [99]
-
-    predefined_colors = [
-        (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
-        (255, 0, 255), (0, 255, 255),
-        (128, 0, 0), (0, 128, 0), (0, 0, 128), (128, 128, 0),
-        (128, 0, 128), (0, 128, 128)
-    ]
-    track_colors: Dict[int, Tuple[int, int, int]] = {}
-
-    video_path = os.path.join(output_directory, f"{video_basename}_FallTracking.mp4")
-    height, width = raw_frames[0].shape[:2]
-    writer = cv2.VideoWriter(
-        video_path,
-        cv2.VideoWriter_fourcc(*"avc1"),
-        frame_rate,
-        (width, height)
-    )
-
-    for frame_data in tracker_output:
-        idx = frame_data["frame"] - 1
-        frame = raw_frames[idx].copy()
-
-        for obj in frame_data["objects"]:
-            trk_id = obj["id"]
-            x1, y1, x2, y2 = obj["bbox"]
-            color = (255, 255, 255) if trk_id in enemy_ids else track_colors.setdefault(trk_id, predefined_colors[trk_id % len(predefined_colors)])
-            # Draw bounding box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-            # Draw ID label
-            id_text = "ID: Enemy" if trk_id in enemy_ids else f"ID: {trk_id}"
-            (id_w, id_h), _ = cv2.getTextSize(id_text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 3)
-            cv2.putText(frame, id_text, (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 3)
-            # Overlay "FALLEN!" if past fall_frame and is enemy
-            if (trk_id in enemy_ids and
-                fall_frames.get(trk_id) is not None and
-                frame_data["frame"] >= fall_frames[trk_id]):
-                fallen_text = "FALLEN!"
-                fallen_x = x1 + id_w + 10
-                fallen_y = y1 - 10
-                cv2.putText(frame, fallen_text, (fallen_x, fallen_y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 3)
 
         writer.write(frame)
 
@@ -980,19 +856,6 @@ def save_gaze_cache(gaze_info: Dict[Tuple[int, int], Tuple[float, float, float, 
             f.write(f"{frm},{tid},{ox},{oy},{dx},{dy}\n")
 
 
-# --- Helper function: save_enemy_fall_cache ---
-def save_enemy_fall_cache(fall_frames: Dict[int, Optional[int]],
-                          output_directory: str,
-                          video_basename: str):
-    """
-    Save enemy fall frame cache.
-    """
-    cache_path = os.path.join(output_directory, f"{video_basename}_EnemyFallCache.txt")
-    with open(cache_path, "w") as f:
-        f.write("enemy_id,fall_frame\n")
-        for eid, ff in fall_frames.items():
-            f.write(f"{eid},{ff if ff is not None else ''}\n")
-
 
 # --- Helper: compute_threat_clearance ---------------------------------------
 
@@ -1348,11 +1211,8 @@ def annotate_map_with_gaze(
                 tri_map_pts = [(float(pt[0]), float(pt[1])) for pt in tri_map]
 
                 tri_polygon = Polygon(tri_map_pts)
-                clipped = tri_polygon.intersection(room_polygon)
-                if clipped.is_empty:
-                    continue
-
-                if clipped.is_empty:
+                clipped = safe_intersection(tri_polygon, room_polygon)
+                if clipped is None or clipped.is_empty:
                     continue
                 # Handle Polygon and collections of polygons
                 if isinstance(clipped, Polygon):
@@ -1412,11 +1272,8 @@ def annotate_map_with_gaze(
                 tri_map_pts_int = [(int(pt[0]), int(pt[1])) for pt in tri_map]
 
                 tri_polygon = Polygon(tri_map_pts_int)
-                clipped = tri_polygon.intersection(room_polygon)
-                if clipped.is_empty:
-                    continue
-
-                if clipped.is_empty:
+                clipped = safe_intersection(tri_polygon, room_polygon)
+                if clipped is None or clipped.is_empty:
                     continue
                 if isinstance(clipped, Polygon):
                     polys = [clipped]
@@ -1520,11 +1377,8 @@ def annotate_map_with_gaze(
             tri_map_pts = [(float(pt[0]), float(pt[1])) for pt in tri_map]
 
             tri_polygon = Polygon(tri_map_pts)
-            clipped = tri_polygon.intersection(room_polygon)
-            if clipped.is_empty:
-                continue
-
-            if clipped.is_empty:
+            clipped = safe_intersection(tri_polygon, room_polygon)
+            if clipped is None or clipped.is_empty:
                 continue
             if isinstance(clipped, Polygon):
                 polys = [clipped]
@@ -1797,8 +1651,8 @@ def compute_room_coverage(
             tri_pts = [(float(pt[0]), float(pt[1])) for pt in tri_map]
 
             tri_polygon = Polygon(tri_pts)
-            clipped = tri_polygon.intersection(room_polygon)
-            if clipped.is_empty:
+            clipped = safe_intersection(tri_polygon, room_polygon)
+            if clipped is None or clipped.is_empty:
                 continue
 
             # Rasterize clipped polygon into a temporary mask, then OR it into covered_mask
@@ -2161,11 +2015,17 @@ def dynamic_pod_working_areas(
         fidx = frame_entry["frame"]
 
         # ---- 1. Build enemy polygons in map space --------------------
-        enemy_polys: List[Polygon] = [
-            _bbox_to_map_polygon(tuple(obj["bbox"]), pixel_mapper)
-            for obj in frame_entry["objects"]
-            if obj["id"] in enemy_ids
-        ]
+        enemy_polys: List[Polygon] = []
+        for obj in frame_entry["objects"]:
+            if obj["id"] not in enemy_ids:
+                continue
+            ep = _bbox_to_map_polygon(tuple(obj["bbox"]), pixel_mapper)
+            # pre-repair to reduce GEOS topology failures later
+            try:
+                ep = ep.buffer(0)
+            except Exception:
+                pass
+            enemy_polys.append(ep)
 
         # ---- 2. Assign each enemy polygon to PODs based on overlap fraction ---
         blocked_by: Dict[int, List[Polygon]] = {idx: [] for idx in pod_circles}
@@ -2174,7 +2034,8 @@ def dynamic_pod_working_areas(
             fracs = []
             for idx, circle in pod_circles.items():
                 if circle.intersects(epoly):
-                    raw_area = circle.intersection(epoly).area
+                    clipped = safe_intersection(circle, epoly)
+                    raw_area = 0.0 if (clipped is None or clipped.is_empty) else float(clipped.area)
                     frac = raw_area / pod_circle_areas[idx]
                     fracs.append((idx, frac))
             if not fracs:
@@ -2202,10 +2063,21 @@ def dynamic_pod_working_areas(
                     adjusted = shift_down
 
                 # Union with enemy polygon, then clip to room boundary
-                adjusted = adjusted.union(epoly).intersection(boundary)
+                # Union with enemy polygon, then clip to room boundary (robust)
+                tmp = safe_union(adjusted, epoly)
+                if tmp is None or tmp.is_empty:
+                    tmp = adjusted
+
+                tmp2 = safe_intersection(tmp, boundary)
+                if tmp2 is not None and not tmp2.is_empty:
+                    adjusted = tmp2
+                else:
+                    adjusted = tmp
 
             # Ensure final area respects the boundary even if there was no enemy
-            adjusted = adjusted.intersection(boundary)
+            tmp2 = safe_intersection(adjusted, boundary)
+            if tmp2 is not None and not tmp2.is_empty:
+                adjusted = tmp2
             pod_polys_this_frame[pod_idx] = adjusted
 
         dynamic_map[fidx] = pod_polys_this_frame

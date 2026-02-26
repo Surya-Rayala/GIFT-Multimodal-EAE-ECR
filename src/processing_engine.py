@@ -23,10 +23,8 @@ from shapely.ops import nearest_points
 from src.helper_functions import (
     initialize_keypoint_indices,
     compute_gaze_vector,
-    detect_enemy_fall,
     annotate_camera_video,
     annotate_camera_with_gaze_triangle,
-    annotate_fall_video,
     annotate_clearance_video,
     annotate_camera_tracking_with_clearance,
     annotate_map_video,
@@ -35,7 +33,6 @@ from src.helper_functions import (
     annotate_map_with_gaze,
     save_position_cache,
     save_gaze_cache,
-    save_enemy_fall_cache,
     compute_threat_clearance,
     save_threat_clearance_cache,
     compute_room_coverage,
@@ -383,11 +380,10 @@ class ProcessingEngine:
                 all_map_points.append([frame_num, idx, mx, my])
 
         # ---- Post‑processing: caches and videos ----
-        fall_frames = detect_enemy_fall(tracker_output, enemy_ids=enemy_ids)
+        fall_frames = None  # fall detection disabled
 
         save_position_cache(all_map_points, self.output_directory, self.video_basename)
         save_gaze_cache(gaze_info, self.output_directory, self.video_basename)
-        save_enemy_fall_cache(fall_frames, self.output_directory, self.video_basename)
 
         # Disabled: not saving this artifact for now
 #         annotate_camera_video(
@@ -450,15 +446,6 @@ class ProcessingEngine:
             )
             save_room_coverage_cache(coverage_data, self.output_directory, self.video_basename)
         # Disabled: not saving this artifact for now
-#         annotate_fall_video(
-#             raw_frames,
-#             tracker_output,
-#             fall_frames,
-#             config["frame_rate"],
-#             self.output_directory,
-#             self.video_basename,
-#             enemy_ids=enemy_ids
-#         )
         
 
         # Persist full tracker output for debugging / downstream analysis
