@@ -30,6 +30,7 @@ dependencies:
   - torchvision
 
   - pip:
+    - platformdirs
     - openmim
     - imutils
     - filterpy

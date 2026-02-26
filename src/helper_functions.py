@@ -8,6 +8,24 @@ import math
 from shapely.ops import nearest_points
 from shapely.errors import GEOSException
 
+# ----------------------------------------------------------------------
+# PixelMapper safety helpers (new robust mapper may return NaNs or shapes like (1,2))
+# ----------------------------------------------------------------------
+
+def _pm_xy(pixel_mapper, pt) -> Optional[Tuple[float, float]]:
+    """Robustly get a finite (x,y) from pixel_mapper.pixel_to_map for a single point.
+    Returns None if output is missing/invalid/non-finite.
+    """
+    if pixel_mapper is None:
+        return None
+    try:
+        xy = pixel_mapper.pixel_to_map(pt)
+    except Exception:
+        return None
+    xy = np.asarray(xy, dtype=float).reshape(-1)
+    if xy.size < 2 or (not np.isfinite(xy[:2]).all()):
+        return None
+    return float(xy[0]), float(xy[1])
 
 # --- Helper: safe_intersection robust to TopologyException ---
 def safe_intersection(a, b):
@@ -217,7 +235,7 @@ def annotate_camera_video(raw_frames: List[np.ndarray],
     track_colors: Dict[int, Tuple[int, int, int]] = {}
 
     # Prepare output writer
-    video_path = os.path.join(output_directory, f"{video_basename}_Tracking.mp4")
+    video_path = os.path.join(output_directory, f"{video_basename}_Tracking_Overlays.mp4")
     height, width = raw_frames[0].shape[:2]
     writer = cv2.VideoWriter(
         video_path,
@@ -317,7 +335,7 @@ def annotate_camera_with_gaze_triangle(raw_frames: List[np.ndarray],
         enemy_ids = [99]
 
     # Prepare output writer
-    video_path = os.path.join(output_directory, f"{video_basename}_GazeTracking.mp4")
+    video_path = os.path.join(output_directory, f"{video_basename}_Gaze_Triangles.mp4")
     height, width = raw_frames[0].shape[:2]
     writer = cv2.VideoWriter(
         video_path,
@@ -415,7 +433,7 @@ def annotate_clearance_video(raw_frames: List[np.ndarray],
     track_colors: Dict[int, Tuple[int, int, int]] = {}
 
     # Prepare output writer
-    video_path = os.path.join(output_directory, f"{video_basename}_ClearanceTracking.mp4")
+    video_path = os.path.join(output_directory, f"{video_basename}_Clearance_Callouts.mp4")
     height, width = raw_frames[0].shape[:2]
     writer = cv2.VideoWriter(
         video_path,
@@ -487,7 +505,7 @@ def annotate_map_video(map_image: np.ndarray,
     """
     if enemy_ids is None:
         enemy_ids = [99]
-    map_out = os.path.join(output_directory, f"{video_basename}_MapTracking.mp4")
+    map_out = os.path.join(output_directory, f"{video_basename}_Tracking_Map.mp4")
     h, w = map_image.shape[:2]
     writer = cv2.VideoWriter(
         map_out,
@@ -634,7 +652,7 @@ def annotate_map_pod_video(
 
     # Prepare writer
     os.makedirs(output_directory, exist_ok=True)
-    out_path = os.path.join(output_directory, f"{video_basename}_PodAreas.mp4")
+    out_path = os.path.join(output_directory, f"{video_basename}_Tracking_PodAreas.mp4")
     h, w = map_image.shape[:2]
     writer = cv2.VideoWriter(
         out_path,
@@ -760,7 +778,7 @@ def annotate_map_pod_with_paths_video(
 
     # --- Prepare writer ---
     os.makedirs(output_directory, exist_ok=True)
-    out_path = os.path.join(output_directory, f"{video_basename}_PodAreasWithTrails.mp4")
+    out_path = os.path.join(output_directory, f"{video_basename}_Tracking_PodAreasWithTrails.mp4")
     h, w = map_image.shape[:2]
     writer = cv2.VideoWriter(
         out_path,
@@ -1137,7 +1155,12 @@ def annotate_map_with_gaze(
     """
     if enemy_ids is None:
         enemy_ids = [99]
-
+        
+    # Index gaze info by frame for efficiency (avoids O(frames * len(gaze_info)))
+    gaze_by_frame: Dict[int, List[Tuple[int, Tuple[float, float, float, float]]]] = {}
+    for (fidx, tid), g in gaze_info.items():
+        gaze_by_frame.setdefault(fidx, []).append((tid, g))
+        
     # --- ACCUMULATED‐CLEAR MODE (translucent blurred black + per‐frame triangles) ---
     if accumulated_clear:
         # Build room polygon for clipping & determine max_frame
@@ -1152,7 +1175,7 @@ def annotate_map_with_gaze(
 
         # Create output folder and VideoWriter
         os.makedirs(output_directory, exist_ok=True)
-        video_path = os.path.join(output_directory, f"{video_basename}_GazeMapCleared.mp4")
+        video_path = os.path.join(output_directory, f"{video_basename}_Gaze_MapCleared.mp4")
         map_h, map_w = map_image.shape[:2]
         writer = cv2.VideoWriter(
             video_path,
@@ -1189,16 +1212,18 @@ def annotate_map_with_gaze(
         # Iterate through each frame index
         for frame_idx in range(1, max_frame + 1):
             # Accumulate covered pixels for this frame
-            for (fidx, trk_id), (ox_px, oy_px, dx, dy) in gaze_info.items():
-                if fidx != frame_idx:
-                    continue
+            for trk_id, (ox_px, oy_px, dx, dy) in gaze_by_frame.get(frame_idx, []):
                 if trk_id in enemy_ids:
                     continue
 
                 # Convert origin + direction into map-space
-                o_map_x, o_map_y = pixel_mapper.pixel_to_map((ox_px, oy_px))
+                o_xy = _pm_xy(pixel_mapper, (ox_px, oy_px))
                 ref_px = (ox_px + dx, oy_px + dy)
-                ref_map_x, ref_map_y = pixel_mapper.pixel_to_map(ref_px)
+                ref_xy = _pm_xy(pixel_mapper, ref_px)
+                if o_xy is None or ref_xy is None:
+                    continue
+                o_map_x, o_map_y = o_xy
+                ref_map_x, ref_map_y = ref_xy
 
                 dir_map = np.array([ref_map_x - o_map_x, ref_map_y - o_map_y], dtype=np.float32)
                 norm_dir = np.linalg.norm(dir_map)
@@ -1243,9 +1268,7 @@ def annotate_map_with_gaze(
             visible_frame[mask_uncovered_3ch.astype(bool)] = blend[mask_uncovered_3ch.astype(bool)]
 
             # Draw this frame's gaze triangles on top (blended/transparent)
-            for (fidx, trk_id), (ox_px, oy_px, dx, dy) in gaze_info.items():
-                if fidx != frame_idx:
-                    continue
+            for trk_id, (ox_px, oy_px, dx, dy) in gaze_by_frame.get(frame_idx, []):
                 if trk_id in enemy_ids and not show_enemy_gaze:
                     continue
 
@@ -1257,9 +1280,13 @@ def annotate_map_with_gaze(
                         predefined_colors[trk_id % len(predefined_colors)]
                     )
 
-                o_map_x, o_map_y = pixel_mapper.pixel_to_map((ox_px, oy_px))
+                o_xy = _pm_xy(pixel_mapper, (ox_px, oy_px))
                 ref_px = (ox_px + dx, oy_px + dy)
-                ref_map_x, ref_map_y = pixel_mapper.pixel_to_map(ref_px)
+                ref_xy = _pm_xy(pixel_mapper, ref_px)
+                if o_xy is None or ref_xy is None:
+                    continue
+                o_map_x, o_map_y = o_xy
+                ref_map_x, ref_map_y = ref_xy
 
                 dir_map = np.array([ref_map_x - o_map_x, ref_map_y - o_map_y], dtype=np.float32)
                 norm_dir_map = np.linalg.norm(dir_map)
@@ -1329,7 +1356,7 @@ def annotate_map_with_gaze(
 
     # Create VideoWriter for normal mode
     os.makedirs(output_directory, exist_ok=True)
-    video_path = os.path.join(output_directory, f"{video_basename}_GazeMap.mp4")
+    video_path = os.path.join(output_directory, f"{video_basename}_Gaze_Map.mp4")
     map_h, map_w = map_image.shape[:2]
     writer = cv2.VideoWriter(
         video_path,
@@ -1349,9 +1376,7 @@ def annotate_map_with_gaze(
     # Iterate frames and draw translucent cones
     for frame_idx in range(1, max_frame + 1):
         base_map = map_image.copy()
-        for (fidx, trk_id), (ox_px, oy_px, dx, dy) in gaze_info.items():
-            if fidx != frame_idx:
-                continue
+        for trk_id, (ox_px, oy_px, dx, dy) in gaze_by_frame.get(frame_idx, []):
             if trk_id in enemy_ids and not show_enemy_gaze:
                 continue
 
@@ -1363,9 +1388,14 @@ def annotate_map_with_gaze(
                     predefined_colors[trk_id % len(predefined_colors)]
                 )
 
-            o_map_x, o_map_y = pixel_mapper.pixel_to_map((ox_px, oy_px))
+            o_xy = _pm_xy(pixel_mapper, (ox_px, oy_px))
             ref_px = (ox_px + dx, oy_px + dy)
-            ref_map_x, ref_map_y = pixel_mapper.pixel_to_map(ref_px)
+            ref_xy = _pm_xy(pixel_mapper, ref_px)
+            if o_xy is None or ref_xy is None:
+                continue
+            o_map_x, o_map_y = o_xy
+            ref_map_x, ref_map_y = ref_xy
+            
             dir_map = np.array([ref_map_x - o_map_x, ref_map_y - o_map_y], dtype=np.float32)
             norm_dir_map = np.linalg.norm(dir_map)
             if norm_dir_map == 0:
@@ -1455,7 +1485,7 @@ def annotate_camera_tracking_with_clearance(raw_frames: List[np.ndarray],
 
     # Prepare writer
     os.makedirs(output_directory, exist_ok=True)
-    video_path = os.path.join(output_directory, f"{video_basename}_TrackingWithClearance.mp4")
+    video_path = os.path.join(output_directory, f"{video_basename}_Tracking_WithClearance.mp4")
     height, width = raw_frames[0].shape[:2]
     writer = cv2.VideoWriter(
         video_path,
@@ -1583,7 +1613,11 @@ def compute_room_coverage(
     """
     if enemy_ids is None:
         enemy_ids = [99]
-
+    # Index gaze info by frame for efficiency
+    gaze_by_frame: Dict[int, List[Tuple[int, Tuple[float, float, float, float]]]] = {}
+    for (fidx, tid), g in gaze_info.items():
+        gaze_by_frame.setdefault(fidx, []).append((tid, g))
+        
     # 1) Build the room polygon and binary room_mask
     map_h, map_w = map_image.shape[:2]
     room_polygon = Polygon(room_boundary_coords)
@@ -1628,16 +1662,18 @@ def compute_room_coverage(
     # 6) Iterate frame by frame
     for frame_idx in range(1, max_frame + 1):
         # a) For this frame, accumulate all gaze cones from non-enemy tracks
-        for (fidx, trk_id), (ox_px, oy_px, dx, dy) in gaze_info.items():
-            if fidx != frame_idx:
-                continue
+        for trk_id, (ox_px, oy_px, dx, dy) in gaze_by_frame.get(frame_idx, []):
             if trk_id in enemy_ids:
                 continue
 
             # Convert pixel origin + direction → map-space
-            o_map_x, o_map_y = pixel_mapper.pixel_to_map((ox_px, oy_px))
+            o_xy = _pm_xy(pixel_mapper, (ox_px, oy_px))
             ref_px = (ox_px + dx, oy_px + dy)
-            ref_map_x, ref_map_y = pixel_mapper.pixel_to_map(ref_px)
+            ref_xy = _pm_xy(pixel_mapper, ref_px)
+            if o_xy is None or ref_xy is None:
+                continue
+            o_map_x, o_map_y = o_xy
+            ref_map_x, ref_map_y = ref_xy
 
             dir_map = np.array([ref_map_x - o_map_x, ref_map_y - o_map_y], dtype=np.float32)
             norm_dir = np.linalg.norm(dir_map)
@@ -1960,16 +1996,19 @@ def compute_pod_working_areas(
 
 def _bbox_to_map_polygon(bbox_px: Tuple[int, int, int, int],
                          pixel_mapper) -> Polygon:
-    """
-    Convert a bbox in pixel space (x1,y1,x2,y2) to a shapely Polygon
-    in **map coordinates** using `pixel_mapper.pixel_to_map`.
-    """
-    x1, y1, x2, y2 = bbox_px
-    p1 = pixel_mapper.pixel_to_map((x1, y1))
-    p2 = pixel_mapper.pixel_to_map((x2, y1))
-    p3 = pixel_mapper.pixel_to_map((x2, y2))
-    p4 = pixel_mapper.pixel_to_map((x1, y2))
-    return Polygon([p1, p2, p3, p4])
+        """Convert a bbox in pixel space (x1,y1,x2,y2) to a shapely Polygon in map coords.
+
+        Uses the robust `_pm_xy` wrapper to tolerate NaNs / odd shapes from the mapper.
+        Returns an empty Polygon() if any corner mapping is invalid.
+        """
+        x1, y1, x2, y2 = bbox_px
+        p1 = _pm_xy(pixel_mapper, (x1, y1))
+        p2 = _pm_xy(pixel_mapper, (x2, y1))
+        p3 = _pm_xy(pixel_mapper, (x2, y2))
+        p4 = _pm_xy(pixel_mapper, (x1, y2))
+        if any(p is None for p in (p1, p2, p3, p4)):
+            return Polygon()
+        return Polygon([p1, p2, p3, p4])
 
 
 def dynamic_pod_working_areas(
@@ -2020,6 +2059,8 @@ def dynamic_pod_working_areas(
             if obj["id"] not in enemy_ids:
                 continue
             ep = _bbox_to_map_polygon(tuple(obj["bbox"]), pixel_mapper)
+            if ep.is_empty:
+                continue
             # pre-repair to reduce GEOS topology failures later
             try:
                 ep = ep.buffer(0)

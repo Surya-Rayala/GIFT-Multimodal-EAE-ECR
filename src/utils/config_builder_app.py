@@ -62,7 +62,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
     # tracker / runtime (advanced defaults)
     "keypoint_indices": [15, 16],
-    "device": "mps",
+    "device": "cpu",
     "boundary_pad_pct": 0.05,
     "track_enemy": True,
     "enemy_ids": [99],
@@ -75,7 +75,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # pod knobs (main defaults)
     "pod_working_radius": 40.0,
     "pod_capture_threshold_sec": 0.1,
-    "pod_time_limits": [30.0],
+    "pod_time_limits": [5.0],
 
     # coverage / wall (main defaults)
     "coverage_time_threshold": 3.0,
@@ -292,6 +292,12 @@ class MapPreview(QGraphicsView):
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         self.setViewportUpdateMode(QGraphicsView.BoundingRectViewportUpdate)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
+        # Zoom config (view-only; does NOT affect saved scene coordinates)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        self._user_zoom: float = 1.0   # multiplier applied on top of fitInView
+        self._min_zoom: float = 0.2
+        self._max_zoom: float = 8.0
 
         self._pix_item: Optional[QGraphicsPixmapItem] = None
         self._boundary_item: Optional[QGraphicsPolygonItem] = None
@@ -305,6 +311,36 @@ class MapPreview(QGraphicsView):
 
     def sizeHint(self) -> QSize:
         return QSize(700, 600)
+
+    def wheelEvent(self, event):
+        """Zoom the map/scene with mouse wheel or trackpad scroll.
+
+        This only changes the view transform (camera) and does not modify any scene
+        coordinates, so saved POD/Boundary values are unaffected.
+        """
+        # Use the vertical delta; on trackpads this can be smooth.
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
+            return
+
+        # Smooth zoom factor. (angleDelta is typically 120 per wheel notch)
+        factor = 1.0015 ** float(delta)
+
+        old = float(getattr(self, "_user_zoom", 1.0))
+        new = max(self._min_zoom, min(self._max_zoom, old * factor))
+        apply = new / old if old != 0 else 1.0
+
+        self._user_zoom = new
+        self.scale(apply, apply)
+        event.accept()
+
+    def reset_zoom(self) -> None:
+        """Reset view zoom/pan to a clean fit-to-view."""
+        self._user_zoom = 1.0
+        # Clear any accumulated transforms (including pan) then refit.
+        self.resetTransform()
+        self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
 
     def refresh(self) -> None:
         self.scene.clear()
@@ -408,7 +444,10 @@ class MapPreview(QGraphicsView):
             self.scene.addItem(t)
             self._pod_labels.append(t)
 
+        # Always fit first, then re-apply any user zoom so refreshes don't reset zoom.
         self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+        if getattr(self, "_user_zoom", 1.0) != 1.0:
+            self.scale(self._user_zoom, self._user_zoom)
 
     def _compute_wall_band_path(self, boundary_pts: List[List[int]], pWall: float) -> Optional[QPainterPath]:
         pts = [(float(x), float(y)) for x, y in boundary_pts]
@@ -427,19 +466,63 @@ class MapPreview(QGraphicsView):
         if w <= 1 or h <= 1:
             return None
 
+        # Map pWall in [0,1] to a wall-band thickness that is dynamic per boundary.
+        # pWall=0  -> a small (but non-zero) band near the wall
+        # pWall=1  -> the entire interior (i.e., inner buffer collapses/empties)
         pWall = max(0.0, min(1.0, float(pWall)))
-        inset = (0.02 + 0.18 * pWall) * min(w, h)
+
+        # Minimum inset keeps the band visible even at pWall=0.
+        min_inset = 0.02 * min(w, h)
+
+        # Compute a dynamic maximum inset such that outer.buffer(-max_inset) becomes empty.
+        # This depends on the specific polygon geometry (concavity, narrow corridors, etc.).
+        def _max_inset_until_empty(poly: Polygon) -> float:
+            # Start with a reasonable upper bound and grow if needed.
+            hi = 0.5 * min(w, h)
+            if hi <= 0:
+                return 0.0
+
+            # Grow upper bound until the negative buffer becomes empty (or we hit a safety cap).
+            safety_cap = 10.0 * min(w, h)
+            test = poly.buffer(-hi)
+            while (not test.is_empty) and (hi < safety_cap):
+                hi *= 1.5
+                test = poly.buffer(-hi)
+
+            if not test.is_empty:
+                # Could not find an empty buffer within cap; fall back.
+                return hi
+
+            lo = 0.0
+            # Binary search for the smallest distance at which it becomes empty.
+            for _ in range(30):
+                mid = 0.5 * (lo + hi)
+                if poly.buffer(-mid).is_empty:
+                    hi = mid
+                else:
+                    lo = mid
+            return hi
+
+        max_inset = _max_inset_until_empty(outer)
+        if max_inset <= 0:
+            return None
+
+        # Ensure max_inset >= min_inset
+        max_inset = max(max_inset, min_inset)
+
+        inset = min_inset + pWall * (max_inset - min_inset)
 
         inner = outer.buffer(-inset)
         if inner.is_empty:
-            return None
-
-        if isinstance(inner, MultiPolygon):
-            inner_poly = max(list(inner.geoms), key=lambda g: g.area)
+            # If we inset past the polygon's inradius, the band becomes the whole polygon.
+            inner_poly = None
         else:
-            inner_poly = inner
+            if isinstance(inner, MultiPolygon):
+                inner_poly = max(list(inner.geoms), key=lambda g: g.area)
+            else:
+                inner_poly = inner
 
-        band = outer.difference(inner_poly)
+        band = outer if inner_poly is None else outer.difference(inner_poly)
         if band.is_empty:
             return None
 
@@ -858,6 +941,18 @@ class ConfigBuilderWindow(QMainWindow):
         left_layout.addStretch(1)
 
         self.preview = MapPreview(self.model, on_pod_moved=self._on_pod_moved)
+        # Preview controls
+        preview_controls = QWidget()
+        pc = QHBoxLayout(preview_controls)
+        pc.setContentsMargins(0, 0, 0, 0)
+        pc.setSpacing(6)
+        pc.addStretch(1)
+        btn_reset_zoom = QPushButton("Reset Zoom")
+        btn_reset_zoom.setToolTip("Fit map to view and reset zoom")
+        btn_reset_zoom.clicked.connect(self.preview.reset_zoom)
+        pc.addWidget(btn_reset_zoom)
+
+        right_layout.addWidget(preview_controls)
         right_layout.addWidget(self.preview, 1)
 
         desc_group = QGroupBox("Description (what this setting does)")

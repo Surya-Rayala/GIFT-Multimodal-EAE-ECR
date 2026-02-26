@@ -2,7 +2,7 @@
 # PyQt5 app:
 # 1) Homography mapping (CAMERA point -> MAP point pairs)
 # 2) Entry Regions (multiple polygons on MAP)
-# 3) Map Points (single points on MAP, one per line)
+# 3) POD Points (single points on MAP, one per line)
 # 4) Room Boundary (single polygon on MAP)
 #
 # Dependencies: PyQt5, opencv-python, numpy
@@ -156,14 +156,25 @@ class ImageCanvas(QGraphicsView):
             self.fitInView(self.sceneRect(), Qt.KeepAspectRatio)
 
     def wheelEvent(self, event):
+        # Trackpad / mouse wheel behavior:
+        # - Normal wheel/trackpad scroll should pan (default QGraphicsView behavior)
+        # - Ctrl + wheel zooms
         if not self._has_image:
+            super().wheelEvent(event)
             return
-        delta = event.angleDelta().y()
-        if delta == 0:
+
+        if event.modifiers() & Qt.ControlModifier:
+            delta = event.angleDelta().y()
+            if delta == 0:
+                return
+            factor = 1.04 if delta > 0 else 1 / 1.04
+            self._user_scaled = True
+            self.scale(factor, factor)
+            event.accept()
             return
-        factor = 1.04 if delta > 0 else 1 / 1.04
-        self._user_scaled = True
-        self.scale(factor, factor)
+
+        # Default scroll/pan behavior (important for trackpads)
+        super().wheelEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -571,7 +582,7 @@ class MapperMainWindow(QMainWindow):
         reg_layout.addWidget(self.list_polys, 1)
         reg_layout.addWidget(reg_btn_row)
 
-        # Map Points tab
+        # POD Points tab
         pts_tab = QWidget()
         pts_layout = QVBoxLayout(pts_tab)
         pts_layout.setContentsMargins(8, 8, 8, 8)
@@ -643,7 +654,7 @@ class MapperMainWindow(QMainWindow):
 
         self.tabs.addTab(map_tab, "Mapping")
         self.tabs.addTab(reg_tab, "Entry Regions")
-        self.tabs.addTab(pts_tab, "Map Points")
+        self.tabs.addTab(pts_tab, "POD Points")
         self.tabs.addTab(bnd_tab, "Room Boundary")
 
         main_split.addWidget(left)
@@ -885,35 +896,54 @@ class MapperMainWindow(QMainWindow):
     def _set_mapping_instructions(self):
         self.txt_instructions.setText(
             "Mapping (Homography):\n"
-            "1) Load Map.\n"
-            "2) Load Video or Frame.\n"
-            "3) Click CAMERA point (green).\n"
-            "4) Click MAP point (red).\n"
-            "5) Repeat.\n\n"
-            "Rule: cannot switch/save if last pair incomplete.\n"
+            "1) Load MAP image.\n"
+            "2) Load CAMERA source (Video or Frame).\n"
+            "3) Click a point on CAMERA (green).\n"
+            "4) Click the matching point on MAP (red).\n"
+            "5) Repeat for several well-spread points (more is better).\n\n"
+            "Rules / Tips:\n"
+            "- Always alternate: CAMERA click → MAP click.\n"
+            "- Use points spread across the whole scene (avoid all points in one corner).\n"
+            "- Avoid ambiguous points (choose sharp corners / unique features).\n"
+            "- You cannot switch tabs or save if the last pair is incomplete.\n"
         )
 
     def _set_regions_instructions(self):
         self.txt_reg_help.setText(
-            "Entry Regions (Map only):\n"
-            "- Click MAP to add vertices.\n"
-            "- Confirm Polygon, then New Polygon.\n"
-            "- Save writes one polygon per line.\n"
+            "Entry Regions (MAP only):\n"
+            "- Click MAP to add vertices in order (either clockwise or counter-clockwise).\n"
+            "- Do NOT draw the final closing edge; closing is automatic when you press Confirm.\n"
+            "- Confirm Polygon when finished adding points.\n"
+            "- Use New Polygon to start the next entry region.\n\n"
+            "Rules / Tips:\n"
+            "- Keep the same winding order for every polygon (CW or CCW).\n"
+            "- Do not cross edges (no self-intersections).\n"
+            "- Put points on corners/turns; fewer, cleaner points are better than noisy zig-zags.\n\n"
+            "Saving:\n"
+            "- Save writes one polygon per line: x1,y1, x2,y2, ...\n"
         )
 
     def _set_points_instructions(self):
         self.txt_pts_help.setText(
-            "Map Points (Map only):\n"
+            "POD Points (MAP only):\n"
             "- Click MAP to add points.\n"
-            "- Save writes one point per line: 'x, y'.\n"
+            "- Undo removes the last point. Delete removes selected rows.\n\n"
+            "Saving:\n"
+            "- Save writes one point per line: x, y\n"
         )
 
     def _set_boundary_instructions(self):
         self.txt_bnd_help.setText(
-            "Room Boundary (Map only):\n"
-            "- Click MAP to add boundary vertices.\n"
-            "- Confirm Boundary then Save.\n"
-            "- Save writes one line: 'x1,y1, x2,y2, ...'.\n"
+            "Room Boundary (MAP only):\n"
+            "- Click MAP to add boundary vertices in order (either clockwise or counter-clockwise).\n"
+            "- Do NOT draw the final closing edge; closing is automatic when you press Confirm.\n"
+            "- Confirm Boundary when finished adding points.\n\n"
+            "Rules / Tips:\n"
+            "- Keep a consistent winding order (CW or CCW).\n"
+            "- Do not cross edges (no self-intersections).\n"
+            "- Put points on corners/turns; avoid noisy zig-zags.\n\n"
+            "Saving:\n"
+            "- Save writes one line: x1,y1, x2,y2, ...\n"
         )
 
     def _have_map_loaded(self) -> bool:
@@ -974,7 +1004,7 @@ class MapperMainWindow(QMainWindow):
         if tab == 1:
             self.lbl_status.setText("Entry Regions: click MAP to add vertices.")
         elif tab == 2:
-            self.lbl_status.setText("Map Points: click MAP to add points.")
+            self.lbl_status.setText("POD Points: click MAP to add points.")
         elif tab == 3:
             self.lbl_status.setText("Room Boundary: click MAP to add boundary.")
 
@@ -995,8 +1025,15 @@ class MapperMainWindow(QMainWindow):
 
     def _refresh_polys_list(self):
         self.list_polys.clear()
+
+        # Saved polygons
         for idx, poly in enumerate(self.region_polys, start=1):
             self.list_polys.addItem(QListWidgetItem(f"Polygon {idx} ({len(poly.points)} pts)"))
+
+        # Also show the current polygon (so it appears immediately after Confirm)
+        if self.current_poly:
+            state = "CONFIRMED" if self.current_poly_confirmed else "DRAFT"
+            self.list_polys.addItem(QListWidgetItem(f"Current ({state}) ({len(self.current_poly)} pts)"))
 
     def _refresh_points_table(self):
         self.table_pts.setRowCount(0)
@@ -1385,21 +1422,20 @@ class MapperMainWindow(QMainWindow):
 
     def on_points_save(self):
         if not self._have_map_loaded():
-            self._warn("Map Points", "Load a MAP image first.")
+            self._warn("POD Points", "Load a MAP image first.")
             return
         if not self._output_dir_ok():
             self._warn("Save", "Choose a valid Save Root Directory first.")
             return
         if not self.map_points:
-            self._warn("Map Points", "No points to save.")
+            self._warn("POD Points", "No points to save.")
             return
-        name = self._project_name()
-        out_path = os.path.join(self.le_output_dir.text().strip(), f"{name}_map_points.txt")
+        out_path = os.path.join(self.le_output_dir.text().strip(), "POD_points.txt")
         with open(out_path, "w", encoding="utf-8") as f:
             for (x, y) in self.map_points:
                 f.write(f"{x}, {y}\n")
         self.points_dirty = False
-        self._info("Saved", f"Map points saved:\n{out_path}")
+        self._info("Saved", f"POD points saved:\n{out_path}")
 
     # --- Boundary ---
     def on_boundary_undo(self):

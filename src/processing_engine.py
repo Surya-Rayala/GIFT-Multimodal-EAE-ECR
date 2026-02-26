@@ -18,7 +18,7 @@ from .utils.config import load_vmeta, load_config
 from .utils.transcode import transcode
 from .metrics import *
 from .utils.vmeta import generate_vmeta
-from shapely.geometry import Point
+from shapely.geometry import Point, Polygon
 from shapely.ops import nearest_points
 from src.helper_functions import (
     initialize_keypoint_indices,
@@ -85,18 +85,32 @@ class ProcessingEngine:
 
     ######################################################Change Begin#####################################################
     # Function to initialize components necessary for new processing.
-    def _initialize_components(self, vmeta_path):
+    def _initialize_components(self, vmeta_path=None):
+        if vmeta_path is None:
+            return
         # Load the PixelMapper instance
         point_mapping_path = os.path.join(os.path.dirname(vmeta_path), self.config["point_mapping_path"])
-        self.mapper = load_pixel_mapper(point_mapping_path)
+        self.mapper = load_pixel_mapper(
+            point_mapping_path,
+            ransac_reproj_threshold=float(self.config.get("homography_ransac_thresh", 3.0)),
+            confidence=float(self.config.get("homography_confidence", 0.999)),
+            max_iters=int(self.config.get("homography_max_iters", 2000)),
+        )
 
         # Load the entry polygons
         entry_polys_path = os.path.join(os.path.dirname(vmeta_path), self.config["entry_polys_path"])
         self.entry_polys = load_entry_polygons(entry_polys_path)
 
-        #Load the Boundary of the room
+        # Load the Boundary of the room
         self.boundary = self.config.get("Boundary", None)
-        
+        # If boundary is provided as coordinates, convert to shapely Polygon
+        if self.boundary is not None and not hasattr(self.boundary, "contains"):
+            try:
+                self.boundary = Polygon(self.boundary)
+            except Exception:
+                # Leave as-is; downstream code will treat it as unavailable
+                self.boundary = None
+
         # Initialize configured keypoint indices (NOSE/eyes/ears)
         initialize_keypoint_indices(self.config)
 
@@ -200,6 +214,8 @@ class ProcessingEngine:
 
     ######################################################Change Begin#####################################################
     def _is_in_entry_region(self, point):
+        if not getattr(self, "entry_polys", None):
+            return False
         for entry_poly in self.entry_polys:  # assuming entry_polys is a list of polygons
             if entry_poly.contains(point):
                 return True
@@ -363,7 +379,10 @@ class ProcessingEngine:
                 trk_id = trk.get('track_id')
                 current_map_pos = trk.get('current_map_pos')
                 if current_map_pos is not None:
-                    mapX, mapY = current_map_pos
+                    cur = np.asarray(current_map_pos, dtype=float).reshape(-1)
+                    if cur.size < 2 or not np.isfinite(cur[:2]).all():
+                        continue
+                    mapX, mapY = float(cur[0]), float(cur[1])
                     # Make sure that the point in map is inside the boundary polygon
                     if self.boundary is not None:
                         point = Point(mapX, mapY)

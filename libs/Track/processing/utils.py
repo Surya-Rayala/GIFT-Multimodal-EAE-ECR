@@ -29,29 +29,43 @@ import shapely.geometry as geo
 import cv2
 
 
-def load_pixel_mapper(point_map_path):
+def load_pixel_mapper(point_map_path: str, *, delimiter=",", skip_header=0, comments="#",
+                      ransac_reproj_threshold=3.0, confidence=0.999, max_iters=2000):
     """
-    Load the point mapping file and create a PixelMapper instance.
-
-    Parameters:
-    - point_map_path (str): The path to the point mapping file.
-        - The file should contain comma-separated values representing pixel coordinates and corresponding map coordinates.
-
-    Returns:
-    - PixelMapper: An instance of the PixelMapper class, initialized with the loaded pixel and map coordinates.
-
-    Example:
-    point_map_path = "path/to/point_map.csv"
-    pixel_mapper = load_pixel_mapper(point_map_path)
+    CSV rows: pixel_x, pixel_y, map_x, map_y
     """
-    # Load the point mapping file
-    point_mapping = np.loadtxt(point_map_path, delimiter=",", dtype="int")
-    pixel_arr = point_mapping[:, :2]
-    map_arr = point_mapping[:, 2:]
+    pts = np.genfromtxt(
+        point_map_path,
+        delimiter=delimiter,
+        skip_header=skip_header,
+        comments=comments,
+        dtype=np.float64,
+    )
 
-    # Create and return the PixelMapper instance
-    mapper = PixelMapper(pixel_arr, map_arr)
-    return mapper
+    if pts.ndim == 1:
+        pts = pts.reshape(1, -1)
+
+    if pts.shape[1] < 4:
+        raise ValueError(f"Expected >=4 columns (px,py,mx,my). Got shape={pts.shape}")
+
+    pts = pts[:, :4]
+    # drop rows with NaNs
+    pts = pts[~np.isnan(pts).any(axis=1)]
+
+    if len(pts) < 4:
+        raise ValueError(f"Need at least 4 point correspondences, got {len(pts)}")
+
+    pixel_arr = pts[:, 0:2]
+    map_arr   = pts[:, 2:4]
+
+    return PixelMapper(
+        pixel_arr,
+        map_arr,
+        method="RANSAC",
+        ransac_reproj_threshold=ransac_reproj_threshold,
+        confidence=confidence,
+        max_iters=max_iters,
+    )
 
 def load_entry_polygons(entry_polys_path):
     """
