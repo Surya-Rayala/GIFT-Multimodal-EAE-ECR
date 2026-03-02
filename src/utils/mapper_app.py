@@ -1430,7 +1430,8 @@ class MapperMainWindow(QMainWindow):
         if not self.map_points:
             self._warn("POD Points", "No points to save.")
             return
-        out_path = os.path.join(self.le_output_dir.text().strip(), "POD_points.txt")
+        name = self._project_name()
+        out_path = os.path.join(self.le_output_dir.text().strip(), f"{name}_POD_points.txt")
         with open(out_path, "w", encoding="utf-8") as f:
             for (x, y) in self.map_points:
                 f.write(f"{x}, {y}\n")

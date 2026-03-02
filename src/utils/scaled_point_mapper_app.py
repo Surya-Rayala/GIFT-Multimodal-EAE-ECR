@@ -1061,10 +1061,10 @@ class MainWindow(QMainWindow):
             return
 
         new_a = ids[0]
-        if self.wallB_id is not None:
-            if not self._are_walls_adjacent(new_a, self.wallB_id):
-                self._warn("Mark A", "Wall A must be adjacent to Wall B (they must share a corner). Select a different wall.")
-                return
+        if self.wallB_id is not None and not self._are_walls_adjacent(new_a, self.wallB_id):
+            # allow jumping to a different area: set A and clear B
+            self.wallB_id = None
+            self.lbl_pf_feedback.setText("Wall B cleared (not adjacent). Now select an adjacent wall and mark it as B.")
 
         self.wallA_id = new_a
         if self.wallB_id == self.wallA_id:
@@ -1078,15 +1078,16 @@ class MainWindow(QMainWindow):
             return
 
         new_b = ids[0]
-        if self.wallA_id is not None:
-            if not self._are_walls_adjacent(self.wallA_id, new_b):
-                self._warn("Mark B", "Wall B must be adjacent to Wall A (they must share a corner). Select a different wall.")
-                return
+        if self.wallA_id is not None and not self._are_walls_adjacent(self.wallA_id, new_b):
+            # allow jumping to a different area: set B and clear A
+            self.wallA_id = None
+            self.lbl_pf_feedback.setText("Wall A cleared (not adjacent). Now select an adjacent wall and mark it as A.")
 
         self.wallB_id = new_b
         if self.wallA_id == self.wallB_id:
             self.wallA_id = None
         self._refresh_all()
+
 
     def on_add_point(self):
         if not self.canvas.has_image():

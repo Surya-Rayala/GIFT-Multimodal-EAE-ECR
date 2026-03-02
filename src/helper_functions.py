@@ -1793,17 +1793,31 @@ def assign_pods_by_entry(
     *,
     enemy_ids: Optional[List[int]] = None,
     boundary: Optional[Polygon] = None,
+    pod_groups: Optional[List[str]] = None,
 ) -> Dict[int, Optional[int]]:
-    """
-    Geometry‑aware POD assignment.
+    """Assign PODs (designated areas) to friend track IDs.
 
-    1. Project first friend’s entry point to the boundary (“door”).
-    2. Infer global CW (+1) / CCW (‑1) flow from the next ≈30 points.
-    3. Split the room by a divider (door → centroid → opposite wall).
-    4. Within each side (+1 / ‑1) order PODs by perimeter distance
-       along the flow, furthest → nearest.
-    5. Alternate soldier assignment between the two sides, starting on
-       the entrance side.  Lists are printed for debugging.
+    This function supports two modes:
+
+    A) **Grouped mode (recommended)**
+       If `pod_groups` is provided (same length as `pods`) with labels "A"/"B",
+       PODs are NOT geometrically split by centroid/dividers. Instead:
+         1) We estimate the first entrant's *entry direction* from early trajectory points.
+         2) We decide which group (A or B) is "in the entry direction".
+         3) We alternate assignments between groups, starting with the entry-direction group.
+         4) Within each group, PODs are ordered (furthest-first) using a stable, room-agnostic
+            distance metric from the door/entry reference.
+
+       This makes grouping robust across irregular room shapes because the grouping is
+       explicit in config ("same entry-side/segment"), and only the *start group* depends
+       on the entrant's motion.
+
+    B) **Legacy geometry mode (fallback)**
+       If `pod_groups` is missing/invalid, we fall back to the previous centroid-divider
+       approach.
+
+    Returns:
+        Dict[track_id, pod_idx|None]
     """
 
     if boundary is None:
@@ -1814,9 +1828,8 @@ def assign_pods_by_entry(
     if enemy_ids is None:
         enemy_ids = [99]
 
-    # --- 1. Filter non‑enemy tracks and choose candidates ---
-    friend_tracks = {tid: traj for tid, traj in tracks_by_id.items()
-                     if tid not in enemy_ids}
+    # --- 1. Filter non-enemy tracks and choose candidates (max: #pods) ---
+    friend_tracks = {tid: traj for tid, traj in tracks_by_id.items() if tid not in enemy_ids}
     if not friend_tracks or not pods:
         return {}
 
@@ -1827,38 +1840,155 @@ def assign_pods_by_entry(
         except ValueError:
             return float("inf")
 
-    items = sorted(friend_tracks.items(),
-                   key=lambda kv: sum(p is not None for p in kv[1]),
-                   reverse=True)[: len(pods)]
-    items.sort(key=first_frame)          # earliest appearance first
+    # Prefer tracks with more valid points, then earliest appearance
+    items = sorted(
+        friend_tracks.items(),
+        key=lambda kv: sum(p is not None for p in kv[1]),
+        reverse=True,
+    )[: len(pods)]
+    items.sort(key=first_frame)
 
-    # --- 2. Door reference (project entry onto boundary) ---
     first_tid, first_trk = items[0]
     idx0 = _first_valid_index(first_trk)
-    entry_pt = Point(first_trk[idx0])
+    entry_xy = first_trk[idx0]
+    entry_pt = Point(entry_xy)
 
     boundary_line = LineString(boundary.exterior.coords)
     door_pt = boundary_line.interpolate(boundary_line.project(entry_pt))
+
+    # Estimate entry-direction vector from a small future window (robust to short tracks)
+    pts_future = [pt for pt in first_trk[idx0 + 1 : idx0 + 61] if pt is not None]
+    mean_dir = None
+    if pts_future:
+        mean_vec = np.mean(np.array(pts_future, dtype=float), axis=0) - np.array(entry_xy, dtype=float)
+        n = float(np.linalg.norm(mean_vec))
+        if n > 1e-6:
+            mean_dir = (mean_vec / n).astype(float)
+
+    # -----------------------------
+    # GROUPED MODE (A/B from config)
+    # -----------------------------
+    def _valid_groups(pg: Optional[List[str]]) -> Optional[List[str]]:
+        if pg is None or not isinstance(pg, list):
+            return None
+        if len(pg) != len(pods):
+            return None
+        out: List[str] = []
+        for g in pg:
+            gs = str(g).strip().upper()
+            if gs not in ("A", "B"):
+                return None
+            out.append(gs)
+        return out
+
+    pg = _valid_groups(pod_groups)
+
+    if pg is not None:
+        # Build indices per group
+        pods_A = [i for i, g in enumerate(pg) if g == "A"]
+        pods_B = [i for i, g in enumerate(pg) if g == "B"]
+
+        # If one group is empty, just assign in a single ordered list
+        if not pods_A or not pods_B:
+            ordered = pods_A + pods_B
+
+            # Order by distance-from-door (furthest first)
+            def _score(pod_idx: int) -> float:
+                x, y = pods[pod_idx]
+                return float(Point(x, y).distance(door_pt))
+
+            ordered.sort(key=_score, reverse=True)
+
+            assignment: Dict[int, Optional[int]] = {}
+            for (tid, _), pod_idx in zip(items, ordered):
+                assignment[tid] = pod_idx
+            # Any extra selected tracks beyond PODs
+            for tid, _ in items[len(ordered) :]:
+                assignment[tid] = None
+            return assignment
+
+        # Decide which group is "in the entry direction".
+        # We score each group by how well its POD vectors align with mean_dir.
+        # If mean_dir is unavailable, default to starting with group A.
+        def _group_alignment(group_indices: List[int]) -> float:
+            if mean_dir is None:
+                return 0.0
+            best = -1e9
+            ox, oy = float(door_pt.x), float(door_pt.y)
+            for pi in group_indices:
+                px, py = pods[pi]
+                v = np.array([float(px) - ox, float(py) - oy], dtype=float)
+                n = float(np.linalg.norm(v))
+                if n <= 1e-6:
+                    continue
+                v /= n
+                best = max(best, float(np.dot(v, mean_dir)))
+            return best
+
+        score_A = _group_alignment(pods_A)
+        score_B = _group_alignment(pods_B)
+
+        # Start group is the one more aligned with the entrant's direction.
+        # Tie-break: start with A.
+        start_group = "A" if score_A >= score_B else "B"
+        # Within-group ordering: stable furthest-first from door.
+        def _pod_dist(pod_idx: int) -> float:
+            x, y = pods[pod_idx]
+            return float(Point(x, y).distance(door_pt))
+
+        pods_A_sorted = sorted(pods_A, key=_pod_dist, reverse=True)
+        pods_B_sorted = sorted(pods_B, key=_pod_dist, reverse=True)
+
+        # Alternate assignment between groups, starting with start_group.
+        assignment: Dict[int, Optional[int]] = {}
+        ia = ib = 0
+        current = start_group
+
+        for tid, _ in items:
+            if current == "A":
+                if ia < len(pods_A_sorted):
+                    assignment[tid] = pods_A_sorted[ia]
+                    ia += 1
+                elif ib < len(pods_B_sorted):
+                    assignment[tid] = pods_B_sorted[ib]
+                    ib += 1
+                else:
+                    assignment[tid] = None
+            else:  # current == "B"
+                if ib < len(pods_B_sorted):
+                    assignment[tid] = pods_B_sorted[ib]
+                    ib += 1
+                elif ia < len(pods_A_sorted):
+                    assignment[tid] = pods_A_sorted[ia]
+                    ia += 1
+                else:
+                    assignment[tid] = None
+
+            current = "B" if current == "A" else "A"
+
+        return assignment
+
+    # -----------------------------
+    # LEGACY GEOMETRY MODE (fallback)
+    # -----------------------------
+
+    # Door reference + centroid divider split (previous behavior)
     centre_pt = Point(boundary.centroid.coords[0])
 
-    # --- 3. Global flow direction (+1 CW / ‑1 CCW) ---
-    pts_future = [pt for pt in first_trk[idx0 + 1: idx0 + 91] if pt is not None]
-    if pts_future:
-        mean_vec = np.mean(np.array(pts_future), axis=0) - np.array(entry_pt.coords[0])
-        v_centre = np.array([centre_pt.x, centre_pt.y]) - np.array(entry_pt.coords[0])
-        z_cross = np.cross(v_centre, mean_vec)
+    # If mean_dir exists, infer a consistent movement sign relative to centre.
+    if mean_dir is not None:
+        v_centre = np.array([centre_pt.x, centre_pt.y], dtype=float) - np.array(entry_xy, dtype=float)
+        z_cross = float(np.cross(v_centre, mean_dir))
         movement_sign = -1 if z_cross < 0 else +1
     else:
-        movement_sign = -1  # default CCW if no extra points
+        movement_sign = -1
 
-    # --- 4. Divider and side helper ---
-    divider_v = np.array([centre_pt.x, centre_pt.y]) - np.array([door_pt.x, door_pt.y])
+    divider_v = np.array([centre_pt.x, centre_pt.y], dtype=float) - np.array([door_pt.x, door_pt.y], dtype=float)
 
     def _side(pt: Point) -> int:
-        v = np.array([pt.x, pt.y]) - np.array([door_pt.x, door_pt.y])
-        return 1 if np.cross(divider_v, v) >= 0 else -1
+        v = np.array([pt.x, pt.y], dtype=float) - np.array([door_pt.x, door_pt.y], dtype=float)
+        return 1 if float(np.cross(divider_v, v)) >= 0 else -1
 
-    # --- 5. POD metadata: side + perimeter distance (furthest first) ---
     door_s = boundary_line.project(door_pt)
     pod_meta = []
     for idx, pod in enumerate(pods):
@@ -1868,19 +1998,12 @@ def assign_pods_by_entry(
         perim = ((pod_s - door_s) if side == -1 else (door_s - pod_s)) % boundary_line.length
         pod_meta.append({"idx": idx, "side": side, "perim": perim})
 
-    pods_pos = sorted((d for d in pod_meta if d["side"] == +1),
-                      key=lambda d: d["perim"], reverse=True)
-    pods_neg = sorted((d for d in pod_meta if d["side"] == -1),
-                      key=lambda d: d["perim"], reverse=True)
+    pods_pos = sorted((d for d in pod_meta if d["side"] == +1), key=lambda d: d["perim"], reverse=True)
+    pods_neg = sorted((d for d in pod_meta if d["side"] == -1), key=lambda d: d["perim"], reverse=True)
 
-    # print(f"[assign_pods_by_entry] first entrant {first_tid}, dir={movement_sign}")
-    # print(f"  +1 PODs: {[d['idx'] for d in pods_pos]}")
-    # print(f"  -1 PODs: {[d['idx'] for d in pods_neg]}")
-
-    # --- 6. Alternate assignment starting on entrance side ---
     assignment: Dict[int, Optional[int]] = {}
     idx_pos = idx_neg = 0
-    current_side = movement_sign   # entrance side
+    current_side = movement_sign
 
     for tid, _ in items:
         if current_side == +1:
@@ -1901,7 +2024,7 @@ def assign_pods_by_entry(
                 idx_pos += 1
             else:
                 assignment[tid] = None
-        current_side *= -1  # flip for next soldier
+        current_side *= -1
 
     return assignment
 
@@ -2272,6 +2395,7 @@ def run_pod_analysis(
     tracks_by_id: Dict[int, List[Optional[Tuple[float, float]]]],
     tracker_output: List[Dict],
     pods_cfg: List[Tuple[float, float]],
+    pod_groups: Optional[List[str]] = None,
     pixel_mapper,
     boundary: Polygon,
     enemy_ids: List[int],
@@ -2303,7 +2427,8 @@ def run_pod_analysis(
         tracks_by_id,
         pods_cfg,
         enemy_ids=enemy_ids,
-        boundary=boundary
+        boundary=boundary,
+        pod_groups=pod_groups
     )
 
     initial_work_areas = compute_pod_working_areas(

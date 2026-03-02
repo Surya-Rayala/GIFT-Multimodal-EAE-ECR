@@ -76,6 +76,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "pod_working_radius": 40.0,
     "pod_capture_threshold_sec": 0.1,
     "pod_time_limits": [5.0],
+    "pod_groups": ["A"],
 
     # coverage / wall (main defaults)
     "coverage_time_threshold": 3.0,
@@ -116,7 +117,8 @@ COMMENTS: Dict[str, str] = {
 
     "pod_working_radius": "Radius (map pixels) around each POD used to compute work areas for POD capture analysis.",
     "pod_capture_threshold_sec": "Seconds required inside a POD work area to count as captured.",
-    "pod_time_limits": "Per-POD time limits (seconds) for POD_CAPTURE_TIME scoring (auto-extends if fewer than POD count).",
+    "pod_time_limits": "Per-POD time limit (seconds) to capture each designated area after entry. Interpreted relative to when the assigned entrant first enters/appears in the room.",
+    "pod_groups": "Per-POD grouping label (A/B). Group PODs that belong to the same side/segment of the room to allow assignment to people moving either left or right from the entry",
 
     "coverage_time_threshold": "Seconds of sustained coverage needed for full score in TOTAL_FLOOR_COVERAGE_TIME.",
     "stay_along_wall_pWall": "Sensitivity/threshold for STAY_ALONG_WALL metric (higher usually means stricter wall adherence).",
@@ -238,6 +240,28 @@ class ConfigModel:
                 limits_f = limits_f[:n_pods]
         self.data["pod_time_limits"] = limits_f
 
+        # pod_groups list[str] - auto-extend to POD count
+        groups = self.data.get("pod_groups", [])
+        if not isinstance(groups, list) or not groups:
+            groups = ["A"]
+        groups_s: List[str] = []
+        for g in groups:
+            try:
+                gs = str(g).strip().upper()
+            except Exception:
+                continue
+            if gs not in ("A", "B"):
+                gs = "A"
+            groups_s.append(gs)
+        if not groups_s:
+            groups_s = ["A"]
+        if n_pods > 0:
+            while len(groups_s) < n_pods:
+                groups_s.append(groups_s[-1])
+            if len(groups_s) > n_pods:
+                groups_s = groups_s[:n_pods]
+        self.data["pod_groups"] = groups_s
+
         # gaze_keypoint_map
         gkm = self.data.get("gaze_keypoint_map", {})
         if not isinstance(gkm, dict):
@@ -305,6 +329,7 @@ class MapPreview(QGraphicsView):
         self._pod_items: List[QGraphicsEllipseItem] = []
         self._pod_labels: List[QGraphicsTextItem] = []
         self._radius_items: List[QGraphicsEllipseItem] = []
+        self._pod_label_bgs: List[QGraphicsEllipseItem] = []
         self._on_pod_moved_cb = on_pod_moved
 
         self.refresh()
@@ -346,6 +371,7 @@ class MapPreview(QGraphicsView):
         self.scene.clear()
         self._pod_items.clear()
         self._pod_labels.clear()
+        self._pod_label_bgs.clear()
         self._radius_items.clear()
         self._pix_item = None
         self._boundary_item = None
@@ -426,6 +452,16 @@ class MapPreview(QGraphicsView):
                     self._radius_items[idx].setRect(nx - rr, ny - rr, 2 * rr, 2 * rr)
                 if 0 <= idx < len(self._pod_labels):
                     self._pod_labels[idx].setPos(nx + 6, ny - 14)
+                    # Keep label background rectangle aligned with text
+                    if 0 <= idx < len(self._pod_label_bgs):
+                        br = self._pod_labels[idx].boundingRect()
+                        pad_x, pad_y = 3.0, 1.5
+                        self._pod_label_bgs[idx].setRect(
+                            (nx + 6) + br.x() - pad_x,
+                            (ny - 14) + br.y() - pad_y,
+                            br.width() + 2 * pad_x,
+                            br.height() + 2 * pad_y,
+                        )
 
                 # Bubble up to window so it can rewrite the POD txt file
                 if self._on_pod_moved_cb is not None:
@@ -435,14 +471,29 @@ class MapPreview(QGraphicsView):
             self.scene.addItem(dot)
             self._pod_items.append(dot)
 
-            # label
+            # label (more visible: background box + high-contrast text)
             t = QGraphicsTextItem(str(i))
-            t.setDefaultTextColor(QColor(255, 255, 255))
-            t.setFont(QFont("Arial", 10, QFont.Bold))
-            t.setPos(x + 6, y - 14)
-            t.setZValue(8)
+            t.setDefaultTextColor(QColor(0, 0, 0))
+            t.setFont(QFont("Arial", 12, QFont.Bold))
+            t.setPos(x + 6, y - 16)
+            t.setZValue(9)
             self.scene.addItem(t)
             self._pod_labels.append(t)
+
+            # Background rectangle behind label text for readability on light maps
+            br = t.boundingRect()
+            pad_x, pad_y = 3.0, 1.5
+            bg = QGraphicsEllipseItem(
+                (x + 6) + br.x() - pad_x,
+                (y - 16) + br.y() - pad_y,
+                br.width() + 2 * pad_x,
+                br.height() + 2 * pad_y,
+            )
+            bg.setPen(QPen(QColor(0, 0, 0, 180), 1))
+            bg.setBrush(QBrush(QColor(255, 255, 255, 200)))
+            bg.setZValue(8)  # behind the text label
+            self.scene.addItem(bg)
+            self._pod_label_bgs.append(bg)
 
         # Always fit first, then re-apply any user zoom so refreshes don't reset zoom.
         self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
@@ -924,6 +975,25 @@ class ConfigBuilderWindow(QMainWindow):
 
         limits_box = QGroupBox("Per-POD Time Limits (seconds)")
         limits_v = QVBoxLayout(limits_box)
+
+        # Header row with Info button for the entire Per-POD component
+        limits_header = QWidget()
+        lh = QHBoxLayout(limits_header)
+        lh.setContentsMargins(0, 0, 0, 0)
+        lh.setSpacing(6)
+        header_lbl = QLabel("Time limits & grouping")
+        header_lbl.setStyleSheet("QLabel { font-weight: 600; }")
+        info_btn = QPushButton()
+        info_btn.setToolTip("Info")
+        info_btn.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxInformation))
+        info_btn.setIconSize(QSize(14, 14))
+        info_btn.setFixedSize(26, 22)
+        info_btn.clicked.connect(lambda: self.show_description("pod_time_limits"))
+        lh.addWidget(header_lbl)
+        lh.addStretch(1)
+        lh.addWidget(info_btn)
+        limits_v.addWidget(limits_header)
+
         self.pod_limits_container = QWidget()
         self.pod_limits_layout = QVBoxLayout(self.pod_limits_container)
         self.pod_limits_layout.setContentsMargins(0, 0, 0, 0)
@@ -985,6 +1055,10 @@ class ConfigBuilderWindow(QMainWindow):
 
     def show_description(self, key: str):
         txt = COMMENTS.get(key, "(No description available)")
+        if key == "pod_time_limits":
+            grp_txt = COMMENTS.get("pod_groups", "")
+            if grp_txt:
+                txt = f"{txt}\n\nGrouping:\n{grp_txt}"
         self.desc.setPlainText(f"{key}\n\n{txt}")
 
     def _mk_dspin(self, key: str, mn: float, mx: float, step: float, suffix: str) -> QDoubleSpinBox:
@@ -1065,13 +1139,43 @@ class ConfigBuilderWindow(QMainWindow):
             self.model.data["pod_time_limits"] = lf
             limits = lf
 
+        # Ensure pod_groups exists and matches POD count
+        groups = self.model.data.get("pod_groups", [])
+        if not isinstance(groups, list) or not groups:
+            groups = ["A"]
+        gf: List[str] = []
+        for g in groups:
+            gs = str(g).strip().upper()
+            if gs not in ("A", "B"):
+                gs = "A"
+            gf.append(gs)
+        if not gf:
+            gf = ["A"]
+        if n > 0:
+            while len(gf) < n:
+                gf.append(gf[-1])
+            gf = gf[:n]
+        self.model.data["pod_groups"] = gf
+        groups = gf
+
         self._pod_limit_spins: List[QDoubleSpinBox] = []
+        self._pod_group_combos: List[QComboBox] = []
         for i in range(max(n, 1)):
             row = QWidget()
             h = QHBoxLayout(row)
             h.setContentsMargins(0, 0, 0, 0)
             label = QLabel(f"POD {i} limit:")
             label.setMinimumWidth(120)
+            grp_label = QLabel("Group:")
+            grp_label.setMinimumWidth(55)
+            grp = QComboBox()
+            grp.addItems(["A", "B"])
+            gval = str(groups[i]) if (i < len(groups)) else (str(groups[-1]) if groups else "A")
+            gidx = grp.findText(gval)
+            if gidx >= 0:
+                grp.setCurrentIndex(gidx)
+            grp.currentTextChanged.connect(lambda t, idx=i: self._on_pod_group_changed(idx, t))
+            grp.activated.connect(lambda _=None, k="pod_time_limits": self.show_description(k))
             sp = QDoubleSpinBox()
             sp.setRange(0.0, 600.0)
             sp.setDecimals(2)
@@ -1082,12 +1186,14 @@ class ConfigBuilderWindow(QMainWindow):
             sp.valueChanged.connect(lambda v, idx=i: self._on_pod_limit_changed(idx, float(v)))
             sp.editingFinished.connect(lambda k="pod_time_limits": self.show_description(k))
             h.addWidget(label)
+            h.addWidget(grp_label)
+            h.addWidget(grp)
             h.addWidget(sp, 1)
             self.pod_limits_layout.addWidget(row)
             self._pod_limit_spins.append(sp)
+            self._pod_group_combos.append(grp)
 
         self.pod_limits_layout.addStretch(1)
-        self.show_description("pod_time_limits")
 
     def _on_pod_limit_changed(self, idx: int, value: float):
         limits = self.model.data.get("pod_time_limits", [])
@@ -1097,6 +1203,20 @@ class ConfigBuilderWindow(QMainWindow):
             limits.append(limits[-1] if limits else 30.0)
         limits[idx] = float(value)
         self.model.data["pod_time_limits"] = limits
+
+    def _on_pod_group_changed(self, idx: int, value: str):
+        groups = self.model.data.get("pod_groups", [])
+        if not isinstance(groups, list):
+            groups = []
+        while len(groups) <= idx:
+            groups.append(groups[-1] if groups else "A")
+        v = str(value).strip().upper()
+        if v not in ("A", "B"):
+            v = "A"
+        groups[idx] = v
+        self.model.data["pod_groups"] = groups
+        # Keep model consistent
+        self.model._normalize()
 
     def refresh_paths(self):
         self.map_picker.set_path(self.model.resolve_path("MapPath"))

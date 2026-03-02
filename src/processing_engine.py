@@ -490,6 +490,7 @@ class ProcessingEngine:
 
         # ---- POD assignment & capture analysis (wrapper) --------------------
         pods_cfg = config.get("POD", [])
+        pod_groups = config.get("pod_groups", None)
         working_radius     = config.get("pod_working_radius", 40.0)
         capture_threshold  = config.get("pod_capture_threshold_sec", 0.1)
 
@@ -497,6 +498,7 @@ class ProcessingEngine:
             tracks_by_id=tracks_by_id,
             tracker_output=tracker_output,
             pods_cfg=pods_cfg,
+            pod_groups=pod_groups,
             pixel_mapper=self.mapper,
             boundary=self.boundary,
             enemy_ids=enemy_ids,
