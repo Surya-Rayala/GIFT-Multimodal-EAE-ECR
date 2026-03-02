@@ -1,9 +1,14 @@
 name: gift-meae
 
+
 channels:
-  - pytorch
   - conda-forge
+  - pytorch
   - defaults
+
+
+channel_priority: strict
+
 
 dependencies:
   - python=3.8
@@ -25,9 +30,14 @@ dependencies:
   # GUI
   - pyqt=5
 
-  # pytorch (CPU by default; install CUDA build separately on Windows if needed)
+  # pytorch
   - pytorch
   - torchvision
+
+  # other dependencies
+  - shapely
+  - loguru
+  
 
   - pip:
     - platformdirs
@@ -35,8 +45,6 @@ dependencies:
     - imutils
     - filterpy
     - dtw
-    - shapely
-    - loguru
     - lap
     - gdown
     - ftfy
