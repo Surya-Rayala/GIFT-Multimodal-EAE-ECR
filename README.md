@@ -55,7 +55,6 @@ conda env create -f environment.yml
 > If environment creation hangs for a long time at **Solving environment**, cancel it (Ctrl+C), enable the faster solver, then re-run **Step 2**:
 >
 > ```bash
-> conda update -n base -c defaults conda -y
 > conda install -n base conda-libmamba-solver -y
 > conda config --set solver libmamba
 > ```
@@ -69,12 +68,12 @@ conda env create -f environment.yml
 conda activate gift-meae
 ```
 
-#### Windows: Install system dependencies (required)
+#### Install system dependencies (required)
 
 On **Windows**, install FFmpeg and related libraries via conda **after** activating the environment:
 
 ```bash
-conda install -c conda-forge ffmpeg libx264 opencv
+conda install -c conda-forge ffmpeg opencv
 ```
 
 On **macOS**, the project typically works without this step.
