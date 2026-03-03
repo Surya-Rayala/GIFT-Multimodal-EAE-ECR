@@ -3,8 +3,8 @@
 # - Load a floorplan image
 # - Two modes:
 #   1) Add Walls: click 2 points to create a wall segment (endpoints snap to existing corners)
-#   2) Add Scaled Point: pick two adjacent walls (share a corner), enter REAL distances to each wall
-#      and REAL wall lengths for A & B, then the tool places the point on the map.
+#   2) Add Scaled Point: pick two adjacent walls (share a corner) and enter REAL distances to each wall.
+#      Wall real-world lengths are captured when each wall is created, so you do NOT re-enter lengths here.
 # - Points are always visible (including in wall mode).
 # - Visible corner dots at wall endpoints:
 #     • Click a corner dot to use it exactly (no “near” clicking required)
@@ -26,7 +26,7 @@ from typing import Optional, Tuple, List, Dict, Set
 from PyQt5.QtCore import Qt, QPointF, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QBrush, QColor
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
+    QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox, QInputDialog,
     QHBoxLayout, QVBoxLayout, QSplitter, QGroupBox, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QAbstractItemView, QFormLayout,
     QDoubleSpinBox, QLineEdit, QSizePolicy, QStackedWidget,
@@ -60,6 +60,7 @@ class Wall:
     wall_id: int
     p1: QPointF
     p2: QPointF
+    real_len: float = 1.0  # user-provided real-world length (any consistent units)
 
 
 @dataclass
@@ -393,6 +394,7 @@ class MainWindow(QMainWindow):
         self.txt_walls_instr.setText(
             "Add Walls:\n"
             "• Click the map twice to create one wall segment.\n"
+            "• After the 2nd click, you will be prompted to enter the wall's REAL length (any consistent units).\n"
             "• Existing wall endpoints show as small corner dots. Click a dot to use it exactly.\n"
             "• Endpoints also SNAP if you click close to a corner.\n"
             "• Walls are selected only by clicking the wall line (corner dots do not select walls).\n"
@@ -442,11 +444,10 @@ class MainWindow(QMainWindow):
             "Add Scaled Point (from two adjacent walls):\n"
             "1) Select TWO walls that meet at a corner.\n"
             "2) Mark one as Wall A and one as Wall B.\n"
-            "3) Enter the REAL wall lengths for A and B.\n"
-            "4) Enter REAL distances to the walls:\n"
+            "3) Enter REAL distances to the walls:\n"
             "   • Distance to Wall B (measured parallel to Wall A)\n"
             "   • Distance to Wall A (measured parallel to Wall B)\n"
-            "5) Click 'Add Point' to place the point on the map.\n\n"
+            "4) Click 'Add Point' to place the point on the map.\n\n"
             "Units note:\n"
             "• Lengths and distances must be in the SAME units. Units don’t matter (feet/meters/etc) as long as consistent.\n\n"
             "Note:\n"
@@ -500,9 +501,12 @@ class MainWindow(QMainWindow):
 
         self.spin_lenA.setValue(1.0)
         self.spin_lenB.setValue(1.0)
+        # These are auto-populated from the wall's stored real length
+        self.spin_lenA.setEnabled(False)
+        self.spin_lenB.setEnabled(False)
 
-        form.addRow("Wall A real length:", self.spin_lenA)
-        form.addRow("Wall B real length:", self.spin_lenB)
+        form.addRow("Wall A real length (auto):", self.spin_lenA)
+        form.addRow("Wall B real length (auto):", self.spin_lenB)
         form.addRow("Distance to Wall B (along A):", self.spin_d_to_B)
         form.addRow("Distance to Wall A (along B):", self.spin_d_to_A)
 
@@ -601,6 +605,24 @@ class MainWindow(QMainWindow):
         return sw
 
 
+    def _prompt_wall_real_length(self, wid: int) -> Optional[float]:
+        """Prompt the user for the real-world length of a wall segment.
+        Units are arbitrary but must be consistent across the project.
+        Returns None if the user cancels.
+        """
+        val, ok = QInputDialog.getDouble(
+            self,
+            "Wall Length",
+            f"Enter REAL length for Wall {wid} (any consistent units):",
+            1.0,
+            0.0001,
+            1_000_000.0,
+            4,
+        )
+        if not ok:
+            return None
+        return float(val)
+
     # ---------------- UX helpers ----------------
     def _warn(self, title: str, msg: str):
         QMessageBox.warning(self, title, msg)
@@ -691,7 +713,7 @@ class MainWindow(QMainWindow):
         for wid in sorted(self.walls.keys()):
             w = self.walls[wid]
             item = QListWidgetItem(
-                f"Wall {wid}   ({int(w.p1.x())},{int(w.p1.y())}) → ({int(w.p2.x())},{int(w.p2.y())})"
+                f"Wall {wid}   ({int(w.p1.x())},{int(w.p1.y())}) → ({int(w.p2.x())},{int(w.p2.y())})   |   L={w.real_len:g}"
             )
             item.setData(Qt.UserRole, wid)
             self.list_walls.addItem(item)
@@ -897,6 +919,8 @@ class MainWindow(QMainWindow):
 
         self.spin_lenA.setValue(1.0)
         self.spin_lenB.setValue(1.0)
+        self.spin_lenA.setEnabled(False)
+        self.spin_lenB.setEnabled(False)
         self.spin_d_to_A.setValue(0.0)
         self.spin_d_to_B.setValue(0.0)
         self.lbl_pf_feedback.setText("")
@@ -949,7 +973,16 @@ class MainWindow(QMainWindow):
         wid = self._wall_id_seq
         self._wall_id_seq += 1
 
-        w = Wall(wall_id=wid, p1=p1, p2=p2)
+        # Prompt for real-world length right after drawing the wall
+        real_len = self._prompt_wall_real_length(wid)
+        if real_len is None:
+            # If cancelled, keep a sensible default but make it visible to the user.
+            real_len = 1.0
+            self.lbl_pf_feedback.setText(
+                f"Wall {wid} length entry cancelled; defaulting to 1.0. You can delete/recreate the wall to change it."
+            )
+
+        w = Wall(wall_id=wid, p1=p1, p2=p2, real_len=real_len)
         item = WallItem(wid, p1, p2)
         self.canvas.scene().addItem(item)
 
@@ -1067,6 +1100,9 @@ class MainWindow(QMainWindow):
             self.lbl_pf_feedback.setText("Wall B cleared (not adjacent). Now select an adjacent wall and mark it as B.")
 
         self.wallA_id = new_a
+        # Auto-fill Wall A real length from stored wall data
+        if self.wallA_id in self.walls:
+            self.spin_lenA.setValue(float(self.walls[self.wallA_id].real_len))
         if self.wallB_id == self.wallA_id:
             self.wallB_id = None
         self._refresh_all()
@@ -1084,6 +1120,9 @@ class MainWindow(QMainWindow):
             self.lbl_pf_feedback.setText("Wall A cleared (not adjacent). Now select an adjacent wall and mark it as A.")
 
         self.wallB_id = new_b
+        # Auto-fill Wall B real length from stored wall data
+        if self.wallB_id in self.walls:
+            self.spin_lenB.setValue(float(self.walls[self.wallB_id].real_len))
         if self.wallA_id == self.wallB_id:
             self.wallA_id = None
         self._refresh_all()
@@ -1112,8 +1151,11 @@ class MainWindow(QMainWindow):
             self._warn("Add Point", "Failed to compute vectors from the shared corner.")
             return
 
-        lenA_real = float(self.spin_lenA.value())
-        lenB_real = float(self.spin_lenB.value())
+        # Use stored wall lengths (spin boxes are auto-populated and disabled)
+        lenA_real = float(self.walls[self.wallA_id].real_len)
+        lenB_real = float(self.walls[self.wallB_id].real_len)
+        self.spin_lenA.setValue(lenA_real)
+        self.spin_lenB.setValue(lenB_real)
         d_to_B = float(self.spin_d_to_B.value())
         d_to_A = float(self.spin_d_to_A.value())
 
