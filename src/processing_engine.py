@@ -7,6 +7,7 @@ import os
 from tqdm import trange, tqdm
 import logging
 import numpy as np
+from typing import Dict, List, Tuple
 
 from src.metrics.utils import len_comparator
 
@@ -61,6 +62,35 @@ logging.getLogger("mmengine").setLevel(logging.ERROR)
 logging.getLogger("mmdet").setLevel(logging.ERROR)
 logging.getLogger("libs.Track.trackers.basetracker").setLevel(logging.ERROR)
 ######################################################Change End#####################################################
+
+# ------------------------------------------------------------------
+# Visualization -> vmeta suffix mapping
+# IMPORTANT: suffix must match the actual saved video filename pattern:
+#   <video_basename><suffix>.mp4
+# ------------------------------------------------------------------
+VIS_VMETA_SUFFIX: Dict[str, str] = {
+    # Camera-view videos
+    "annotate_camera_video": "_Tracking_Overlays",
+    "annotate_camera_with_gaze_triangle": "_Gaze_Triangles",
+    "annotate_clearance_video": "_Clearance_Callouts",
+    "annotate_camera_tracking_with_clearance": "_Tracking_WithClearance",
+
+    # Map-view videos
+    "annotate_map_video": "_Tracking_Map",
+    "annotate_map_pod_video": "_Tracking_PodAreas",
+    "annotate_map_pod_with_paths_video": "_Tracking_PodAreasWithTrails",
+
+    # Map gaze (your ProcessingEngine uses accumulated_clear=True)
+    "annotate_map_with_gaze": "_Gaze_MapCleared",
+}
+
+DEFAULT_ENABLED_VISUALIZATIONS: List[str] = [
+    "annotate_camera_with_gaze_triangle",
+    "annotate_map_with_gaze",
+    "annotate_map_pod_with_paths_video",
+    "annotate_camera_tracking_with_clearance",
+]
+
 
 class ProcessingEngine:
     def __init__(self, force_transcode=False, config=None):
@@ -225,6 +255,17 @@ class ProcessingEngine:
         config = self.config  # Use the initialized config
 
         # --------------------------------------------------------------
+        # Which visualizations to render (avoid commenting/uncommenting)
+        # --------------------------------------------------------------
+        enabled = config.get("enabled_visualizations", None)
+        if not isinstance(enabled, list) or not enabled:
+            enabled = list(DEFAULT_ENABLED_VISUALIZATIONS)
+
+        # Keep only known visualization names
+        enabled = [name for name in enabled if name in VIS_VMETA_SUFFIX]
+        self.enabled_visualizations = enabled
+        
+        # --------------------------------------------------------------
         # Visual angle config: store ONE value in config (full angle).
         # Some downstream functions expect a half-angle; compute it once.
         # --------------------------------------------------------------
@@ -243,7 +284,7 @@ class ProcessingEngine:
         enemy_ids = config.get("enemy_ids", [getattr(self.tracker, "ENEMY_FINAL_ID", 99)])
 
         # Initialize metrics
-        metrics: list[AbstractMetric] = [
+        metrics: List[AbstractMetric] = [
             IdentifyAndCapturePods_Metric(config),
             CapturePodTime_Metric(config),
             MoveAlongWall_Metric(config),
@@ -270,11 +311,11 @@ class ProcessingEngine:
         logging.debug("Saved map cache to: {}".format(os.path.join(self.output_directory, "EmptyMap.jpg")))
 
         # Collectors
-        raw_frames: list[np.ndarray] = []            # original frames for camera video
-        tracker_output: list[dict] = []              # per‑frame serialised tracking info
-        all_map_points: list[list] = []              # [frame, id, mapX, mapY]
-        gaze_info: dict[tuple, tuple] = {}           # {(frame, id): (ox, oy, dx, dy)}
-        all_frames: list[list] = []  # collect map_points per frame for batch metrics
+        raw_frames: List[np.ndarray] = []            # original frames for camera video
+        tracker_output: List[dict] = []              # per‑frame serialised tracking info
+        all_map_points: List[list] = []              # [frame, id, mapX, mapY]
+        gaze_info: Dict[Tuple[int, int], Tuple[float, float, float, float]] = {}  # {(frame, id): (ox, oy, dx, dy)}
+        all_frames: List[list] = []  # collect map_points per frame for batch metrics
 
         # Begin Processing
         for frame_num in tqdm(range(1, frame_total + 1), desc="Processing frames", unit="frame"):
@@ -404,55 +445,65 @@ class ProcessingEngine:
         save_position_cache(all_map_points, self.output_directory, self.video_basename)
         save_gaze_cache(gaze_info, self.output_directory, self.video_basename)
 
-        # Disabled: not saving this artifact for now
-#         annotate_camera_video(
-#             raw_frames,
-#             tracker_output,
-#             config["frame_rate"],
-#             self.output_directory,
-#             self.video_basename,
-#             enemy_ids=enemy_ids,
-#             gaze_conf_threshold=self.pose_conf_threshold,
-#         )
-        annotate_camera_with_gaze_triangle(
-            raw_frames,
-            tracker_output,
-            gaze_info,
-            config["frame_rate"],
-            self.output_directory,
-            self.video_basename,
-            enemy_ids=enemy_ids,
-            half_angle_deg=half_visual_angle_deg,
-            alpha=0.2,
-            show_enemy_gaze=False
-        )
-        # Disabled: not saving this artifact for now
-#         annotate_map_video(
-#             config["Map Image"],
-#             all_map_points,
-#             config["frame_rate"],
-#             self.output_directory,
-#             self.video_basename,
-#             total_frames=len(raw_frames)
-#         )
-        # --- Annotate map with gaze if boundary is available ---
-        if self.boundary is not None:
-            annotate_map_with_gaze(
-                map_image=config["Map Image"],
-                pixel_mapper=self.mapper,
-                gaze_info=gaze_info,
-                room_boundary_coords=list(self.boundary.exterior.coords),
-                frame_rate=config["frame_rate"],
-                output_directory=self.output_directory,
-                video_basename=self.video_basename,
+        # --------------------------------------------------------------
+        # Visualizations (driven by config["enabled_visualizations"])
+        # --------------------------------------------------------------
+        if "annotate_camera_video" in self.enabled_visualizations:
+            annotate_camera_video(
+                raw_frames,
+                tracker_output,
+                config["frame_rate"],
+                self.output_directory,
+                self.video_basename,
                 enemy_ids=enemy_ids,
-                show_enemy_gaze=False,
-                half_angle_deg=half_visual_angle_deg,
-                alpha=0.1,
-                total_frames=len(raw_frames),
-                accumulated_clear=True
+                gaze_conf_threshold=self.pose_conf_threshold,
             )
-            # Compute and save room coverage cache
+
+        if "annotate_camera_with_gaze_triangle" in self.enabled_visualizations:
+            annotate_camera_with_gaze_triangle(
+                raw_frames,
+                tracker_output,
+                gaze_info,
+                config["frame_rate"],
+                self.output_directory,
+                self.video_basename,
+                enemy_ids=enemy_ids,
+                half_angle_deg=half_visual_angle_deg,
+                alpha=0.2,
+                show_enemy_gaze=False,
+            )
+
+        if "annotate_map_video" in self.enabled_visualizations:
+            annotate_map_video(
+                config["Map Image"],
+                all_map_points,
+                config["frame_rate"],
+                self.output_directory,
+                self.video_basename,
+                total_frames=len(raw_frames),
+                enemy_ids=enemy_ids,
+            )
+
+        coverage_data = None
+        if self.boundary is not None:
+            if "annotate_map_with_gaze" in self.enabled_visualizations:
+                annotate_map_with_gaze(
+                    map_image=config["Map Image"],
+                    pixel_mapper=self.mapper,
+                    gaze_info=gaze_info,
+                    room_boundary_coords=list(self.boundary.exterior.coords),
+                    frame_rate=config["frame_rate"],
+                    output_directory=self.output_directory,
+                    video_basename=self.video_basename,
+                    enemy_ids=enemy_ids,
+                    show_enemy_gaze=False,
+                    half_angle_deg=half_visual_angle_deg,
+                    alpha=0.1,
+                    total_frames=len(raw_frames),
+                    accumulated_clear=True,
+                )
+
+            # Keep this as-is if you always want it when boundary exists
             coverage_data = compute_room_coverage(
                 map_image=config["Map Image"],
                 pixel_mapper=self.mapper,
@@ -461,10 +512,9 @@ class ProcessingEngine:
                 frame_rate=config["frame_rate"],
                 total_frames=len(raw_frames),
                 enemy_ids=enemy_ids,
-                half_angle_deg=half_visual_angle_deg
+                half_angle_deg=half_visual_angle_deg,
             )
             save_room_coverage_cache(coverage_data, self.output_directory, self.video_basename)
-        # Disabled: not saving this artifact for now
         
 
         # Persist full tracker output for debugging / downstream analysis
@@ -482,7 +532,7 @@ class ProcessingEngine:
         for frame_pts in all_frames:
             for trk_id, _, _ in frame_pts:
                 all_ids.add(trk_id)
-        tracks_by_id: dict[int, list] = {tid: [] for tid in all_ids}
+        tracks_by_id: Dict[int, list] = {tid: [] for tid in all_ids}
         for frame_pts in all_frames:
             frame_dict = {tid: (x, y) for tid, x, y in frame_pts}
             for tid in all_ids:
@@ -510,34 +560,34 @@ class ProcessingEngine:
             video_basename=self.video_basename
         )
 
-        # ---- Render POD area video ----
-        # Disabled: not saving this artifact for now
-#         annotate_map_pod_video(
-#             config["Map Image"],
-#             all_map_points=all_map_points,
-#             assignment=assignment,
-#             dynamic_work_areas=dynamic_work_areas,
-#             pod_capture_data=pod_capture_data,
-#             frame_rate=config["frame_rate"],
-#             output_directory=self.output_directory,
-#             video_basename=self.video_basename,
-#             total_frames=len(raw_frames),
-#             enemy_ids=enemy_ids
-#         )
+        # ---- Render POD videos (driven by enabled list) ----
+        if "annotate_map_pod_video" in self.enabled_visualizations:
+            annotate_map_pod_video(
+                config["Map Image"],
+                all_map_points=all_map_points,
+                assignment=assignment,
+                dynamic_work_areas=dynamic_work_areas,
+                pod_capture_data=pod_capture_data,
+                frame_rate=config["frame_rate"],
+                output_directory=self.output_directory,
+                video_basename=self.video_basename,
+                total_frames=len(raw_frames),
+                enemy_ids=enemy_ids,
+            )
 
-        # ---- Render combined POD areas + trajectory trails video ----
-        annotate_map_pod_with_paths_video(
-            config["Map Image"],
-            all_map_points=all_map_points,
-            assignment=assignment,
-            dynamic_work_areas=dynamic_work_areas,
-            pod_capture_data=pod_capture_data,
-            frame_rate=config["frame_rate"],
-            output_directory=self.output_directory,
-            video_basename=self.video_basename,
-            total_frames=len(raw_frames),
-            enemy_ids=enemy_ids
-        )
+        if "annotate_map_pod_with_paths_video" in self.enabled_visualizations:
+            annotate_map_pod_with_paths_video(
+                config["Map Image"],
+                all_map_points=all_map_points,
+                assignment=assignment,
+                dynamic_work_areas=dynamic_work_areas,
+                pod_capture_data=pod_capture_data,
+                frame_rate=config["frame_rate"],
+                output_directory=self.output_directory,
+                video_basename=self.video_basename,
+                total_frames=len(raw_frames),
+                enemy_ids=enemy_ids,
+            )
 
         # Build structured context containing all inferences
         bbox_details = {}
@@ -574,29 +624,29 @@ class ProcessingEngine:
             wrist_frames=threat_interaction_frames*0.1,  # Finer‑grained threshold for wrist intersection time if desired
             gaze_frames=threat_interaction_frames*0.5,    # Finer‑grained threshold for gaze intersection time if desired
         )
-        # Disabled: not saving this artifact for now
-#         annotate_clearance_video(
-#             raw_frames,
-#             tracker_output,
-#             clearance_map,
-#             config["frame_rate"],
-#             self.output_directory,
-#             self.video_basename,
-#             enemy_ids=enemy_ids
-#         )
+        if "annotate_clearance_video" in self.enabled_visualizations:
+            annotate_clearance_video(
+                raw_frames,
+                tracker_output,
+                clearance_map,
+                config["frame_rate"],
+                self.output_directory,
+                self.video_basename,
+                enemy_ids=enemy_ids,
+            )
 
-        # ---- Render combined tracking (boxes + skeletons) with clearance callouts ----
-        annotate_camera_tracking_with_clearance(
-            raw_frames,
-            tracker_output,
-            clearance_map,
-            config["frame_rate"],
-            self.output_directory,
-            self.video_basename,
-            enemy_ids=enemy_ids,
-            gaze_conf_threshold=self.pose_conf_threshold,
-            show_clearing_id=True
-        )
+        if "annotate_camera_tracking_with_clearance" in self.enabled_visualizations:
+            annotate_camera_tracking_with_clearance(
+                raw_frames,
+                tracker_output,
+                clearance_map,
+                config["frame_rate"],
+                self.output_directory,
+                self.video_basename,
+                enemy_ids=enemy_ids,
+                gaze_conf_threshold=self.pose_conf_threshold,
+                show_clearing_id=True,
+            )
         save_threat_clearance_cache(clearance_map, self.output_directory, self.video_basename)
         # Attach to context so metrics can reuse it
         context.threat_clearance = clearance_map
@@ -630,8 +680,12 @@ class ProcessingEngine:
     def get_assessment(self, timestamp, metric_name):
         timestamp = int(timestamp)
         if self.writeXML:
-            generate_vmeta(self.output_directory, self.video_basename, "_Tracking")
-            generate_vmeta(self.output_directory, self.video_basename, "_MapTracking")
+            # Generate vmeta files for whichever visualizations were enabled.
+            for viz_name in getattr(self, "enabled_visualizations", []) or []:
+                suffix = VIS_VMETA_SUFFIX.get(viz_name)
+                if not suffix:
+                    continue
+                generate_vmeta(self.output_directory, self.video_basename, suffix)
             self.writeXML = False
 
         desired_metrics = []
