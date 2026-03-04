@@ -690,7 +690,7 @@ class ProcessingEngine:
 
         desired_metrics = []
         for metric in self.metrics:
-            if metric["metric_name"] == metric_name and metric["timestamp"] < timestamp and metric["timestamp"] > self.playback_time:
+            if metric["metric_name"] == metric_name:
                 desired_metrics.append(metric)
 
         self.playback_time = max(timestamp, self.playback_time)  # Enforce forward time progression

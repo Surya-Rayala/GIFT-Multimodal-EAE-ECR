@@ -76,6 +76,14 @@ On **Windows**, install FFmpeg and related libraries via conda **after** activat
 conda install -c conda-forge ffmpeg opencv
 ```
 
+If you later see `mmcv`/`mim` attempting to **build from source** (instead of downloading a prebuilt wheel), you may also need a C++ toolchain:
+
+- Microsoft C++ Build Tools (Visual Studio Build Tools)
+- CMake
+- Ninja (optional but helpful)
+
+In most cases, the best fix is to ensure PyTorch + CUDA are installed correctly (see below) so `mim` can find a matching prebuilt wheel.
+
 On **macOS**, the project typically works without this step.
 
 ---
@@ -83,30 +91,39 @@ On **macOS**, the project typically works without this step.
 
 ### CUDA + PyTorch (GPU machines only)
 
-If you are using a **CUDA-enabled** machine, the supported **CUDA Toolkit** versions are:
-
-- **11.8**
-- **12.1**
-- **12.4**
+If you are using a **CUDA-enabled** machine, this project targets **CUDA 12+** (recommended: **12.1**).
 
 This step is **only needed on CUDA-enabled devices**.
 
 **Uninstall any existing PyTorch packages** in this environment:
 
 ```bash
-pip uninstall -y torch torchvision
+pip uninstall -y torch torchvision torchaudio
 ```
 
-Next, install compatible **PyTorch**:
+Next, install compatible **PyTorch (CUDA 12.1)** using **either** Conda **or** Pip:
 
-#### CUDA 11.8
-conda install pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1  pytorch-cuda=11.8 -c pytorch -c nvidia
-#### CUDA 12.1
-conda install pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 pytorch-cuda=12.1 -c pytorch -c nvidia
-#### CUDA 12.4
-conda install pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 pytorch-cuda=12.4 -c pytorch -c nvidia
+**Option A — Conda (recommended)**
 
-Once PyTorch is installed, continue with the `mim` installs below.
+```bash
+conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=12.1 -c pytorch -c nvidia
+```
+
+**Option B — Pip (CUDA 12.1 wheels)**
+
+```bash
+pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu121
+```
+
+Right after installing PyTorch, **verify CUDA is visible** before installing any OpenMMLab packages:
+
+```bash
+python -c "import torch; print('torch', torch.__version__); print('cuda available:', torch.cuda.is_available()); print('mps available:', hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()); print('device count (cuda):', torch.cuda.device_count() if torch.cuda.is_available() else 0)"
+```
+
+⚠️ **Caution:** Make sure `cuda available: True` (and ideally `device count (cuda) > 0`) **at this step** before running any `mim install ...` commands. OpenMMLab wheels (especially `mmcv`) are selected based on your installed PyTorch/CUDA setup. If CUDA is not detected here, `mim` may fall back to incompatible wheels or attempt a source build.
+
+Once PyTorch is verified, continue with the `mim` installs below.
 
 ---
 
