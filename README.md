@@ -87,16 +87,6 @@ If you are using a **CUDA-enabled** machine, this project targets **CUDA 12+** (
 
 This step is **only needed on CUDA-enabled devices**.
 
-#### Windows note (build tools)
-
-If you later see `mmcv`/`mim` attempting to **build from source** (instead of downloading a prebuilt wheel), you may also need a C++ toolchain:
-
-- Microsoft C++ Build Tools (Visual Studio Build Tools)
-- CMake
-- Ninja (optional but helpful)
-
-In most cases, the best fix is to ensure PyTorch + CUDA are installed correctly (see below) so `mim` can find a matching prebuilt wheel.
-
 **Uninstall any existing PyTorch packages** in this environment:
 
 ```bash
