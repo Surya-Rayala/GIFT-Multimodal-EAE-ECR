@@ -68,21 +68,13 @@ conda env create -f environment.yml
 conda activate gift-meae
 ```
 
-#### Install system dependencies (required)
+#### Install video dependencies (required)
 
-On **Windows**, install FFmpeg and related libraries via conda **after** activating the environment:
+Install FFmpeg and related libraries via conda **after** activating the environment:
 
 ```bash
 conda install -c conda-forge ffmpeg opencv
 ```
-
-If you later see `mmcv`/`mim` attempting to **build from source** (instead of downloading a prebuilt wheel), you may also need a C++ toolchain:
-
-- Microsoft C++ Build Tools (Visual Studio Build Tools)
-- CMake
-- Ninja (optional but helpful)
-
-In most cases, the best fix is to ensure PyTorch + CUDA are installed correctly (see below) so `mim` can find a matching prebuilt wheel.
 
 On **macOS**, the project typically works without this step.
 
@@ -94,6 +86,16 @@ On **macOS**, the project typically works without this step.
 If you are using a **CUDA-enabled** machine, this project targets **CUDA 12+** (recommended: **12.1**).
 
 This step is **only needed on CUDA-enabled devices**.
+
+#### Windows note (build tools)
+
+If you later see `mmcv`/`mim` attempting to **build from source** (instead of downloading a prebuilt wheel), you may also need a C++ toolchain:
+
+- Microsoft C++ Build Tools (Visual Studio Build Tools)
+- CMake
+- Ninja (optional but helpful)
+
+In most cases, the best fix is to ensure PyTorch + CUDA are installed correctly (see below) so `mim` can find a matching prebuilt wheel.
 
 **Uninstall any existing PyTorch packages** in this environment:
 
