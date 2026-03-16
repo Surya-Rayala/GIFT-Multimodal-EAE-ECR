@@ -3,8 +3,9 @@ Config Builder UI (PyQt5) for Army ECR Battle Drill pipeline
 
 Features
 - Main page: POD + Boundary loaders (txt), point mapping / entry polys / map image pickers
-- Main knobs: visual angle, threat interaction time, entry time threshold, POD working radius,
-              POD capture threshold, per-POD time limits (dynamic), coverage time threshold, stay-along-wall
+- Main knobs: visual angle, threat interaction time, entry time threshold, hesitation threshold,
+              hesitation threshold (2→3 entrants), POD working radius, POD capture threshold,
+              per-POD time limits (dynamic), coverage time threshold, stay-along-wall
 - Live preview: map image + boundary polygon + POD points (labeled) + working-radius circles + wall band
 - Advanced page: all other config elements with defaults pre-filled
 - Root folder picker: used for saving config.json and for storing relative paths when possible
@@ -71,6 +72,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "visual_angle_degrees": 20.0,
     "min_threat_interaction_time_sec": 1.0,
     "entry_time_threshold_sec": 2.0,
+    "HESITATION_THRESHOLD": 1.0,
+    "HESITATION_THRESHOLD_SECOND": 2.0,
 
     # pod knobs (main defaults)
     "pod_working_radius": 40.0,
@@ -114,6 +117,8 @@ COMMENTS: Dict[str, str] = {
     "visual_angle_degrees": "Full field-of-view angle (degrees) used for gaze triangles, map gaze/coverage, and threat-clearance.",
     "min_threat_interaction_time_sec": "Minimum interaction time (seconds) required to count a threat as cleared.",
     "entry_time_threshold_sec": "Max allowed team entry span (seconds) for full score in TOTAL_TIME_OF_ENTRY.",
+    "HESITATION_THRESHOLD": "No-penalty hesitation gap (seconds) used for all consecutive entrant pairs except the second pair. Doctrine allows some delay between entrants 2 and 3 in case of any adverse action in the room.",
+    "HESITATION_THRESHOLD_SECOND": "Special no-penalty hesitation gap (seconds) used only for the gap between entrants 2→3. This second threshold is intentionally more permissive because doctrine allows some delay there in case of any adverse action in the room.",
 
     "pod_working_radius": "Radius (map pixels) around each POD used to compute work areas for POD capture analysis.",
     "pod_capture_threshold_sec": "Seconds required inside a POD work area to count as captured.",
@@ -970,6 +975,18 @@ class ConfigBuilderWindow(QMainWindow):
         knobs_layout.addWidget(QLabel("seconds"), row, 2)
         row += 1
 
+        self.spin_hesitation = self._mk_dspin("HESITATION_THRESHOLD", 0.0, 30.0, 0.1, "sec")
+        knobs_layout.addWidget(self._mk_label_btn("Hesitation threshold", "HESITATION_THRESHOLD"), row, 0)
+        knobs_layout.addWidget(self.spin_hesitation, row, 1)
+        knobs_layout.addWidget(QLabel("seconds"), row, 2)
+        row += 1
+
+        self.spin_hesitation_second = self._mk_dspin("HESITATION_THRESHOLD_SECOND", 0.0, 30.0, 0.1, "sec")
+        knobs_layout.addWidget(self._mk_label_btn("Hesitation threshold (2→3 entrants)", "HESITATION_THRESHOLD_SECOND"), row, 0)
+        knobs_layout.addWidget(self.spin_hesitation_second, row, 1)
+        knobs_layout.addWidget(QLabel("seconds"), row, 2)
+        row += 1
+
         self.spin_pod_radius = self._mk_dspin("pod_working_radius", 0.0, 5000.0, 1.0, "px")
         self.spin_pod_radius.valueChanged.connect(lambda _: self.preview.refresh())
         knobs_layout.addWidget(self._mk_label_btn("POD working radius", "pod_working_radius"), row, 0)
@@ -1250,6 +1267,8 @@ class ConfigBuilderWindow(QMainWindow):
         self.spin_visual_angle.setValue(float(self.model.data.get("visual_angle_degrees", 20.0)))
         self.spin_threat_time.setValue(float(self.model.data.get("min_threat_interaction_time_sec", 1.0)))
         self.spin_entry_time.setValue(float(self.model.data.get("entry_time_threshold_sec", 2.0)))
+        self.spin_hesitation.setValue(float(self.model.data.get("HESITATION_THRESHOLD", 1.0)))
+        self.spin_hesitation_second.setValue(float(self.model.data.get("HESITATION_THRESHOLD_SECOND", 2.0)))
         self.spin_pod_radius.setValue(float(self.model.data.get("pod_working_radius", 40.0)))
         self.spin_pod_capture.setValue(float(self.model.data.get("pod_capture_threshold_sec", 0.1)))
         self.spin_coverage_time.setValue(float(self.model.data.get("coverage_time_threshold", 3.0)))
