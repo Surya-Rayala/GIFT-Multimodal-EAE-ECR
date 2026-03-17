@@ -1892,18 +1892,19 @@ def compute_room_coverage(
 
         # b) Compute fraction covered so far
         covered_pixels = int(covered_mask.sum())
-        fraction = covered_pixels / total_room_pixels
+        raw_fraction = covered_pixels / total_room_pixels
+        fraction = round(raw_fraction, 2)
         coverage_per_frame.append((frame_idx, fraction))
 
-        # c) If coverage just reached 1.0 and we haven't recorded it yet, record time_to_full
+        # c) Use the rounded per-frame fraction for completion timing so timing,
+        # cache values, and downstream analysis are all based on the same rounded data.
         if fraction >= 1.0 and time_to_full is None and first_non_enemy_frame is not None:
             full_frame_idx = frame_idx
             # Time elapsed = (full_frame_idx - first_non_enemy_frame) / frame_rate
-            time_to_full = (full_frame_idx - first_non_enemy_frame) / frame_rate
+            time_to_full = round((full_frame_idx - first_non_enemy_frame) / frame_rate, 2)
 
-    # 7) After all frames, record final fraction
-    raw_final_fraction = coverage_per_frame[-1][1] if coverage_per_frame else 0.0
-    final_fraction = round(raw_final_fraction, 2)
+    # 7) After all frames, record final fraction from the already-rounded per-frame values
+    final_fraction = coverage_per_frame[-1][1] if coverage_per_frame else 0.0
 
     return {
         "coverage_per_frame": coverage_per_frame,
@@ -1951,12 +1952,13 @@ def save_room_coverage_cache(
         # 1) Write per-frame coverage
         f.write("frame,coverage_fraction\n")
         for frame_idx, frac in cov_list:
-            f.write(f"{frame_idx},{frac:.6f}\n")
+            f.write(f"{frame_idx},{frac:.2f}\n")
 
         # 2) Blank line, then summary
         f.write("\n")
         f.write(f"first_non_enemy_frame,{first_non_enemy if first_non_enemy is not None else ''}\n")
-        f.write(f"time_to_full_seconds,{time_to_full if time_to_full is not None else ''}\n")
+        time_to_full_str = f"{time_to_full:.2f}" if time_to_full is not None else ""
+        f.write(f"time_to_full_seconds,{time_to_full_str}\n")
         f.write(f"final_fraction,{final_fraction:.2f}\n")
 
 
