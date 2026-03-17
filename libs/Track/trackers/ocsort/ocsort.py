@@ -489,6 +489,8 @@ class OCSort(BaseTracker):
         boundary=None,
         boundary_pad_pct: float = 0.0,
         track_enemy: bool = True,
+        entry_conf_threshold: Optional[float] = None,
+        keypoint_mean_conf_threshold: Optional[float] = None,
         # FIX: was missing in your class but used later
         max_obs: int = 50,
     ):
@@ -504,6 +506,10 @@ class OCSort(BaseTracker):
         self.asso_func = get_asso_func(asso_func)
         self.inertia = inertia
         self.use_byte = use_byte
+        self.entry_conf_threshold = float(entry_conf_threshold) if entry_conf_threshold is not None else float(det_thresh)
+        self.keypoint_mean_conf_threshold = (
+            float(keypoint_mean_conf_threshold) if keypoint_mean_conf_threshold is not None else float(det_thresh)
+        )
 
         self.max_obs = max_obs
 
@@ -566,12 +572,27 @@ class OCSort(BaseTracker):
         dets = np.hstack([dets, np.arange(len(dets)).reshape(-1, 1)])
 
         confs = dets[:, 4]
+
+        if keypoints is not None:
+            kp_mean_confs = np.asarray(
+                [float(np.mean(kp[:, 2])) if kp is not None and len(kp) > 0 else 0.0 for kp in keypoints],
+                dtype=float,
+            )
+        else:
+            kp_mean_confs = None
+
         inds_low = confs > 0.1
         inds_high = confs < self.det_thresh
         inds_second = np.logical_and(inds_low, inds_high)
+
+        if kp_mean_confs is not None:
+            inds_second = np.logical_and(inds_second, kp_mean_confs > self.keypoint_mean_conf_threshold)
+
         dets_second = dets[inds_second]
 
         remain_inds = confs > self.det_thresh
+        if kp_mean_confs is not None:
+            remain_inds = np.logical_and(remain_inds, kp_mean_confs > self.keypoint_mean_conf_threshold)
         dets = dets[remain_inds]
 
         # FIX: keypoints can be None
@@ -673,6 +694,7 @@ class OCSort(BaseTracker):
         if unmatched_dets.shape[0] > 0:
             for i in unmatched_dets:
                 kp_i = keypoints_first[i] if keypoints_first is not None else None
+                det_conf = float(dets[i, 4])
 
                 # Convert detection centre to map point (if mapper available)
                 map_point = None
@@ -684,6 +706,8 @@ class OCSort(BaseTracker):
 
                 # If the point is inside an entry polygon (door/entry zone), do NOT classify it as the pre-existing enemy.
                 # This prevents door entrants from being incorrectly assigned ENEMY_FINAL_ID.
+                # Also, once we accept an entrant through the entry logic below, we will mark
+                # `enemy_done = True` so the remaining tracks are treated as participants.
                 in_entry = False
                 if (map_point is not None) and self.entry_polys:
                     in_entry = any(poly.contains(map_point) for poly in self.entry_polys)
@@ -725,10 +749,14 @@ class OCSort(BaseTracker):
                             map_point = geo.Point(float(map_xy[0]), float(map_xy[1]))
 
                     for poly in self.entry_polys:
-                        if poly.contains(map_point):
+                        if poly.contains(map_point) and det_conf >= self.entry_conf_threshold:
                             create = True
                             break
 
+                    # Require both spatial entry confirmation and sufficient detection
+                    # confidence before allowing a new track to be born from an entry region.
+                    # This helps suppress one-off false detections near the doorway from
+                    # later maturing into valid room identities after they drift elsewhere.
                     if create and not self.entry_window_active:
                         self.entry_window_active = True
                         self.entry_window_counter = 0
@@ -746,6 +774,16 @@ class OCSort(BaseTracker):
                         keypoint_confidence_threshold=keypoint_confidence_threshold,
                     )
                     self.active_tracks.append(trk)
+
+                    # Once a person is legitimately born from an entry region, treat the
+                    # scene as having no pre-existing in-room enemy. From this point on,
+                    # all entrants are participants and normal participant IDs should start
+                    # from 1 instead of allowing a later non-entry detection to be labeled
+                    # as ENEMY_FINAL_ID.
+                    if self.limit_entry and in_entry:
+                        self.enemy_active = False
+                        self.enemy_done = True
+                        self.enemy_was_in_entry = False
 
         # ---------------- Build outputs + remove dead tracks ----------------
         i = len(self.active_tracks)

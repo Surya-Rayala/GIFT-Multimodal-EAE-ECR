@@ -126,7 +126,7 @@ class ThreatCoverage_Metric(AbstractMetric):
 
         # Compute final score
         if present_frames == 0:
-            self._final_score = 0.0
+            self._final_score = 1.0
         else:
             self._final_score = covered_frames / present_frames
 

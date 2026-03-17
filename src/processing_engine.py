@@ -159,7 +159,7 @@ class ProcessingEngine:
             per_class=False,
             det_thresh=0.3,
             max_age=1000,
-            min_hits=3,
+            min_hits=1,
             asso_threshold=0.6,
             delta_t=5,
             asso_func="diou", 
@@ -168,10 +168,11 @@ class ProcessingEngine:
             pixel_mapper=self.mapper,
             limit_entry=True,
             entry_polys=self.entry_polys,
-            entry_window_time=float('inf'),
+            entry_window_time=300,
             boundary=self.boundary,
             boundary_pad_pct=self.config.get("boundary_pad_pct", 0.05),
-            track_enemy=self.config.get("track_enemy", True)
+            track_enemy=self.config.get("track_enemy", True),
+            entry_conf_threshold=0.3
         )
 
         # Prepare additional parameters
@@ -391,6 +392,25 @@ class ProcessingEngine:
                 h = int(trk.get('height', 0))
                 bbox = [x1, y1, x1 + w, y1 + h]
                 kps = trk.get('keypoints', None)
+                # --- Begin inserted lines ---
+                bbox_confidence = trk.get('confidence', None)
+                track_class = trk.get('class', None)
+                ankle_based_point = trk.get('ankle_based_point', None)
+                current_map_pos = trk.get('current_map_pos', None)
+                map_velocity = trk.get('map_velocity', None)
+
+                if ankle_based_point is not None:
+                    ankle_based_point = np.asarray(ankle_based_point, dtype=float).reshape(-1)
+                    ankle_based_point = ankle_based_point.tolist() if ankle_based_point.size >= 2 else None
+
+                if current_map_pos is not None:
+                    current_map_pos = np.asarray(current_map_pos, dtype=float).reshape(-1)
+                    current_map_pos = current_map_pos.tolist() if current_map_pos.size >= 2 else None
+
+                if map_velocity is not None:
+                    map_velocity = np.asarray(map_velocity, dtype=float).reshape(-1)
+                    map_velocity = map_velocity.tolist() if map_velocity.size >= 2 else None
+                # --- End inserted lines ---
                 if kps is not None:
                     keypoints = kps[:, :2].tolist()
                     keypoint_scores = kps[:, 2].tolist()
@@ -410,6 +430,11 @@ class ProcessingEngine:
                 frame_objects.append({
                     "id": trk_id,
                     "bbox": bbox,
+                    "confidence": float(bbox_confidence) if bbox_confidence is not None else None,
+                    "class": int(track_class) if track_class is not None else None,
+                    "ankle_based_point": ankle_based_point,
+                    "current_map_pos": current_map_pos,
+                    "map_velocity": map_velocity,
                     "keypoints": keypoints,
                     "keypoint_scores": keypoint_scores
                 })

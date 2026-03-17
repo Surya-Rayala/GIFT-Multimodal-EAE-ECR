@@ -1076,26 +1076,37 @@ def _draw_point_with_border(
 
 
 def _has_valid_run(
-    info_list: List[Tuple[int, int, bool, bool]],
+    info_list: List[Tuple[int, bool, bool]],
     intersection_thr: int,
     wrist_thr: int,
     gaze_thr: int
-) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+) -> Tuple[Optional[int], Optional[int]]:
     """
-    Look for the first consecutive run of `intersection_thr` frames
-    where at least `wrist_thr` frames have wrist_flag=True and
-    at least `gaze_thr` frames have gaze_flag=True.
+    Look for the first consecutive run of `intersection_thr` frames where a
+    *single enemy-friend pair* stays in contact, and within that same run:
 
-    Returns (first_frame_in_run, last_frame_in_run, contributing_friend_id)  
-    or (None, None, None) if no valid run is found.
+      • at least `wrist_thr` frames have wrist_flag=True
+      • at least `gaze_thr` frames have gaze_flag=True
+
+    `info_list` must contain entries for one specific (enemy_id, friend_id) pair
+    in the form:
+        [(frame_idx, wrist_flag, gaze_flag), ...]
+
+    Returns:
+        (first_frame_where_thresholds_are_met, last_frame_in_qualifying_run)
+    or:
+        (None, None)
+    if no qualifying run exists.
     """
     if not info_list:
-        return None, None, None
+        return None, None
 
-    # Build a per‑frame map
-    frame_map: Dict[int, List[Tuple[int, bool, bool]]] = {}
-    for f_idx, f_id, w_flag, g_flag in info_list:
-        frame_map.setdefault(f_idx, []).append((f_id, w_flag, g_flag))
+    # Deduplicate by frame for this pair. If multiple entries somehow exist for the
+    # same frame, combine them conservatively with OR.
+    frame_map: Dict[int, Tuple[bool, bool]] = {}
+    for f_idx, w_flag, g_flag in info_list:
+        prev_w, prev_g = frame_map.get(f_idx, (False, False))
+        frame_map[f_idx] = (prev_w or w_flag, prev_g or g_flag)
 
     frames_sorted = sorted(frame_map.keys())
     i = 0
@@ -1109,26 +1120,29 @@ def _has_valid_run(
         if len(run) >= intersection_thr:
             wrist_cnt = 0
             gaze_cnt = 0
-            first_fid: Optional[int] = None
             early_frame: Optional[int] = None
+
             for fr in run:
-                for fid, w_flag, g_flag in frame_map[fr]:
-                    if w_flag:
-                        wrist_cnt += 1
-                    if g_flag:
-                        gaze_cnt += 1
-                    if (w_flag or g_flag) and first_fid is None:
-                        first_fid = fid
-                    # Record the first frame where all three thresholds are met
-                    if (wrist_cnt >= wrist_thr and gaze_cnt >= gaze_thr and
-                        len(run) >= intersection_thr and early_frame is None):
-                        early_frame = fr
+                w_flag, g_flag = frame_map[fr]
+                if w_flag:
+                    wrist_cnt += 1
+                if g_flag:
+                    gaze_cnt += 1
+
+                if wrist_cnt >= wrist_thr and gaze_cnt >= gaze_thr and early_frame is None:
+                    early_frame = fr
+
             if wrist_cnt >= wrist_thr and gaze_cnt >= gaze_thr:
-                return early_frame if early_frame is not None else run[0], run[-1], first_fid
+                return early_frame if early_frame is not None else run[0], run[-1]
+
         i = j
 
-    return None, None, None
+    return None, None
 
+
+# NOTE:
+# Threat clearance must be validated by a single friend against a single enemy.
+# Do not pool wrist / gaze evidence across multiple friends for one enemy.
 
 def compute_threat_clearance(
     tracker_output: List[Dict],
@@ -1142,7 +1156,13 @@ def compute_threat_clearance(
     gaze_frames: int = 15,
 ) -> Dict[int, Tuple[Optional[int], Optional[int], Optional[int]]]:
     """
-    Detects the first valid clearance per enemy using temporal thresholds.
+    Detect the first valid clearance per enemy using temporal thresholds.
+
+    IMPORTANT:
+    Clearance is evaluated per (enemy_id, friend_id) pair. Wrist and gaze counts
+    are never pooled across multiple friends. This makes the returned
+    `clearing_friend_id` correspond to the same friend whose overlap / wrist /
+    gaze evidence satisfied the thresholds.
 
     Returns:
         { enemy_id: (first_clear_frame, last_clear_frame, clearing_friend_id) }
@@ -1151,10 +1171,14 @@ def compute_threat_clearance(
         enemy_ids = [99]
 
     half_angle = visual_angle_deg / 2.0
-    clearance: Dict[int, Tuple[Optional[int], Optional[int], Optional[int]]] = {eid: (None, None, None) for eid in enemy_ids}
-    per_enemy: Dict[int, List[Tuple[int, int, bool, bool]]] = {eid: [] for eid in enemy_ids}
+    clearance: Dict[int, Tuple[Optional[int], Optional[int], Optional[int]]] = {
+        eid: (None, None, None) for eid in enemy_ids
+    }
 
-    # Pass 1: collect per‑frame info when boxes intersect
+    # Collect evidence separately for each (enemy, friend) pair:
+    #   (frame_idx, wrist_flag, gaze_flag)
+    per_pair: Dict[Tuple[int, int], List[Tuple[int, bool, bool]]] = {}
+
     for frame_entry in tracker_output:
         fidx = frame_entry["frame"]
         bboxes = {obj["id"]: tuple(obj["bbox"]) for obj in frame_entry["objects"]}
@@ -1166,24 +1190,33 @@ def compute_threat_clearance(
             ex1, ey1, ex2, ey2 = ebox
 
             for fid in friends:
-                if clearance[eid][0] is not None:
-                    break  # already cleared
                 fbox = bboxes[fid]
                 if not _boxes_intersect(ebox, fbox):
                     continue
 
-                # wrist check
+                # Wrist check for this same friend in this same frame.
                 wrist_flag = False
                 kp_tuple = keypoint_details.get((fidx, fid))
                 if kp_tuple and len(kp_tuple[0]) > 10:
-                    kp_list, _ = kp_tuple
+                    kp_list, kp_scores = kp_tuple
                     for wi in (9, 10):
-                        wx, wy = kp_list[wi]
-                        if ex1 <= wx <= ex2 and ey1 <= wy <= ey2:
+                        try:
+                            wx, wy = kp_list[wi]
+                        except Exception:
+                            continue
+
+                        score_ok = True
+                        if kp_scores is not None and len(kp_scores) > wi:
+                            try:
+                                score_ok = float(kp_scores[wi]) > 0.0
+                            except Exception:
+                                score_ok = True
+
+                        if score_ok and ex1 <= wx <= ex2 and ey1 <= wy <= ey2:
                             wrist_flag = True
                             break
 
-                # gaze check  (triangle / cone intersection)
+                # Gaze check for this same friend in this same frame.
                 gaze_flag = False
                 g = gaze_info.get((fidx, fid))
                 if g:
@@ -1192,12 +1225,41 @@ def compute_threat_clearance(
                     if _triangle_box_intersect(tri, ebox):
                         gaze_flag = True
 
-                per_enemy[eid].append((fidx, fid, wrist_flag, gaze_flag))
+                per_pair.setdefault((eid, fid), []).append((fidx, wrist_flag, gaze_flag))
 
-    # Pass 2: evaluate thresholds per enemy
-    for eid, info in per_enemy.items():
-        frm_start, frm_end, fid = _has_valid_run(info, intersection_frames, wrist_frames, gaze_frames)
-        clearance[eid] = (frm_start, frm_end, fid)
+    # Evaluate each enemy-friend pair independently, then choose the earliest
+    # valid clearance per enemy.
+    for eid in enemy_ids:
+        best_result: Optional[Tuple[int, int, int]] = None
+
+        pair_keys = [pair_key for pair_key in per_pair.keys() if pair_key[0] == eid]
+        for _, fid in pair_keys:
+            frm_start, frm_end = _has_valid_run(
+                per_pair[(eid, fid)],
+                intersection_frames,
+                wrist_frames,
+                gaze_frames,
+            )
+            if frm_start is None or frm_end is None:
+                continue
+
+            candidate = (frm_start, frm_end, fid)
+            if best_result is None:
+                best_result = candidate
+                continue
+
+            best_start, best_end, best_fid = best_result
+            # Prefer the earliest true clearance start. Tie-break by earlier end,
+            # then smaller friend id for determinism.
+            if (
+                frm_start < best_start
+                or (frm_start == best_start and frm_end < best_end)
+                or (frm_start == best_start and frm_end == best_end and fid < best_fid)
+            ):
+                best_result = candidate
+
+        if best_result is not None:
+            clearance[eid] = best_result
 
     return clearance
 
@@ -1840,7 +1902,8 @@ def compute_room_coverage(
             time_to_full = (full_frame_idx - first_non_enemy_frame) / frame_rate
 
     # 7) After all frames, record final fraction
-    final_fraction = coverage_per_frame[-1][1] if coverage_per_frame else 0.0
+    raw_final_fraction = coverage_per_frame[-1][1] if coverage_per_frame else 0.0
+    final_fraction = round(raw_final_fraction, 2)
 
     return {
         "coverage_per_frame": coverage_per_frame,
@@ -1894,7 +1957,7 @@ def save_room_coverage_cache(
         f.write("\n")
         f.write(f"first_non_enemy_frame,{first_non_enemy if first_non_enemy is not None else ''}\n")
         f.write(f"time_to_full_seconds,{time_to_full if time_to_full is not None else ''}\n")
-        f.write(f"final_fraction,{final_fraction:.6f}\n")
+        f.write(f"final_fraction,{final_fraction:.2f}\n")
 
 
 # ----------------------------------------------------------------------
