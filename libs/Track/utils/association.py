@@ -5,6 +5,41 @@ import numpy as np
 from .iou import iou_batch, centroid_batch, run_asso_func
 
 
+# -------------------- Helper Functions --------------------
+
+def _resolve_pose_costs(iou_matrix, pose_affinity, pose_reliability, pose_weight):
+    if pose_affinity is None:
+        return None, 0.0
+
+    pose_affinity = np.asarray(pose_affinity, dtype=float)
+    if pose_affinity.shape != iou_matrix.shape:
+        raise ValueError(
+            f"pose_affinity shape mismatch: expected {iou_matrix.shape}, got {pose_affinity.shape}"
+        )
+    pose_affinity = np.clip(pose_affinity, a_min=0.0, a_max=1.0)
+    pose_cost = pose_affinity * float(pose_weight)
+
+    if pose_reliability is None:
+        pose_reliability_cost = 1.0
+    else:
+        pose_reliability = np.asarray(pose_reliability, dtype=float)
+        if pose_reliability.shape != iou_matrix.shape:
+            raise ValueError(
+                f"pose_reliability shape mismatch: expected {iou_matrix.shape}, got {pose_reliability.shape}"
+            )
+        pose_reliability_cost = np.clip(pose_reliability, a_min=0.0, a_max=1.0)
+
+    effective_pose_cost = pose_cost * pose_reliability_cost
+    return pose_affinity, effective_pose_cost
+
+
+def _resolve_hybrid_gate_thresholds(iou_threshold, hybrid_threshold, box_threshold_floor, pose_threshold_floor):
+    resolved_hybrid_threshold = float(hybrid_threshold) if hybrid_threshold is not None else float(iou_threshold)
+    resolved_box_floor = float(box_threshold_floor) if box_threshold_floor is not None else float(iou_threshold) * 0.5
+    resolved_pose_floor = float(pose_threshold_floor) if pose_threshold_floor is not None else 0.30
+    return resolved_hybrid_threshold, resolved_box_floor, resolved_pose_floor
+
+
 def speed_direction_batch(dets, tracks):
     tracks = tracks[..., np.newaxis]
     CX1, CY1 = (dets[:, 0] + dets[:, 2]) / 2.0, (dets[:, 1] + dets[:, 3]) / 2.0
@@ -31,7 +66,7 @@ def linear_assignment(cost_matrix):
 def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3):
     """
     Assigns detections to tracked object (both represented as bounding boxes)
-    Returns 3 lists of matches, unmatched_detections and unmatched_trackers
+    Returns matches, unmatched_detections, and unmatched_trackers.
     """
     if len(trackers) == 0:
         return (
@@ -122,7 +157,12 @@ def associate(
     w_assoc_emb=None,
     aw_off=None,
     aw_param=None,
-    
+    pose_affinity=None,
+    pose_reliability=None,
+    pose_weight=0.0,
+    hybrid_threshold=None,
+    box_threshold_floor=None,
+    pose_threshold_floor=None,
 ):
     if len(trackers) == 0:
         return (
@@ -153,26 +193,28 @@ def associate(
     angle_diff_cost = angle_diff_cost.T
     angle_diff_cost = angle_diff_cost * scores
 
+    pose_affinity, effective_pose_cost = _resolve_pose_costs(
+        iou_matrix,
+        pose_affinity,
+        pose_reliability,
+        pose_weight,
+    )
+
+    final_similarity = None
     if min(iou_matrix.shape):
-        a = (iou_matrix > iou_threshold).astype(np.int32)
-        if a.sum(1).max() == 1 and a.sum(0).max() == 1:
-            matched_indices = np.stack(np.where(a), axis=1)
+        if emb_cost is None:
+            emb_cost = 0
         else:
-            if emb_cost is None:
-                emb_cost = 0
+            emb_cost[iou_matrix <= 0] = 0
+            if not aw_off:
+                emb_cost = compute_aw_max_metric(emb_cost, w_assoc_emb, bottom=aw_param)
             else:
-                emb_cost = emb_cost
-                emb_cost[iou_matrix <= 0] = 0
-                if not aw_off:
-                    emb_cost = compute_aw_max_metric(emb_cost, w_assoc_emb, bottom=aw_param)
-                else:
-                    emb_cost *= w_assoc_emb
+                emb_cost *= w_assoc_emb
 
-            final_cost = -(iou_matrix + angle_diff_cost + emb_cost)
-            matched_indices = linear_assignment(final_cost)
-            if matched_indices.size == 0:
-                matched_indices = np.empty(shape=(0, 2))
-
+        final_similarity = iou_matrix + angle_diff_cost + emb_cost + effective_pose_cost
+        matched_indices = linear_assignment(-final_similarity)
+        if matched_indices.size == 0:
+            matched_indices = np.empty(shape=(0, 2))
     else:
         matched_indices = np.empty(shape=(0, 2))
 
@@ -185,12 +227,27 @@ def associate(
         if t not in matched_indices[:, 1]:
             unmatched_trackers.append(t)
 
-    # filter out matched with low IOU
+    # filter matched pairs with hybrid gating
     matches = []
+    resolved_hybrid_threshold, resolved_box_floor, resolved_pose_floor = _resolve_hybrid_gate_thresholds(
+        iou_threshold,
+        hybrid_threshold,
+        box_threshold_floor,
+        pose_threshold_floor,
+    )
+
     for m in matched_indices:
-        if iou_matrix[m[0], m[1]] < iou_threshold:
-            unmatched_detections.append(m[0])
-            unmatched_trackers.append(m[1])
+        det_idx, trk_idx = m[0], m[1]
+        box_value = float(iou_matrix[det_idx, trk_idx])
+        pose_value = float(pose_affinity[det_idx, trk_idx]) if pose_affinity is not None else 0.0
+        hybrid_value = float(final_similarity[det_idx, trk_idx]) if final_similarity is not None else box_value
+
+        hybrid_ok = hybrid_value >= resolved_hybrid_threshold
+        evidence_ok = (box_value >= resolved_box_floor) or (pose_value >= resolved_pose_floor)
+
+        if not (hybrid_ok and evidence_ok):
+            unmatched_detections.append(det_idx)
+            unmatched_trackers.append(trk_idx)
         else:
             matches.append(m.reshape(1, 2))
     if len(matches) == 0:
@@ -211,9 +268,7 @@ def associate_kitti(
             np.empty((0, 5), dtype=int),
         )
 
-    """
-        Cost from the velocity direction consistency
-    """
+    # Cost from the velocity direction consistency
     Y, X = speed_direction_batch(detections, previous_obs)
     inertia_Y, inertia_X = velocities[:, 0], velocities[:, 1]
     inertia_Y = np.repeat(inertia_Y[:, np.newaxis], Y.shape[1], axis=1)
@@ -232,14 +287,10 @@ def associate_kitti(
     angle_diff_cost = angle_diff_cost.T
     angle_diff_cost = angle_diff_cost * scores
 
-    """
-        Cost from IoU
-    """
+    # Cost from IoU
     iou_matrix = iou_batch(detections, trackers)
 
-    """
-        With multiple categories, generate the cost for catgory mismatch
-    """
+    # With multiple categories, generate the cost for category mismatch
     num_dets = detections.shape[0]
     num_trk = trackers.shape[0]
     cate_matrix = np.zeros((num_dets, num_trk))

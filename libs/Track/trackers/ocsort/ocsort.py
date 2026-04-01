@@ -6,11 +6,17 @@ from __future__ import annotations
 
 import numpy as np
 from collections import deque
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple, List
 
 from ...motion.kalman_filters.xysr_kf import KalmanFilterXYSR
 from ...utils.association import associate, linear_assignment
 from ...utils.iou import get_asso_func, run_asso_func
+from ...utils.pose_association import (
+    POSE_ANCHOR_NAMES,
+    extract_pose_anchors,
+    compute_detection_track_pose_metrics,
+)
 from ..basetracker import BaseTracker
 from ...utils import PerClassDecorator
 from ...utils.ops import xyxy2xysr
@@ -57,12 +63,28 @@ def speed_direction(bbox1: np.ndarray, bbox2: np.ndarray):
     return speed / norm
 
 
+
 def normalize(v: np.ndarray):
     norm = np.linalg.norm(v)
     if norm == 0:
         norm = np.finfo(v.dtype).eps
     return v / norm
 
+@dataclass(frozen=True)
+class PoseAssociationGateConfig:
+    hybrid_threshold: float
+    box_evidence_floor: float
+    pose_evidence_floor: float
+
+
+@dataclass(frozen=True)
+class PoseAssociationConfig:
+    enabled: bool
+    weight: float
+    min_affinity: float
+    detection_mean_conf_threshold: float
+    primary: PoseAssociationGateConfig
+    rematch: PoseAssociationGateConfig
 
 # ==============================
 # Point Kalman Filter (keypoints)
@@ -187,6 +209,21 @@ class KalmanBoxTracker:
         self.keypoint_confidence_threshold = float(keypoint_confidence_threshold)
         self.filtered_keypoints = self.filter_keypoints(keypoints, self.keypoint_confidence_threshold)
 
+        self.pose_anchors = extract_pose_anchors(self.filtered_keypoints, self.keypoint_confidence_threshold)
+        self.predicted_pose_anchors = {
+            name: dict(info) for name, info in self.pose_anchors.items()
+        }
+        self.pose_anchor_filters: Dict[str, Optional[KalmanFilterPoint]] = {
+            name: None for name in POSE_ANCHOR_NAMES
+        }
+        self.pose_anchor_missing_counts: Dict[str, int] = {
+            name: 0 for name in POSE_ANCHOR_NAMES
+        }
+        self.pose_anchor_reliability: Dict[str, float] = {
+            name: float(self.pose_anchors[name].get("confidence", 0.0)) if self.pose_anchors[name].get("valid", False) else 0.0
+            for name in POSE_ANCHOR_NAMES
+        }
+
         self.ankle_based_point: Optional[np.ndarray] = None
         self.keypoint_kalman_filter: Optional[KalmanFilterPoint] = None
 
@@ -217,6 +254,73 @@ class KalmanBoxTracker:
         low = filtered[:, 2] < threshold
         filtered[low, 2] = 0.0
         return filtered
+
+    def _init_or_update_pose_anchor_filters(
+        self,
+        anchors: Dict[str, Dict[str, Any]],
+        reappearance_threshold: int = 5,
+    ):
+        for name in POSE_ANCHOR_NAMES:
+            info = anchors.get(name, {})
+            valid = bool(info.get("valid", False))
+            if valid:
+                point = np.asarray(info["point"], dtype=float)
+                if self.pose_anchor_missing_counts[name] >= reappearance_threshold or self.pose_anchor_filters[name] is None:
+                    self.pose_anchor_filters[name] = KalmanFilterPoint()
+                    self.pose_anchor_filters[name].initiate(point)
+                else:
+                    self.pose_anchor_filters[name].update(point)
+
+                filt = self.pose_anchor_filters[name]
+                filtered_point = filt.state[:2].flatten() if filt is not None else point
+                self.pose_anchor_missing_counts[name] = 0
+                self.pose_anchor_reliability[name] = float(info.get("confidence", 0.0))
+                self.pose_anchors[name] = {
+                    "point": np.asarray(filtered_point, dtype=float),
+                    "confidence": float(info.get("confidence", 0.0)),
+                    "support": int(info.get("support", 0)),
+                    "valid": True,
+                }
+            else:
+                self.pose_anchor_missing_counts[name] += 1
+                decay = 0.85 if self.pose_anchor_missing_counts[name] <= 3 else 0.65
+                self.pose_anchor_reliability[name] *= decay
+                predicted_info = self.predicted_pose_anchors.get(name, {}) if self.predicted_pose_anchors is not None else {}
+                predicted_point = predicted_info.get("point", None)
+                if predicted_point is not None:
+                    predicted_point = np.asarray(predicted_point, dtype=float)
+                self.pose_anchors[name] = {
+                    "point": predicted_point,
+                    "confidence": float(self.pose_anchor_reliability[name]),
+                    "support": int(predicted_info.get("support", 0)),
+                    "valid": self.pose_anchor_missing_counts[name] <= reappearance_threshold and predicted_point is not None,
+                }
+
+    def _predict_pose_anchors(self, stale_after: int = 8):
+        predicted: Dict[str, Dict[str, Any]] = {}
+        for name in POSE_ANCHOR_NAMES:
+            filt = self.pose_anchor_filters.get(name)
+            missing = int(self.pose_anchor_missing_counts.get(name, 0))
+            reliability = float(self.pose_anchor_reliability.get(name, 0.0))
+
+            if filt is not None:
+                point = filt.predict()
+                predicted[name] = {
+                    "point": np.asarray(point, dtype=float),
+                    "confidence": reliability,
+                    "support": int(self.pose_anchors.get(name, {}).get("support", 0)),
+                    "valid": missing <= stale_after,
+                }
+            else:
+                prev = self.pose_anchors.get(name, {})
+                predicted[name] = {
+                    "point": prev.get("point", None),
+                    "confidence": reliability,
+                    "support": int(prev.get("support", 0)),
+                    "valid": bool(prev.get("valid", False)) and missing <= stale_after,
+                }
+
+        self.predicted_pose_anchors = predicted
 
     def update(self, bbox: Optional[np.ndarray], cls: Optional[int], det_ind: Optional[int], keypoints: Optional[np.ndarray] = None):
         """
@@ -250,10 +354,19 @@ class KalmanBoxTracker:
 
             self.kf.update(xyxy2xysr(bbox))
 
-            # keypoints
+            # keypoints / pose anchors
             if keypoints is not None:
                 self.keypoints = keypoints
                 self.filtered_keypoints = self.filter_keypoints(keypoints, self.keypoint_confidence_threshold)
+            else:
+                self.keypoints = None
+                self.filtered_keypoints = None
+
+            current_anchors = extract_pose_anchors(self.filtered_keypoints, self.keypoint_confidence_threshold)
+            self._init_or_update_pose_anchor_filters(current_anchors)
+            self.predicted_pose_anchors = {
+                name: dict(info) for name, info in self.pose_anchors.items()
+            }
         else:
             # unmatched: still update KF with None per original design
             self.kf.update(bbox)
@@ -271,6 +384,7 @@ class KalmanBoxTracker:
             self.hit_streak = 0
         self.time_since_update += 1
 
+        self._predict_pose_anchors()
         self.history.append(convert_x_to_bbox(self.kf.x))
         return self.history[-1]
 
@@ -355,7 +469,7 @@ class KalmanBoxTracker:
                 right_pts = collect_pts(foot_indices_right)
 
                 # hip & knee history updates
-                hip_knee_map = {"lhip": 12, "rhip": 13, "lknee": 14, "rknee": 15}
+                hip_knee_map = {"lhip": 11, "rhip": 12, "lknee": 13, "rknee": 14}
                 for name, idx in hip_knee_map.items():
                     if idx < len(keypoints) and keypoints[idx][2] > self.keypoint_confidence_threshold:
                         self.joint_histories[name].append((frame_idx, keypoints[idx][:2]))
@@ -490,8 +604,11 @@ class OCSort(BaseTracker):
         boundary_pad_pct: float = 0.0,
         track_enemy: bool = True,
         entry_conf_threshold: Optional[float] = None,
+        detection_keypoint_mean_conf_threshold: Optional[float] = None,
+        pose_hybrid_enabled: bool = True,
+        pose_weight: float = 0.5,
+        pose_min_affinity: float = 0.10,
         keypoint_mean_conf_threshold: Optional[float] = None,
-        # FIX: was missing in your class but used later
         max_obs: int = 50,
     ):
         super().__init__(max_age=max_age, class_id_to_label=class_id_to_label)
@@ -506,10 +623,16 @@ class OCSort(BaseTracker):
         self.asso_func = get_asso_func(asso_func)
         self.inertia = inertia
         self.use_byte = use_byte
-        self.entry_conf_threshold = float(entry_conf_threshold) if entry_conf_threshold is not None else float(det_thresh)
-        self.keypoint_mean_conf_threshold = (
-            float(keypoint_mean_conf_threshold) if keypoint_mean_conf_threshold is not None else float(det_thresh)
+        self.pose_association = self._build_pose_association_config(
+            asso_threshold=asso_threshold,
+            det_thresh=det_thresh,
+            pose_hybrid_enabled=pose_hybrid_enabled,
+            pose_weight=pose_weight,
+            pose_min_affinity=pose_min_affinity,
+            detection_keypoint_mean_conf_threshold=detection_keypoint_mean_conf_threshold,
+            legacy_keypoint_mean_conf_threshold=keypoint_mean_conf_threshold,
         )
+        self.entry_conf_threshold = float(entry_conf_threshold) if entry_conf_threshold is not None else float(det_thresh)
 
         self.max_obs = max_obs
 
@@ -547,6 +670,115 @@ class OCSort(BaseTracker):
         self.enemy_was_in_entry = False
         self.track_enemy = track_enemy
 
+    @staticmethod
+    def _build_pose_association_config(
+        asso_threshold: float,
+        det_thresh: float,
+        pose_hybrid_enabled: bool,
+        pose_weight: float,
+        pose_min_affinity: float,
+        detection_keypoint_mean_conf_threshold: Optional[float],
+        legacy_keypoint_mean_conf_threshold: Optional[float],
+    ) -> PoseAssociationConfig:
+        mean_conf_threshold = detection_keypoint_mean_conf_threshold
+        if mean_conf_threshold is None:
+            mean_conf_threshold = legacy_keypoint_mean_conf_threshold
+        if mean_conf_threshold is None:
+            mean_conf_threshold = det_thresh
+
+        return PoseAssociationConfig(
+            enabled=bool(pose_hybrid_enabled),
+            weight=float(pose_weight),
+            min_affinity=float(pose_min_affinity),
+            detection_mean_conf_threshold=float(mean_conf_threshold),
+            primary=PoseAssociationGateConfig(
+                hybrid_threshold=float(asso_threshold),
+                box_evidence_floor=float(asso_threshold) * 0.5,
+                pose_evidence_floor=float(asso_threshold) * 0.5,
+            ),
+            rematch=PoseAssociationGateConfig(
+                hybrid_threshold=float(asso_threshold),
+                box_evidence_floor=float(asso_threshold) * 0.4,
+                pose_evidence_floor=float(asso_threshold) * 0.4,
+            ),
+        )
+
+    @staticmethod
+    def _split_detections_by_confidence(
+        dets: np.ndarray,
+        det_thresh: float,
+        keypoints: Optional[np.ndarray],
+        detection_keypoint_mean_conf_threshold: float,
+    ):
+        confs = dets[:, 4]
+
+        if keypoints is not None:
+            kp_mean_confs = np.asarray(
+                [float(np.mean(kp[:, 2])) if kp is not None and len(kp) > 0 else 0.0 for kp in keypoints],
+                dtype=float,
+            )
+        else:
+            kp_mean_confs = None
+
+        inds_low = confs > 0.1
+        inds_high = confs < det_thresh
+        inds_second = np.logical_and(inds_low, inds_high)
+
+        if kp_mean_confs is not None:
+            inds_second = np.logical_and(inds_second, kp_mean_confs > detection_keypoint_mean_conf_threshold)
+
+        remain_inds = confs > det_thresh
+        if kp_mean_confs is not None:
+            remain_inds = np.logical_and(remain_inds, kp_mean_confs > detection_keypoint_mean_conf_threshold)
+
+        dets_first = dets[remain_inds]
+        dets_second = dets[inds_second]
+
+        if keypoints is not None:
+            keypoints_first = keypoints[remain_inds]
+            keypoints_second = keypoints[inds_second]
+        else:
+            keypoints_first = None
+            keypoints_second = None
+
+        return dets_first, dets_second, keypoints_first, keypoints_second
+
+    def _compute_pose_metrics(
+        self,
+        detections: np.ndarray,
+        tracks: List[KalmanBoxTracker],
+        keypoints: Optional[np.ndarray],
+        keypoint_confidence_threshold: float,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if keypoints is None or len(tracks) == 0 or len(detections) == 0:
+            return None, None
+
+        pose_affinity = np.zeros((len(detections), len(tracks)), dtype=float)
+        pose_reliability = np.zeros((len(detections), len(tracks)), dtype=float)
+        for det_idx in range(len(detections)):
+            sims, reliabilities = compute_detection_track_pose_metrics(
+                keypoints[det_idx],
+                tracks,
+                detections[det_idx, 0:4],
+                keypoint_confidence_threshold,
+            )
+            pose_affinity[det_idx, :] = sims
+            pose_reliability[det_idx, :] = reliabilities
+
+        pose_affinity[pose_affinity < self.pose_association.min_affinity] = 0.0
+        pose_reliability[pose_affinity <= 0.0] = 0.0
+        return pose_affinity, pose_reliability
+
+    @staticmethod
+    def _update_track_with_detection(
+        track: KalmanBoxTracker,
+        detection: np.ndarray,
+        keypoints: Optional[np.ndarray],
+        keypoint_confidence_threshold: float,
+    ):
+        track.keypoint_confidence_threshold = float(keypoint_confidence_threshold)
+        track.update(detection[:5], detection[5], detection[6], keypoints=keypoints)
+
     @PerClassDecorator
     def update(
         self,
@@ -571,39 +803,13 @@ class OCSort(BaseTracker):
         # append detection indices
         dets = np.hstack([dets, np.arange(len(dets)).reshape(-1, 1)])
 
-        confs = dets[:, 4]
+        dets, dets_second, keypoints_first, keypoints_second = self._split_detections_by_confidence(
+            dets,
+            self.det_thresh,
+            keypoints,
+            self.pose_association.detection_mean_conf_threshold,
+        )
 
-        if keypoints is not None:
-            kp_mean_confs = np.asarray(
-                [float(np.mean(kp[:, 2])) if kp is not None and len(kp) > 0 else 0.0 for kp in keypoints],
-                dtype=float,
-            )
-        else:
-            kp_mean_confs = None
-
-        inds_low = confs > 0.1
-        inds_high = confs < self.det_thresh
-        inds_second = np.logical_and(inds_low, inds_high)
-
-        if kp_mean_confs is not None:
-            inds_second = np.logical_and(inds_second, kp_mean_confs > self.keypoint_mean_conf_threshold)
-
-        dets_second = dets[inds_second]
-
-        remain_inds = confs > self.det_thresh
-        if kp_mean_confs is not None:
-            remain_inds = np.logical_and(remain_inds, kp_mean_confs > self.keypoint_mean_conf_threshold)
-        dets = dets[remain_inds]
-
-        # FIX: keypoints can be None
-        if keypoints is not None:
-            # optional alignment check (kept non-fatal)
-            # if len(keypoints) != len(confs): pass
-            keypoints_first = keypoints[remain_inds]
-            keypoints_second = keypoints[inds_second]
-        else:
-            keypoints_first = None
-            keypoints_second = None
 
         # get predicted locations from existing trackers
         trks = np.zeros((len(self.active_tracks), 5), dtype=float)
@@ -619,6 +825,13 @@ class OCSort(BaseTracker):
         trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
         for t in reversed(to_del):
             self.active_tracks.pop(t)
+
+        pose_affinity, pose_reliability = self._compute_pose_metrics(
+            dets,
+            self.active_tracks,
+            keypoints_first,
+            keypoint_confidence_threshold,
+        )
 
         velocities = np.array(
             [trk.velocity if trk.velocity is not None else np.array((0.0, 0.0)) for trk in self.active_tracks],
@@ -638,13 +851,23 @@ class OCSort(BaseTracker):
             self.inertia,
             w,
             h,
+            pose_affinity=pose_affinity,
+            pose_reliability=pose_reliability,
+            pose_weight=self.pose_association.weight if self.pose_association.enabled else 0.0,
+            hybrid_threshold=self.pose_association.primary.hybrid_threshold,
+            box_threshold_floor=self.pose_association.primary.box_evidence_floor,
+            pose_threshold_floor=self.pose_association.primary.pose_evidence_floor,
         )
 
         for m in matched:
-            trk = self.active_tracks[m[1]]
-            trk.keypoint_confidence_threshold = float(keypoint_confidence_threshold)
-            kp = keypoints_first[m[0]] if keypoints_first is not None else None
-            trk.update(dets[m[0], :5], dets[m[0], 5], dets[m[0], 6], keypoints=kp)
+            det_idx, trk_idx = m[0], m[1]
+            kp = keypoints_first[det_idx] if keypoints_first is not None else None
+            self._update_track_with_detection(
+                self.active_tracks[trk_idx],
+                dets[det_idx],
+                kp,
+                keypoint_confidence_threshold,
+            )
 
         # ---------------- Second association (BYTE) ----------------
         if self.use_byte and len(dets_second) > 0 and unmatched_trks.shape[0] > 0:
@@ -657,10 +880,13 @@ class OCSort(BaseTracker):
                     det_ind, trk_ind = m[0], unmatched_trks[m[1]]
                     if iou_left[m[0], m[1]] < self.asso_threshold:
                         continue
-                    trk = self.active_tracks[trk_ind]
-                    trk.keypoint_confidence_threshold = float(keypoint_confidence_threshold)
                     kp = keypoints_second[m[0]] if keypoints_second is not None else None
-                    trk.update(dets_second[det_ind, :5], dets_second[det_ind, 5], dets_second[det_ind, 6], keypoints=kp)
+                    self._update_track_with_detection(
+                        self.active_tracks[trk_ind],
+                        dets_second[det_ind],
+                        kp,
+                        keypoint_confidence_threshold,
+                    )
                     to_remove_trk_indices.append(trk_ind)
                 unmatched_trks = np.setdiff1d(unmatched_trks, np.array(to_remove_trk_indices))
 
@@ -668,19 +894,45 @@ class OCSort(BaseTracker):
         if unmatched_dets.shape[0] > 0 and unmatched_trks.shape[0] > 0:
             left_dets = dets[unmatched_dets]
             left_trks = last_boxes[unmatched_trks]
-            iou_left = np.array(run_asso_func(self.asso_func, left_dets, left_trks, w, h))
-            if iou_left.max() > self.asso_threshold:
-                rematched_indices = linear_assignment(-iou_left)
+
+            rematch_tracks = [self.active_tracks[idx] for idx in unmatched_trks]
+            rematch_pose, rematch_pose_reliability = self._compute_pose_metrics(
+                left_dets,
+                rematch_tracks,
+                keypoints_first[unmatched_dets] if keypoints_first is not None else None,
+                keypoint_confidence_threshold,
+            )
+
+            rematch_matched, _, _ = associate(
+                left_dets[:, 0:5],
+                left_trks,
+                self.asso_func,
+                self.asso_threshold,
+                np.zeros((len(unmatched_trks), 2), dtype=float),
+                left_trks,
+                0.0,
+                w,
+                h,
+                pose_affinity=rematch_pose,
+                pose_reliability=rematch_pose_reliability,
+                pose_weight=self.pose_association.weight if self.pose_association.enabled else 0.0,
+                hybrid_threshold=self.pose_association.rematch.hybrid_threshold,
+                box_threshold_floor=self.pose_association.rematch.box_evidence_floor,
+                pose_threshold_floor=self.pose_association.rematch.pose_evidence_floor,
+            )
+
+            if rematch_matched.size > 0:
                 to_remove_det_indices = []
                 to_remove_trk_indices = []
-                for m in rematched_indices:
+                for m in rematch_matched:
                     det_ind, trk_ind = unmatched_dets[m[0]], unmatched_trks[m[1]]
-                    if iou_left[m[0], m[1]] < self.asso_threshold:
-                        continue
-                    trk = self.active_tracks[trk_ind]
-                    trk.keypoint_confidence_threshold = float(keypoint_confidence_threshold)
                     kp = keypoints_first[det_ind] if keypoints_first is not None else None
-                    trk.update(dets[det_ind, :5], dets[det_ind, 5], dets[det_ind, 6], keypoints=kp)
+                    self._update_track_with_detection(
+                        self.active_tracks[trk_ind],
+                        dets[det_ind],
+                        kp,
+                        keypoint_confidence_threshold,
+                    )
                     to_remove_det_indices.append(det_ind)
                     to_remove_trk_indices.append(trk_ind)
                 unmatched_dets = np.setdiff1d(unmatched_dets, np.array(to_remove_det_indices))

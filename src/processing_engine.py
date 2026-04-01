@@ -168,7 +168,7 @@ class ProcessingEngine:
             pixel_mapper=self.mapper,
             limit_entry=True,
             entry_polys=self.entry_polys,
-            entry_window_time=300,
+            entry_window_time=float("inf"),
             boundary=self.boundary,
             boundary_pad_pct=self.config.get("boundary_pad_pct", 0.05),
             track_enemy=self.config.get("track_enemy", True),
