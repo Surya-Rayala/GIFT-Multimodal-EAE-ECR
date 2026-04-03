@@ -1,141 +1,124 @@
-import os
 import glob
 import json
-from typing import Dict, Optional, Tuple, List
+import os
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import cv2
-import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
 from . import AbstractMetric
 
-# --------------------------------------------------------------------
-# Helpers for gaze‐cone construction and intersection
-# --------------------------------------------------------------------
+
 def _gaze_triangle(origin, direction, half_angle_deg, length=10000.0):
-    """Return a 3-point gaze-cone triangle (origin, left, right)."""
     d = np.asarray(direction, dtype=np.float32)
     n = np.linalg.norm(d)
     if n == 0.0:
         return np.zeros((3, 2), dtype=np.float32)
+
     d /= n
     ang = np.deg2rad(float(half_angle_deg))
     cos_a, sin_a = float(np.cos(ang)), float(np.sin(ang))
-    rot_left  = np.array([[cos_a, -sin_a],
-                          [sin_a,  cos_a]], dtype=np.float32)
-    rot_right = np.array([[cos_a,  sin_a],
-                          [-sin_a, cos_a]], dtype=np.float32)
+
+    rot_left = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float32)
+    rot_right = np.array([[cos_a, sin_a], [-sin_a, cos_a]], dtype=np.float32)
 
     o = np.asarray(origin, dtype=np.float32)
-    left_vec  = rot_left  @ d * length
+    left_vec = rot_left @ d * length
     right_vec = rot_right @ d * length
     return np.stack([o, o + left_vec, o + right_vec], axis=0)
 
 
 def _triangle_box_intersect(triangle, box):
-    """Return True if the triangle intersects the axis-aligned bbox."""
     tri = np.asarray(triangle, dtype=np.float32).reshape(-1, 1, 2)
     x1, y1, x2, y2 = map(float, box)
-    rect = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
-                    dtype=np.float32).reshape(-1, 1, 2)
+    rect = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32).reshape(-1, 1, 2)
     inter_area, _ = cv2.intersectConvexConvex(tri, rect)
     return inter_area > 0.0
 
 
 class ThreatCoverage_Metric(AbstractMetric):
-    """Fraction of frames where an active (uncleared) threat is covered by gaze."""
+    """Fraction of counted frames where at least one active in-room threat is covered by gaze."""
+
     def __init__(self, config):
         super().__init__(config)
         self.metricName = "THREAT_COVERAGE"
-        # Field of view half‐angle (degrees)
-        self.coverage_angle = float(config.get("visual_angle_degrees", 20.0))
-        # List of enemy track IDs to consider
-        self.enemy_ids = config.get("enemy_ids", [99])
+        self.visual_angle_deg = float(config.get("visual_angle_degrees", 20.0))
         self._final_score = 0.0
 
     def process(self, ctx):
-        """Score = covered_frames / counted_frames while threats are present & uncleared."""
-        present_frames = 0
-        covered_frames = 0
+        inroom_ids = set(getattr(ctx, "inroom_ids", []) or [])
+        if not inroom_ids:
+            self._final_score = 1.0
+            return
 
         all_frame_count = len(ctx.all_frames)
-        # Build list of trainee IDs (all tracks minus enemies)
-        all_ids = list(ctx.tracks_by_id.keys())
-        trainee_ids = [tid for tid in all_ids if tid not in self.enemy_ids]
+        all_ids = set(ctx.tracks_by_id.keys())
+        entry_ids = sorted(tid for tid in all_ids if tid not in inroom_ids)
+
+        present_frames = 0
+        covered_frames = 0
+        half_angle = self.visual_angle_deg / 2.0
+
+        threat_clearance = getattr(ctx, "threat_clearance", {}) or {}
 
         for frame_idx in range(1, all_frame_count + 1):
-            # Check if any teammate is present this frame
-            any_trainee_present = False
-            for tid in trainee_ids:
-                if (frame_idx, tid) in ctx.bbox_details:
-                    any_trainee_present = True
-                    break
+            any_entry_present = any((frame_idx, tid) in ctx.bbox_details for tid in entry_ids)
+            if not any_entry_present:
+                continue
 
-            # Enemies present this frame and still uncleared.
-            uncleared_enemies = []
-            for enemy_id in self.enemy_ids:
-                # Must appear in this frame
-                if (frame_idx, enemy_id) not in ctx.bbox_details:
+            active_inroom_ids = []
+            for inroom_id in inroom_ids:
+                if (frame_idx, inroom_id) not in ctx.bbox_details:
                     continue
 
+                clearance_tuple = threat_clearance.get(inroom_id)
                 cleared = False
-                if hasattr(ctx, "threat_clearance"):
-                    clear_tuple = ctx.threat_clearance.get(enemy_id)
-                    if clear_tuple is not None:
-                        # clear_tuple is (start_frame, end_frame, friend_id)
-                        _, end_frame, _ = clear_tuple
-                        # Enemy must be covered until the END of the clearance window.
-                        # Treat as cleared only from end_frame onward.
-                        if end_frame is not None and frame_idx >= end_frame:
-                            cleared = True
+                if clearance_tuple is not None:
+                    _, end_frame, _ = clearance_tuple
+                    if end_frame is not None and frame_idx >= end_frame:
+                        cleared = True
 
                 if not cleared:
-                    uncleared_enemies.append(enemy_id)
+                    active_inroom_ids.append(inroom_id)
 
-            # Only count this frame if at least one trainee and one uncleared enemy
-            if not any_trainee_present or len(uncleared_enemies) == 0:
+            if not active_inroom_ids:
                 continue
 
             present_frames += 1
+            looked_at_any = False
 
-            # Check if any trainee is looking at any uncleared enemy
-            looked_at = False
-            half_angle = self.coverage_angle / 2.0
-            for tid in trainee_ids:
-                if (frame_idx, tid) not in ctx.gaze_info:
+            for entry_id in entry_ids:
+                gaze = ctx.gaze_info.get((frame_idx, entry_id))
+                if gaze is None:
                     continue
-                ox, oy, dx, dy = ctx.gaze_info[(frame_idx, tid)]
-                origin = np.array([ox, oy], dtype=np.float32)
+
+                ox, oy, dx, dy = gaze
                 direction = np.array([dx, dy], dtype=np.float32)
-                if np.linalg.norm(direction) == 0.0:
-                    # Zero‐vector gaze counts as “looking”
-                    looked_at = True
-                    break
-                tri = _gaze_triangle(origin, direction, half_angle)
-                for enemy_id in uncleared_enemies:
-                    bbox = ctx.bbox_details[(frame_idx, enemy_id)]
-                    if _triangle_box_intersect(tri, bbox):
-                        looked_at = True
-                        break
-                if looked_at:
+                if float(np.linalg.norm(direction)) == 0.0:
+                    looked_at_any = True
                     break
 
-            if looked_at:
+                tri = _gaze_triangle(np.array([ox, oy], dtype=np.float32), direction, half_angle)
+
+                for inroom_id in active_inroom_ids:
+                    bbox = ctx.bbox_details[(frame_idx, inroom_id)]
+                    if _triangle_box_intersect(tri, bbox):
+                        looked_at_any = True
+                        break
+
+                if looked_at_any:
+                    break
+
+            if looked_at_any:
                 covered_frames += 1
 
-        # Compute final score
-        if present_frames == 0:
-            self._final_score = 1.0
-        else:
-            self._final_score = covered_frames / present_frames
+        self._final_score = covered_frames / present_frames if present_frames > 0 else 1.0
 
     def getFinalScore(self) -> float:
         return round(self._final_score, 2)
 
-    # --------------------------------------------------------------------- #
-    # Expert comparison (folder-based)
-    # --------------------------------------------------------------------- #
     @staticmethod
     def expertCompare(
         session_folder: str,
@@ -143,13 +126,6 @@ class ThreatCoverage_Metric(AbstractMetric):
         _map_image=None,
         config: Optional[dict] = None,
     ):
-        """Compare trainee vs expert threat coverage.
-
-        Coverage is counted only while at least one enemy is present and uncleared.
-        Time is aligned to each run's first non-enemy entry.
-        Writes `THREAT_COVERAGE_Comparison.jpg`.
-        """
-
         def _pick_latest(folder: str, pattern: str) -> Optional[str]:
             matches = glob.glob(os.path.join(folder, pattern))
             if not matches:
@@ -171,9 +147,11 @@ class ThreatCoverage_Metric(AbstractMetric):
             path = _pick_latest(folder, "*_GazeCache.txt")
             if path is None:
                 return {}
+
             df = pd.read_csv(path)
             if df is None or df.empty:
                 return {}
+
             cols = {c.lower(): c for c in df.columns}
             f_col = cols.get("frame")
             id_col = cols.get("id")
@@ -200,48 +178,127 @@ class ThreatCoverage_Metric(AbstractMetric):
             return out
 
         def _load_clearance_cache(folder: str) -> Dict[int, Tuple[Optional[int], Optional[int], Optional[int]]]:
-            """Return {enemy_id: (start_frame, end_frame, friend_id)} from cache."""
             path = _pick_latest(folder, "*_ThreatClearanceCache.txt")
             if path is None:
                 return {}
+
             df = pd.read_csv(path)
             if df is None or df.empty:
                 return {}
+
             cols = {c.lower(): c for c in df.columns}
-            eid_col = cols.get("enemy_id") or cols.get("enemy")
+            id_col = cols.get("inroom_id") or cols.get("enemy_id") or cols.get("id")
             s_col = cols.get("immediate_frame") or cols.get("start_frame") or cols.get("start")
             e_col = cols.get("contact_end_frame") or cols.get("end_frame") or cols.get("end")
             f_col = cols.get("clearing_friend") or cols.get("friend") or cols.get("clearing")
-            if eid_col is None:
+
+            if id_col is None:
                 return {}
 
             out: Dict[int, Tuple[Optional[int], Optional[int], Optional[int]]] = {}
+
+            def _to_int(x) -> Optional[int]:
+                try:
+                    if pd.isna(x):
+                        return None
+                    xi = int(x)
+                    return None if xi < 0 else xi
+                except Exception:
+                    return None
+
             for _, r in df.iterrows():
                 try:
-                    eid = int(r[eid_col])
+                    inroom_id = int(r[id_col])
                 except Exception:
                     continue
-
-                def _to_int(x) -> Optional[int]:
-                    try:
-                        if pd.isna(x):
-                            return None
-                        xi = int(x)
-                        return None if xi < 0 else xi
-                    except Exception:
-                        return None
 
                 start = _to_int(r[s_col]) if s_col is not None else None
                 end = _to_int(r[e_col]) if e_col is not None else None
                 fid = _to_int(r[f_col]) if f_col is not None else None
-                out[eid] = (start, end, fid)
+                out[inroom_id] = (start, end, fid)
+
             return out
 
-        def _first_team_entry_frame(tracker_output: List[Dict], enemy_ids: List[int]) -> Optional[int]:
-            min_fr = None
+        def _frame_rate_from_config(cfg: Optional[dict]) -> float:
+            if cfg and isinstance(cfg, dict):
+                try:
+                    return float(cfg.get("frame_rate", 30.0))
+                except Exception:
+                    return 30.0
+            return 30.0
+
+        def _visual_angle_from_config(cfg: Optional[dict]) -> float:
+            if cfg and isinstance(cfg, dict):
+                try:
+                    return float(cfg.get("visual_angle_degrees", 20.0))
+                except Exception:
+                    return 20.0
+            return 20.0
+
+        def _inroom_id_start_from_config(cfg: Optional[dict]) -> int:
+            if cfg and isinstance(cfg, dict):
+                try:
+                    return int(cfg.get("inroom_id_start", 99))
+                except Exception:
+                    return 99
+            return 99
+
+        def _extract_frame_maps(tracker_output: List[Dict]) -> Tuple[
+            Dict[Tuple[int, int], Tuple[float, float, float, float]],
+            Dict[int, set],
+            Dict[int, set],
+            Dict[int, set],
+        ]:
+            bbox_map: Dict[Tuple[int, int], Tuple[float, float, float, float]] = {}
+            ids_per_frame: Dict[int, set] = {}
+            entry_ids_per_frame: Dict[int, set] = {}
+            inroom_ids_per_frame: Dict[int, set] = {}
+
             for entry in tracker_output:
                 fr = int(entry.get("frame", 0))
-                for obj in entry.get("objects", []) or []:
+                objs = entry.get("objects", []) or []
+                ids_per_frame.setdefault(fr, set())
+                entry_ids_per_frame.setdefault(fr, set())
+                inroom_ids_per_frame.setdefault(fr, set())
+
+                for obj in objs:
+                    tid = obj.get("id")
+                    bb = obj.get("bbox")
+                    if tid is None or bb is None:
+                        continue
+
+                    try:
+                        tid = int(tid)
+                        x1, y1, x2, y2 = bb
+                    except Exception:
+                        continue
+
+                    bbox_map[(fr, tid)] = (float(x1), float(y1), float(x2), float(y2))
+                    ids_per_frame[fr].add(tid)
+
+                    role = obj.get("identity_role")
+                    is_entry = bool(obj.get("is_entry", False))
+                    is_inroom = bool(obj.get("is_inroom", False))
+                    birth_location = obj.get("birth_location")
+
+                    if role == "entry" or is_entry or birth_location == "entry":
+                        entry_ids_per_frame[fr].add(tid)
+                    if role == "inroom" or is_inroom or birth_location == "inroom":
+                        inroom_ids_per_frame[fr].add(tid)
+
+            return bbox_map, ids_per_frame, entry_ids_per_frame, inroom_ids_per_frame
+
+        def _infer_semantic_ids(
+            tracker_output: List[Dict],
+            clearance_map: Dict[int, Tuple[Optional[int], Optional[int], Optional[int]]],
+            inroom_id_start: int,
+        ) -> Tuple[List[int], List[int]]:
+            all_ids = set()
+            entry_ids = set()
+            inroom_ids = set()
+
+            for frame_entry in tracker_output:
+                for obj in frame_entry.get("objects", []) or []:
                     tid = obj.get("id")
                     if tid is None:
                         continue
@@ -249,159 +306,164 @@ class ThreatCoverage_Metric(AbstractMetric):
                         tid = int(tid)
                     except Exception:
                         continue
-                    if tid in enemy_ids:
-                        continue
-                    if min_fr is None or fr < min_fr:
-                        min_fr = fr
-            return min_fr
 
-        def _extract_bbox_map(tracker_output: List[Dict]) -> Tuple[Dict[Tuple[int, int], Tuple[float, float, float, float]], Dict[int, set]]:
-            bbox_map: Dict[Tuple[int, int], Tuple[float, float, float, float]] = {}
-            ids_per_frame: Dict[int, set] = {}
-            for entry in tracker_output:
-                fr = int(entry.get("frame", 0))
-                objs = entry.get("objects", []) or []
-                ids_per_frame.setdefault(fr, set())
-                for obj in objs:
+                    all_ids.add(tid)
+                    role = obj.get("identity_role")
+                    is_entry = bool(obj.get("is_entry", False))
+                    is_inroom = bool(obj.get("is_inroom", False))
+                    birth_location = obj.get("birth_location")
+
+                    if role == "entry" or is_entry or birth_location == "entry":
+                        entry_ids.add(tid)
+                    if role == "inroom" or is_inroom or birth_location == "inroom":
+                        inroom_ids.add(tid)
+
+            if not inroom_ids and clearance_map:
+                inroom_ids = set(int(k) for k in clearance_map.keys())
+
+            if not inroom_ids:
+                inroom_ids = {tid for tid in all_ids if tid >= inroom_id_start}
+
+            if not entry_ids:
+                entry_ids = {tid for tid in all_ids if tid not in inroom_ids}
+
+            return sorted(entry_ids), sorted(inroom_ids)
+
+        def _first_entry_frame(
+            tracker_output: List[Dict],
+            entry_ids: List[int],
+        ) -> Optional[int]:
+            entry_id_set = set(entry_ids)
+            min_fr = None
+
+            for frame_entry in tracker_output:
+                fr = int(frame_entry.get("frame", 0))
+                for obj in frame_entry.get("objects", []) or []:
                     tid = obj.get("id")
-                    bb = obj.get("bbox")
-                    if tid is None or bb is None:
+                    if tid is None:
                         continue
                     try:
                         tid = int(tid)
-                        x1, y1, x2, y2 = bb
-                        bbox_map[(fr, tid)] = (float(x1), float(y1), float(x2), float(y2))
-                        ids_per_frame[fr].add(tid)
                     except Exception:
                         continue
-            return bbox_map, ids_per_frame
+
+                    if tid in entry_id_set:
+                        if min_fr is None or fr < min_fr:
+                            min_fr = fr
+            return min_fr
 
         def _evaluate_folder(
             folder: str,
             *,
-            enemy_ids: List[int],
             fps: float,
+            visual_angle_deg: float,
+            inroom_id_start: int,
         ) -> Dict[str, object]:
             tracker_output = _load_tracker_output(folder)
             gaze_info = _load_gaze_cache(folder)
             clearance = _load_clearance_cache(folder)
 
-            bbox_map, ids_per_frame = _extract_bbox_map(tracker_output)
+            bbox_map, ids_per_frame, _, _ = _extract_frame_maps(tracker_output)
+            entry_ids, inroom_ids = _infer_semantic_ids(tracker_output, clearance, inroom_id_start)
 
-            # If enemy_ids not provided by config, infer from clearance cache if possible.
-            if not enemy_ids:
-                enemy_ids = sorted(list(clearance.keys())) if clearance else [99]
+            entry_id_set = set(entry_ids)
+            inroom_id_set = set(inroom_ids)
 
-            # Team IDs = all ids seen minus enemies
-            all_ids = set()
-            for s in ids_per_frame.values():
-                all_ids |= set(s)
-            trainee_ids = sorted([tid for tid in all_ids if tid not in enemy_ids])
-
-            first_entry = _first_team_entry_frame(tracker_output, enemy_ids)
+            first_entry = _first_entry_frame(tracker_output, entry_ids)
             if first_entry is None:
                 first_entry = 1
 
             max_frame = max(ids_per_frame.keys()) if ids_per_frame else 0
+            half_angle = visual_angle_deg / 2.0
 
-            # Per-enemy counters
-            per_enemy_present: Dict[int, int] = {eid: 0 for eid in enemy_ids}
-            per_enemy_covered: Dict[int, int] = {eid: 0 for eid in enemy_ids}
+            per_inroom_present: Dict[int, int] = {tid: 0 for tid in inroom_ids}
+            per_inroom_covered: Dict[int, int] = {tid: 0 for tid in inroom_ids}
 
             present_frames = 0
             covered_frames = 0
-
-            # Curves for plotting: cumulative coverage over time (counted frames only)
             curve_t: List[float] = []
             curve_cov: List[float] = []
 
-            half_angle = float(config.get("visual_angle_degrees", 20.0)) / 2.0 if isinstance(config, dict) else 10.0
-
-            def _enemy_uncleared(eid: int, frame_idx: int) -> bool:
-                # For expert compare: cleared from contact_end_frame onward.
-                tup = clearance.get(eid)
+            def _inroom_uncleared(inroom_id: int, frame_idx: int) -> bool:
+                tup = clearance.get(inroom_id)
                 if tup is None:
                     return True
-                _start, end, _fid = tup
+                _, end, _ = tup
                 if end is None:
                     return True
                 return frame_idx < int(end)
 
             for frame_idx in range(int(first_entry), int(max_frame) + 1):
-                # Any trainee present?
-                any_trainee_present = any((frame_idx, tid) in bbox_map for tid in trainee_ids)
-                if not any_trainee_present:
+                active_entry_ids = [tid for tid in entry_id_set if (frame_idx, tid) in bbox_map]
+                if not active_entry_ids:
                     continue
 
-                # Enemies present & uncleared
-                uncleared_enemies = [
-                    eid for eid in enemy_ids
-                    if (frame_idx, eid) in bbox_map and _enemy_uncleared(eid, frame_idx)
+                active_inroom_ids = [
+                    tid
+                    for tid in inroom_id_set
+                    if (frame_idx, tid) in bbox_map and _inroom_uncleared(tid, frame_idx)
                 ]
-                if not uncleared_enemies:
+                if not active_inroom_ids:
                     continue
 
                 present_frames += 1
 
-                # Per-enemy present
-                for eid in uncleared_enemies:
-                    per_enemy_present[eid] += 1
+                for inroom_id in active_inroom_ids:
+                    per_inroom_present[inroom_id] += 1
 
-                # Check gaze intersection
                 looked_any = False
-                looked_by_enemy: Dict[int, bool] = {eid: False for eid in uncleared_enemies}
+                looked_by_inroom: Dict[int, bool] = {tid: False for tid in active_inroom_ids}
 
-                for tid in trainee_ids:
-                    g = gaze_info.get((frame_idx, tid))
+                for entry_id in active_entry_ids:
+                    g = gaze_info.get((frame_idx, entry_id))
                     if g is None:
                         continue
+
                     ox, oy, dx, dy = g
                     direction = np.array([dx, dy], dtype=np.float32)
+
                     if float(np.linalg.norm(direction)) == 0.0:
-                        # Treat zero-vector gaze as "looking"
                         looked_any = True
-                        for eid in uncleared_enemies:
-                            looked_by_enemy[eid] = True
+                        for inroom_id in active_inroom_ids:
+                            looked_by_inroom[inroom_id] = True
                         break
 
-                    origin = np.array([ox, oy], dtype=np.float32)
-                    tri = _gaze_triangle(origin, direction, half_angle)
+                    tri = _gaze_triangle(np.array([ox, oy], dtype=np.float32), direction, half_angle)
 
-                    for eid in uncleared_enemies:
-                        if looked_by_enemy.get(eid):
+                    for inroom_id in active_inroom_ids:
+                        if looked_by_inroom[inroom_id]:
                             continue
-                        bbox = bbox_map[(frame_idx, eid)]
+                        bbox = bbox_map[(frame_idx, inroom_id)]
                         if _triangle_box_intersect(tri, bbox):
-                            looked_by_enemy[eid] = True
+                            looked_by_inroom[inroom_id] = True
                             looked_any = True
 
-                    if looked_any and all(looked_by_enemy.values()):
+                    if looked_any and all(looked_by_inroom.values()):
                         break
 
                 if looked_any:
                     covered_frames += 1
 
-                # Per-enemy covered
-                for eid, ok in looked_by_enemy.items():
+                for inroom_id, ok in looked_by_inroom.items():
                     if ok:
-                        per_enemy_covered[eid] += 1
+                        per_inroom_covered[inroom_id] += 1
 
-                # Update curves (seconds since first entry)
-                t_sec = (frame_idx - first_entry) / fps
-                curve_t.append(float(t_sec))
+                curve_t.append((frame_idx - first_entry) / fps)
                 curve_cov.append(float(covered_frames / max(1, present_frames)))
 
             final_cov = float(covered_frames / present_frames) if present_frames > 0 else 0.0
 
-
             return {
                 "first_entry_frame": int(first_entry),
                 "fps": float(fps),
+                "visual_angle_deg": float(visual_angle_deg),
+                "entry_ids": sorted(entry_ids),
+                "inroom_ids": sorted(inroom_ids),
                 "final_coverage": float(final_cov),
                 "present_frames": int(present_frames),
                 "covered_frames": int(covered_frames),
-                "per_enemy_present": per_enemy_present,
-                "per_enemy_covered": per_enemy_covered,
+                "per_inroom_present": per_inroom_present,
+                "per_inroom_covered": per_inroom_covered,
                 "clearance": clearance,
                 "curve_t": curve_t,
                 "curve_cov": curve_cov,
@@ -412,15 +474,14 @@ class ThreatCoverage_Metric(AbstractMetric):
             out_path: str,
             expert_res: Dict[str, object],
             trainee_res: Dict[str, object],
-            per_enemy_df: pd.DataFrame,
+            per_inroom_df: pd.DataFrame,
         ) -> None:
-            """Stitched plot: cumulative threat coverage + per-enemy unseen time."""
             ex_t = expert_res.get("curve_t", [])
             ex_c = expert_res.get("curve_cov", [])
             tr_t = trainee_res.get("curve_t", [])
             tr_c = trainee_res.get("curve_cov", [])
 
-            if (not ex_t and not tr_t) and (per_enemy_df is None or per_enemy_df.empty):
+            if (not ex_t and not tr_t) and (per_inroom_df is None or per_inroom_df.empty):
                 return
 
             fig, (ax_ts, ax_bar) = plt.subplots(
@@ -430,16 +491,13 @@ class ThreatCoverage_Metric(AbstractMetric):
                 constrained_layout=True,
             )
 
-            # ---- Panel 1: cumulative coverage over time ----
             if ex_t:
                 ax_ts.plot(ex_t, ex_c, label="Expert", color="tab:blue", linewidth=2.5)
             if tr_t:
                 ax_ts.plot(tr_t, tr_c, label="Trainee", color="tab:orange", linewidth=2.5)
 
-            # Per-enemy clear-time markers (dotted), labeled by enemy id
             ex_clear = expert_res.get("clearance") or {}
             tr_clear = trainee_res.get("clearance") or {}
-
             ex_first = float(expert_res.get("first_entry_frame", 1))
             tr_first = float(trainee_res.get("first_entry_frame", 1))
             ex_fps = float(expert_res.get("fps", 30.0))
@@ -448,9 +506,9 @@ class ThreatCoverage_Metric(AbstractMetric):
             def _mark_clear_times(clearance_map, first_frame, fps_local, color):
                 if not clearance_map or fps_local <= 0:
                     return
-                for eid, tup in clearance_map.items():
+                for inroom_id, tup in clearance_map.items():
                     try:
-                        eid_i = int(eid)
+                        inroom_id_i = int(inroom_id)
                     except Exception:
                         continue
                     if tup is None or len(tup) < 2 or tup[1] is None:
@@ -461,11 +519,12 @@ class ThreatCoverage_Metric(AbstractMetric):
                         continue
                     if not np.isfinite(t_sec):
                         continue
+
                     ax_ts.axvline(float(t_sec), linestyle=":", color=color, alpha=0.45, linewidth=1.2)
                     ax_ts.text(
                         float(t_sec),
                         1.045,
-                        f"Enemy ID: {eid_i}",
+                        f"InRoom ID: {inroom_id_i}",
                         rotation=90,
                         color=color,
                         ha="center",
@@ -483,43 +542,39 @@ class ThreatCoverage_Metric(AbstractMetric):
             ax_ts.set_title("Threat coverage until threats are cleared")
             ax_ts.set_ylim(0.0, 1.05)
             ax_ts.grid(True, axis="y", linestyle="--", alpha=0.35)
-            # ax_ts.legend(loc="upper left", framealpha=0.9)
 
-            # ---- Panel 2: per-enemy unseen time (until clearance) ----
-            if per_enemy_df is None or per_enemy_df.empty:
+            if per_inroom_df is None or per_inroom_df.empty:
                 ax_bar.set_axis_off()
             else:
-                dfp = per_enemy_df.copy()
-                dfp["enemy_id"] = pd.to_numeric(dfp["enemy_id"], errors="coerce")
-                dfp = dfp.dropna(subset=["enemy_id"]).sort_values("enemy_id")
+                dfp = per_inroom_df.copy()
+                dfp["inroom_id"] = pd.to_numeric(dfp["inroom_id"], errors="coerce")
+                dfp = dfp.dropna(subset=["inroom_id"]).sort_values("inroom_id")
+
                 if dfp.empty:
                     ax_bar.set_axis_off()
                 else:
-                    enemy_ids = [int(x) for x in dfp["enemy_id"].tolist()]
-                    idx = np.arange(len(enemy_ids), dtype=float)
+                    inroom_ids = [int(x) for x in dfp["inroom_id"].tolist()]
+                    idx = np.arange(len(inroom_ids), dtype=float)
                     width = 0.36
 
-                    # Unseen seconds per enemy = (present - covered) / fps (per run)
                     ex_fps = float(expert_res.get("fps", 30.0))
                     tr_fps = float(trainee_res.get("fps", 30.0))
 
-                    ex_p = pd.to_numeric(dfp["expert_enemy_present_frames"], errors="coerce").fillna(0).to_numpy(dtype=float)
-                    ex_cov = pd.to_numeric(dfp["expert_enemy_covered_frames"], errors="coerce").fillna(0).to_numpy(dtype=float)
-                    tr_p = pd.to_numeric(dfp["trainee_enemy_present_frames"], errors="coerce").fillna(0).to_numpy(dtype=float)
-                    tr_cov = pd.to_numeric(dfp["trainee_enemy_covered_frames"], errors="coerce").fillna(0).to_numpy(dtype=float)
+                    ex_p = pd.to_numeric(dfp["expert_inroom_present_frames"], errors="coerce").fillna(0).to_numpy(dtype=float)
+                    ex_cov = pd.to_numeric(dfp["expert_inroom_covered_frames"], errors="coerce").fillna(0).to_numpy(dtype=float)
+                    tr_p = pd.to_numeric(dfp["trainee_inroom_present_frames"], errors="coerce").fillna(0).to_numpy(dtype=float)
+                    tr_cov = pd.to_numeric(dfp["trainee_inroom_covered_frames"], errors="coerce").fillna(0).to_numpy(dtype=float)
 
                     ex_unseen_sec = np.maximum(0.0, (ex_p - ex_cov) / max(ex_fps, 1.0))
                     tr_unseen_sec = np.maximum(0.0, (tr_p - tr_cov) / max(tr_fps, 1.0))
 
-                    # Coverage scores per enemy
                     ex_score = np.where(ex_p > 0, ex_cov / ex_p, 0.0)
                     tr_score = np.where(tr_p > 0, tr_cov / tr_p, 0.0)
 
                     ax_bar.bar(idx - width / 2.0, ex_unseen_sec, width, label="Expert", color="tab:blue", alpha=0.9)
                     ax_bar.bar(idx + width / 2.0, tr_unseen_sec, width, label="Trainee", color="tab:orange", alpha=0.9)
 
-                    # Labels show rounded score with ~
-                    for i in range(len(enemy_ids)):
+                    for i in range(len(inroom_ids)):
                         ax_bar.text(
                             idx[i] - width / 2.0,
                             ex_unseen_sec[i] + 0.02,
@@ -538,14 +593,12 @@ class ThreatCoverage_Metric(AbstractMetric):
                         )
 
                     ax_bar.set_xticks(idx)
-                    ax_bar.set_xticklabels([str(e) for e in enemy_ids])
-                    ax_bar.set_xlabel("Enemy ID")
+                    ax_bar.set_xticklabels([str(e) for e in inroom_ids])
+                    ax_bar.set_xlabel("InRoom ID")
                     ax_bar.set_ylabel("Unseen time (seconds)")
-                    ax_bar.set_title("Per-enemy unseen time while uncleared (labels show ~coverage score)")
+                    ax_bar.set_title("Per-inroom unseen time while uncleared (labels show ~coverage score)")
                     ax_bar.grid(True, axis="y", linestyle="--", alpha=0.35)
-                    # ax_bar.legend(loc="upper left", framealpha=0.9)
 
-            # Single legend for the full figure (outside, top-right)
             h1, l1 = ax_ts.get_legend_handles_labels()
             h2, l2 = ax_bar.get_legend_handles_labels()
             seen = set()
@@ -571,30 +624,32 @@ class ThreatCoverage_Metric(AbstractMetric):
             plt.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.2)
             plt.close(fig)
 
-        # ------------------ Main ------------------
         os.makedirs(session_folder, exist_ok=True)
         img_path = os.path.join(session_folder, "THREAT_COVERAGE_Comparison.jpg")
         txt_path = os.path.join(session_folder, "THREAT_COVERAGE_Comparison.txt")
 
-        fps = 30.0
-        if isinstance(config, dict) and config.get("frame_rate") is not None:
-            try:
-                fps = float(config.get("frame_rate"))
-            except Exception:
-                fps = 30.0
-
-        enemy_ids_cfg: List[int] = []
-        if isinstance(config, dict):
-            try:
-                enemy_ids_cfg = [int(x) for x in config.get("enemy_ids", [])]
-            except Exception:
-                enemy_ids_cfg = []
+        fps = _frame_rate_from_config(config)
+        visual_angle_deg = _visual_angle_from_config(config)
+        inroom_id_start = _inroom_id_start_from_config(config)
 
         try:
-            expert_res = _evaluate_folder(expert_folder, enemy_ids=enemy_ids_cfg, fps=fps)
-            trainee_res = _evaluate_folder(session_folder, enemy_ids=enemy_ids_cfg, fps=fps)
+            expert_res = _evaluate_folder(
+                expert_folder,
+                fps=fps,
+                visual_angle_deg=visual_angle_deg,
+                inroom_id_start=inroom_id_start,
+            )
+            trainee_res = _evaluate_folder(
+                session_folder,
+                fps=fps,
+                visual_angle_deg=visual_angle_deg,
+                inroom_id_start=inroom_id_start,
+            )
         except Exception:
-            err_text = "There was an error while processing this comparison. Missing TrackerOutput/GazeCache/ThreatClearanceCache."
+            err_text = (
+                "There was an error while processing this comparison. "
+                "Missing TrackerOutput, GazeCache, or ThreatClearanceCache."
+            )
             try:
                 with open(txt_path, "w", encoding="utf-8") as f:
                     f.write(err_text)
@@ -608,39 +663,38 @@ class ThreatCoverage_Metric(AbstractMetric):
                 "Text": err_text,
             }
 
-        # Align enemy list across both results
-        ex_enemies = set((expert_res.get("per_enemy_present") or {}).keys())
-        tr_enemies = set((trainee_res.get("per_enemy_present") or {}).keys())
-        enemies = sorted(list(ex_enemies | tr_enemies))
-        if not enemies:
-            enemies = [99]
+        ex_inroom = set((expert_res.get("per_inroom_present") or {}).keys())
+        tr_inroom = set((trainee_res.get("per_inroom_present") or {}).keys())
+        inroom_ids = sorted(list(ex_inroom | tr_inroom))
 
         rows: List[Dict[str, object]] = []
+        for inroom_id in inroom_ids:
+            ex_p = int((expert_res.get("per_inroom_present") or {}).get(inroom_id, 0))
+            ex_c = int((expert_res.get("per_inroom_covered") or {}).get(inroom_id, 0))
+            tr_p = int((trainee_res.get("per_inroom_present") or {}).get(inroom_id, 0))
+            tr_c = int((trainee_res.get("per_inroom_covered") or {}).get(inroom_id, 0))
+            rows.append(
+                {
+                    "inroom_id": int(inroom_id),
+                    "expert_inroom_present_frames": ex_p,
+                    "expert_inroom_covered_frames": ex_c,
+                    "trainee_inroom_present_frames": tr_p,
+                    "trainee_inroom_covered_frames": tr_c,
+                }
+            )
 
+        per_inroom_df = pd.DataFrame(rows) if rows else pd.DataFrame([])
 
-        # Per-enemy rows
-        for eid in enemies:
-            ex_p = int((expert_res.get("per_enemy_present") or {}).get(eid, 0))
-            ex_c = int((expert_res.get("per_enemy_covered") or {}).get(eid, 0))
-            tr_p = int((trainee_res.get("per_enemy_present") or {}).get(eid, 0))
-            tr_c = int((trainee_res.get("per_enemy_covered") or {}).get(eid, 0))
-            rows.append({
-                "enemy_id": int(eid),
-                "expert_enemy_present_frames": ex_p,
-                "expert_enemy_covered_frames": ex_c,
-                "trainee_enemy_present_frames": tr_p,
-                "trainee_enemy_covered_frames": tr_c,
-            })
-
-        per_enemy_df = pd.DataFrame(rows) if rows else pd.DataFrame([])
-
-        # Plot
         try:
-            _generate_plot(out_path=img_path, expert_res=expert_res, trainee_res=trainee_res, per_enemy_df=per_enemy_df)
+            _generate_plot(
+                out_path=img_path,
+                expert_res=expert_res,
+                trainee_res=trainee_res,
+                per_inroom_df=per_inroom_df,
+            )
         except Exception:
             pass
 
-        # ---- Summary (score diff + avg uncovered time per enemy) ----
         ex_final = float(expert_res.get("final_coverage", 0.0))
         tr_final = float(trainee_res.get("final_coverage", 0.0))
         delta_final = float(tr_final - ex_final)
@@ -662,17 +716,18 @@ class ThreatCoverage_Metric(AbstractMetric):
             )
 
         def _avg_uncovered_sec(res: Dict[str, object]) -> Optional[float]:
-            present = res.get("per_enemy_present") or {}
-            covered = res.get("per_enemy_covered") or {}
+            present = res.get("per_inroom_present") or {}
+            covered = res.get("per_inroom_covered") or {}
             try:
                 fps_local = float(res.get("fps", fps))
             except Exception:
                 fps_local = fps
+
             if fps_local <= 0:
                 return None
 
             vals: List[float] = []
-            for eid, p in present.items():
+            for inroom_id, p in present.items():
                 try:
                     p_int = int(p)
                 except Exception:
@@ -680,7 +735,7 @@ class ThreatCoverage_Metric(AbstractMetric):
                 if p_int <= 0:
                     continue
                 try:
-                    c_int = int(covered.get(eid, 0))
+                    c_int = int(covered.get(inroom_id, 0))
                 except Exception:
                     c_int = 0
                 vals.append(max(0.0, (p_int - c_int) / fps_local))
@@ -691,30 +746,33 @@ class ThreatCoverage_Metric(AbstractMetric):
 
         if ex_avg_u is None or tr_avg_u is None:
             uncovered_part = (
-                "On average, uncovered time per enemy before clearance couldn't be computed (missing per-enemy counts)."
+                "On average, uncovered time per in-room threat before clearance couldn't be computed "
+                "(missing per-inroom counts)."
             )
         else:
             du = float(tr_avg_u - ex_avg_u)
             if abs(du) <= 0.10:
-                uncovered_part = "On average, the trainee had about the same uncovered time per enemy before clearance as the expert."
+                uncovered_part = (
+                    "On average, the trainee had about the same uncovered time per in-room threat "
+                    "before clearance as the expert."
+                )
             elif du < 0:
                 uncovered_part = (
-                    f"On average, the trainee had about {abs(du):.2f}s less uncovered time per enemy before clearance than the expert "
-                    f"(better coverage)."
+                    f"On average, the trainee had about {abs(du):.2f}s less uncovered time per in-room threat "
+                    f"before clearance than the expert (better coverage)."
                 )
             else:
                 uncovered_part = (
-                    f"On average, the trainee had about {abs(du):.2f}s more uncovered time per enemy before clearance than the expert."
+                    f"On average, the trainee had about {abs(du):.2f}s more uncovered time per in-room threat "
+                    f"before clearance than the expert."
                 )
 
         text = score_part + "\n" + uncovered_part
 
-        # Also save the returned summary text alongside the image
         try:
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write(text)
         except Exception:
-            # Non-fatal: still return the summary even if file write fails
             pass
 
         return {

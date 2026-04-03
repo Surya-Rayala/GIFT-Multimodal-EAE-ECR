@@ -1,17 +1,20 @@
+from typing import Any, Dict
+
+
 class AbstractMetric:
-    def __init__(self, config: dict) -> None:
-        self.config = config
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self.config = config or {}
         self.metricName = "Metric"
-    def process(self, ctx):
-        """
-        Process the unified MetricContext for this metric.
-        Subclasses must override this to extract and prepare needed data.
-        """
-        raise NotImplementedError("Subclasses must implement process")
-    def updateFrame(self, map_pos):
+
+    def process(self, ctx) -> None:
+        raise NotImplementedError("Subclasses must implement process(ctx)")
+
+    def updateFrame(self, map_pos) -> None:
         pass
+
     def getFinalScore(self) -> float:
-        pass
+        raise NotImplementedError("Subclasses must implement getFinalScore()")
+
     @staticmethod
-    def expertCompare(expert_track, trainee_track, mapView, outputFolder):
-        pass
+    def expertCompare(*args, **kwargs):
+        raise NotImplementedError("Subclasses must implement expertCompare(...)")

@@ -1,75 +1,107 @@
-# Motion Trackers for Video Analysis -Surya ⎜(Extended from Mikel Broström's work on boxmot(10.0.81))
+# Motion Trackers for Video Analysis - Surya
+# Extended from Mikel Broström's work on boxmot (10.0.81)
 """
-    This script is adopted from the SORT script by Alex Bewley alex@bewley.ai
+This script is adopted from the SORT script by Alex Bewley.
 """
+
 from __future__ import annotations
 
-import numpy as np
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Any, Dict, List, Optional, Tuple
 
-from ...motion.kalman_filters.xysr_kf import KalmanFilterXYSR
-from ...utils.association import associate, linear_assignment
-from ...utils.iou import get_asso_func, run_asso_func
-from ...utils.pose_association import (
-    POSE_ANCHOR_NAMES,
-    extract_pose_anchors,
-    compute_detection_track_pose_metrics,
-)
-from ..basetracker import BaseTracker
-from ...utils import PerClassDecorator
-from ...utils.ops import xyxy2xysr
-
-# ---------------------------------------------------------------------
-# Extra ops + geometry
-# ---------------------------------------------------------------------
-from ...utils.ops import xyxy2xywh, xyxy2tlwh
+import numpy as np
 import shapely.geometry as geo
 from shapely.affinity import scale
 
+from ...motion.kalman_filters.xysr_kf import KalmanFilterXYSR
+from ...utils import PerClassDecorator
+from ...utils.association import associate, linear_assignment
+from ...utils.iou import get_asso_func, run_asso_func
+from ...utils.ops import xyxy2tlwh, xyxy2xywh, xyxy2xysr
+from ...utils.pose_association import (
+    POSE_ANCHOR_NAMES,
+    compute_detection_track_pose_metrics,
+    extract_pose_anchors,
+)
+from ..basetracker import BaseTracker
 
-# ==============================
+
+# ---------------------------------------------------------------------
 # Small utilities
-# ==============================
-def k_previous_obs(observations: Dict[int, np.ndarray], cur_age: int, k: int):
+# ---------------------------------------------------------------------
+def k_previous_obs(observations: Dict[int, np.ndarray], current_age: int, lookback: int):
+    """
+    Return the most recent observation within the requested lookback window.
+    If none exists, return the latest available observation.
+    """
     if len(observations) == 0:
         return [-1, -1, -1, -1, -1]
-    for i in range(k):
-        dt = k - i
-        if cur_age - dt in observations:
-            return observations[cur_age - dt]
+
+    for step in range(lookback):
+        delta = lookback - step
+        if current_age - delta in observations:
+            return observations[current_age - delta]
+
     max_age = max(observations.keys())
     return observations[max_age]
 
 
-def convert_x_to_bbox(x: np.ndarray, score: Optional[float] = None):
+def convert_x_to_bbox(state_vector: np.ndarray, score: Optional[float] = None):
     """
-    Takes a bounding box in the centre form [x,y,s,r] and returns it in the form
-      [x1,y1,x2,y2] where x1,y1 is the top left and x2,y2 is the bottom right
+    Convert bbox state from [x, y, s, r] to [x1, y1, x2, y2].
     """
-    w = np.sqrt(x[2] * x[3])
-    h = x[2] / w
+    width = np.sqrt(state_vector[2] * state_vector[3])
+    height = state_vector[2] / width
+
     if score is None:
-        return np.array([x[0] - w / 2.0, x[1] - h / 2.0, x[0] + w / 2.0, x[1] + h / 2.0]).reshape((1, 4))
-    return np.array([x[0] - w / 2.0, x[1] - h / 2.0, x[0] + w / 2.0, x[1] + h / 2.0, score]).reshape((1, 5))
+        return np.array(
+            [
+                state_vector[0] - width / 2.0,
+                state_vector[1] - height / 2.0,
+                state_vector[0] + width / 2.0,
+                state_vector[1] + height / 2.0,
+            ]
+        ).reshape((1, 4))
+
+    return np.array(
+        [
+            state_vector[0] - width / 2.0,
+            state_vector[1] - height / 2.0,
+            state_vector[0] + width / 2.0,
+            state_vector[1] + height / 2.0,
+            score,
+        ]
+    ).reshape((1, 5))
 
 
-def speed_direction(bbox1: np.ndarray, bbox2: np.ndarray):
-    cx1, cy1 = (bbox1[0] + bbox1[2]) / 2.0, (bbox1[1] + bbox1[3]) / 2.0
-    cx2, cy2 = (bbox2[0] + bbox2[2]) / 2.0, (bbox2[1] + bbox2[3]) / 2.0
-    speed = np.array([cy2 - cy1, cx2 - cx1])
-    norm = np.sqrt((cy2 - cy1) ** 2 + (cx2 - cx1) ** 2) + 1e-6
-    return speed / norm
+def speed_direction(previous_bbox: np.ndarray, current_bbox: np.ndarray):
+    """
+    Compute normalized motion direction from previous box center to current box center.
+    """
+    prev_center_x = (previous_bbox[0] + previous_bbox[2]) / 2.0
+    prev_center_y = (previous_bbox[1] + previous_bbox[3]) / 2.0
+    curr_center_x = (current_bbox[0] + current_bbox[2]) / 2.0
+    curr_center_y = (current_bbox[1] + current_bbox[3]) / 2.0
+
+    direction = np.array([curr_center_y - prev_center_y, curr_center_x - prev_center_x])
+    norm = np.sqrt((curr_center_y - prev_center_y) ** 2 + (curr_center_x - prev_center_x) ** 2) + 1e-6
+    return direction / norm
 
 
-
-def normalize(v: np.ndarray):
-    norm = np.linalg.norm(v)
+def normalize(vector: np.ndarray):
+    """
+    Normalize a vector safely.
+    """
+    norm = np.linalg.norm(vector)
     if norm == 0:
-        norm = np.finfo(v.dtype).eps
-    return v / norm
+        norm = np.finfo(vector.dtype).eps
+    return vector / norm
 
+
+# ---------------------------------------------------------------------
+# Pose association config
+# ---------------------------------------------------------------------
 @dataclass(frozen=True)
 class PoseAssociationGateConfig:
     hybrid_threshold: float
@@ -86,23 +118,35 @@ class PoseAssociationConfig:
     primary: PoseAssociationGateConfig
     rematch: PoseAssociationGateConfig
 
-# ==============================
-# Point Kalman Filter (keypoints)
-# ==============================
+
+# ---------------------------------------------------------------------
+# Small Kalman filter for 2D point smoothing
+# ---------------------------------------------------------------------
 class KalmanFilterPoint:
     """
-    Constant velocity KF for a 2D point.
+    Constant-velocity Kalman filter for a 2D point.
     State: [x, y, vx, vy]
     """
+
     def __init__(self):
         self.state = np.zeros((4, 1))
         self.P = np.eye(4) * 1000.0
-        self.F = np.array([[1, 0, 1, 0],
-                           [0, 1, 0, 1],
-                           [0, 0, 1, 0],
-                           [0, 0, 0, 1]], dtype=float)
-        self.H = np.array([[1, 0, 0, 0],
-                           [0, 1, 0, 0]], dtype=float)
+        self.F = np.array(
+            [
+                [1, 0, 1, 0],
+                [0, 1, 0, 1],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ],
+            dtype=float,
+        )
+        self.H = np.array(
+            [
+                [1, 0, 0, 0],
+                [0, 1, 0, 0],
+            ],
+            dtype=float,
+        )
         self.R = np.eye(2) * 10.0
         self.Q = np.eye(4) * 0.01
 
@@ -117,22 +161,23 @@ class KalmanFilterPoint:
         return self.state[:2].flatten()
 
     def update(self, measurement: np.ndarray):
-        z = np.asarray(measurement, dtype=float).reshape(2, 1)
-        y = z - (self.H @ self.state)
-        S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-        self.state = self.state + (K @ y)
-        I = np.eye(4)
-        self.P = (I - K @ self.H) @ self.P
+        measurement = np.asarray(measurement, dtype=float).reshape(2, 1)
+        residual = measurement - (self.H @ self.state)
+        innovation_covariance = self.H @ self.P @ self.H.T + self.R
+        kalman_gain = self.P @ self.H.T @ np.linalg.inv(innovation_covariance)
+        self.state = self.state + (kalman_gain @ residual)
+        identity = np.eye(4)
+        self.P = (identity - kalman_gain @ self.H) @ self.P
 
 
-# ==============================
+# ---------------------------------------------------------------------
 # Track object
-# ==============================
+# ---------------------------------------------------------------------
 class KalmanBoxTracker:
     """
-    Internal state of individual tracked objects observed as bbox.
+    Internal state of an individual tracked object.
     """
+
     count = 0
 
     def __init__(
@@ -147,7 +192,9 @@ class KalmanBoxTracker:
     ):
         self.det_ind = det_ind
 
-        # KF for bbox
+        # -------------------------------------------------------------
+        # Bounding-box Kalman filter
+        # -------------------------------------------------------------
         self.kf = KalmanFilterXYSR(dim_x=7, dim_z=4, max_obs=max_obs)
         self.kf.F = np.array(
             [
@@ -176,10 +223,11 @@ class KalmanBoxTracker:
         self.kf.P *= 10.0
         self.kf.Q[-1, -1] *= 0.01
         self.kf.Q[4:, 4:] *= 0.01
-
         self.kf.x[:4] = xyxy2xysr(bbox)
 
-        # book-keeping
+        # -------------------------------------------------------------
+        # General tracking state
+        # -------------------------------------------------------------
         self.time_since_update = 0
         self.id = KalmanBoxTracker.count
         KalmanBoxTracker.count += 1
@@ -193,37 +241,64 @@ class KalmanBoxTracker:
         self.conf = float(bbox[-1])
         self.cls = int(cls)
 
-        self.last_observation = np.array([-1, -1, -1, -1, -1], dtype=float)  # placeholder
+        self.last_observation = np.array([-1, -1, -1, -1, -1], dtype=float)
         self.observations: Dict[int, np.ndarray] = {}
         self.history_observations = deque([], maxlen=self.max_obs)
 
         self.velocity = None
         self.delta_t = delta_t
 
-        # -------------------- Mapping / keypoints state --------------------
+        # -------------------------------------------------------------
+        # Mapping and identity state
+        # -------------------------------------------------------------
         self.current_map_pos: Optional[np.ndarray] = None
         self.last_map_pos: Optional[np.ndarray] = None
         self.final_id: Optional[int] = None
 
+        self.identity_role: str = "unknown"
+        self.role_locked: bool = False
+        self.birth_frame: Optional[int] = None
+        self.birth_location: str = "unknown"
+        self.frames_since_birth: int = 0
+        self.frames_in_entry: int = 0
+        self.frames_in_entry_buffer: int = 0
+        self.frames_in_interior: int = 0
+        self.consecutive_interior_frames: int = 0
+
+        # -------------------------------------------------------------
+        # Keypoints and pose-anchor state
+        # -------------------------------------------------------------
         self.keypoints = keypoints
         self.keypoint_confidence_threshold = float(keypoint_confidence_threshold)
         self.filtered_keypoints = self.filter_keypoints(keypoints, self.keypoint_confidence_threshold)
 
-        self.pose_anchors = extract_pose_anchors(self.filtered_keypoints, self.keypoint_confidence_threshold)
+        self.pose_anchors = extract_pose_anchors(
+            self.filtered_keypoints,
+            self.keypoint_confidence_threshold,
+        )
         self.predicted_pose_anchors = {
-            name: dict(info) for name, info in self.pose_anchors.items()
-        }
-        self.pose_anchor_filters: Dict[str, Optional[KalmanFilterPoint]] = {
-            name: None for name in POSE_ANCHOR_NAMES
-        }
-        self.pose_anchor_missing_counts: Dict[str, int] = {
-            name: 0 for name in POSE_ANCHOR_NAMES
-        }
-        self.pose_anchor_reliability: Dict[str, float] = {
-            name: float(self.pose_anchors[name].get("confidence", 0.0)) if self.pose_anchors[name].get("valid", False) else 0.0
-            for name in POSE_ANCHOR_NAMES
+            anchor_name: dict(anchor_info)
+            for anchor_name, anchor_info in self.pose_anchors.items()
         }
 
+        self.pose_anchor_filters: Dict[str, Optional[KalmanFilterPoint]] = {
+            anchor_name: None for anchor_name in POSE_ANCHOR_NAMES
+        }
+        self.pose_anchor_missing_counts: Dict[str, int] = {
+            anchor_name: 0 for anchor_name in POSE_ANCHOR_NAMES
+        }
+        self.pose_anchor_reliability: Dict[str, float] = {
+            anchor_name: (
+                float(self.pose_anchors[anchor_name].get("confidence", 0.0))
+                if self.pose_anchors[anchor_name].get("valid", False)
+                else 0.0
+            )
+            for anchor_name in POSE_ANCHOR_NAMES
+        }
+
+        # -------------------------------------------------------------
+        # Map-position smoothing from ankle / foot evidence
+        # -------------------------------------------------------------
         self.ankle_based_point: Optional[np.ndarray] = None
         self.keypoint_kalman_filter: Optional[KalmanFilterPoint] = None
 
@@ -231,7 +306,6 @@ class KalmanBoxTracker:
         self.missing_keypoints_frames = 0
         self.previous_bbox: Optional[np.ndarray] = None
 
-        # Joint-specific position history for velocity estimation
         self.joint_histories = {
             "lhip": deque([], maxlen=8),
             "rhip": deque([], maxlen=8),
@@ -239,92 +313,124 @@ class KalmanBoxTracker:
             "rknee": deque([], maxlen=8),
             "bbox": deque([], maxlen=8),
         }
-
         self.bbox_top_center_history = deque(maxlen=5)
 
     @staticmethod
-    def filter_keypoints(keypoints: Optional[np.ndarray], threshold: float) -> Optional[np.ndarray]:
+    def filter_keypoints(
+        keypoints: Optional[np.ndarray],
+        threshold: float,
+    ) -> Optional[np.ndarray]:
         """
-        Keep x,y as-is; invalidate by zeroing confidence only.
-        (Prevents accidental averaging toward (0,0) if someone later forgets confidence checks.)
+        Keep x and y unchanged; invalidate low-confidence keypoints by zeroing only
+        the confidence channel.
         """
         if keypoints is None:
             return None
-        filtered = np.array(keypoints, copy=True)
-        low = filtered[:, 2] < threshold
-        filtered[low, 2] = 0.0
-        return filtered
+
+        filtered_keypoints = np.array(keypoints, copy=True)
+        low_confidence_mask = filtered_keypoints[:, 2] < threshold
+        filtered_keypoints[low_confidence_mask, 2] = 0.0
+        return filtered_keypoints
 
     def _init_or_update_pose_anchor_filters(
         self,
         anchors: Dict[str, Dict[str, Any]],
         reappearance_threshold: int = 5,
     ):
-        for name in POSE_ANCHOR_NAMES:
-            info = anchors.get(name, {})
-            valid = bool(info.get("valid", False))
-            if valid:
-                point = np.asarray(info["point"], dtype=float)
-                if self.pose_anchor_missing_counts[name] >= reappearance_threshold or self.pose_anchor_filters[name] is None:
-                    self.pose_anchor_filters[name] = KalmanFilterPoint()
-                    self.pose_anchor_filters[name].initiate(point)
-                else:
-                    self.pose_anchor_filters[name].update(point)
+        """
+        Update per-anchor Kalman filters from current anchor observations.
+        """
+        for anchor_name in POSE_ANCHOR_NAMES:
+            anchor_info = anchors.get(anchor_name, {})
+            is_valid = bool(anchor_info.get("valid", False))
 
-                filt = self.pose_anchor_filters[name]
-                filtered_point = filt.state[:2].flatten() if filt is not None else point
-                self.pose_anchor_missing_counts[name] = 0
-                self.pose_anchor_reliability[name] = float(info.get("confidence", 0.0))
-                self.pose_anchors[name] = {
+            if is_valid:
+                point = np.asarray(anchor_info["point"], dtype=float)
+
+                if (
+                    self.pose_anchor_missing_counts[anchor_name] >= reappearance_threshold
+                    or self.pose_anchor_filters[anchor_name] is None
+                ):
+                    self.pose_anchor_filters[anchor_name] = KalmanFilterPoint()
+                    self.pose_anchor_filters[anchor_name].initiate(point)
+                else:
+                    self.pose_anchor_filters[anchor_name].update(point)
+
+                anchor_filter = self.pose_anchor_filters[anchor_name]
+                filtered_point = anchor_filter.state[:2].flatten() if anchor_filter is not None else point
+
+                self.pose_anchor_missing_counts[anchor_name] = 0
+                self.pose_anchor_reliability[anchor_name] = float(anchor_info.get("confidence", 0.0))
+                self.pose_anchors[anchor_name] = {
                     "point": np.asarray(filtered_point, dtype=float),
-                    "confidence": float(info.get("confidence", 0.0)),
-                    "support": int(info.get("support", 0)),
+                    "confidence": float(anchor_info.get("confidence", 0.0)),
+                    "support": int(anchor_info.get("support", 0)),
                     "valid": True,
                 }
             else:
-                self.pose_anchor_missing_counts[name] += 1
-                decay = 0.85 if self.pose_anchor_missing_counts[name] <= 3 else 0.65
-                self.pose_anchor_reliability[name] *= decay
-                predicted_info = self.predicted_pose_anchors.get(name, {}) if self.predicted_pose_anchors is not None else {}
+                self.pose_anchor_missing_counts[anchor_name] += 1
+
+                decay = 0.85 if self.pose_anchor_missing_counts[anchor_name] <= 3 else 0.65
+                self.pose_anchor_reliability[anchor_name] *= decay
+
+                predicted_info = (
+                    self.predicted_pose_anchors.get(anchor_name, {})
+                    if self.predicted_pose_anchors is not None
+                    else {}
+                )
                 predicted_point = predicted_info.get("point", None)
                 if predicted_point is not None:
                     predicted_point = np.asarray(predicted_point, dtype=float)
-                self.pose_anchors[name] = {
+
+                self.pose_anchors[anchor_name] = {
                     "point": predicted_point,
-                    "confidence": float(self.pose_anchor_reliability[name]),
+                    "confidence": float(self.pose_anchor_reliability[anchor_name]),
                     "support": int(predicted_info.get("support", 0)),
-                    "valid": self.pose_anchor_missing_counts[name] <= reappearance_threshold and predicted_point is not None,
+                    "valid": (
+                        self.pose_anchor_missing_counts[anchor_name] <= reappearance_threshold
+                        and predicted_point is not None
+                    ),
                 }
 
     def _predict_pose_anchors(self, stale_after: int = 8):
-        predicted: Dict[str, Dict[str, Any]] = {}
-        for name in POSE_ANCHOR_NAMES:
-            filt = self.pose_anchor_filters.get(name)
-            missing = int(self.pose_anchor_missing_counts.get(name, 0))
-            reliability = float(self.pose_anchor_reliability.get(name, 0.0))
+        """
+        Predict anchor positions one step forward for pose-based association.
+        """
+        predicted_anchors: Dict[str, Dict[str, Any]] = {}
 
-            if filt is not None:
-                point = filt.predict()
-                predicted[name] = {
-                    "point": np.asarray(point, dtype=float),
+        for anchor_name in POSE_ANCHOR_NAMES:
+            anchor_filter = self.pose_anchor_filters.get(anchor_name)
+            missing_count = int(self.pose_anchor_missing_counts.get(anchor_name, 0))
+            reliability = float(self.pose_anchor_reliability.get(anchor_name, 0.0))
+
+            if anchor_filter is not None:
+                predicted_point = anchor_filter.predict()
+                predicted_anchors[anchor_name] = {
+                    "point": np.asarray(predicted_point, dtype=float),
                     "confidence": reliability,
-                    "support": int(self.pose_anchors.get(name, {}).get("support", 0)),
-                    "valid": missing <= stale_after,
+                    "support": int(self.pose_anchors.get(anchor_name, {}).get("support", 0)),
+                    "valid": missing_count <= stale_after,
                 }
             else:
-                prev = self.pose_anchors.get(name, {})
-                predicted[name] = {
-                    "point": prev.get("point", None),
+                previous_anchor = self.pose_anchors.get(anchor_name, {})
+                predicted_anchors[anchor_name] = {
+                    "point": previous_anchor.get("point", None),
                     "confidence": reliability,
-                    "support": int(prev.get("support", 0)),
-                    "valid": bool(prev.get("valid", False)) and missing <= stale_after,
+                    "support": int(previous_anchor.get("support", 0)),
+                    "valid": bool(previous_anchor.get("valid", False)) and missing_count <= stale_after,
                 }
 
-        self.predicted_pose_anchors = predicted
+        self.predicted_pose_anchors = predicted_anchors
 
-    def update(self, bbox: Optional[np.ndarray], cls: Optional[int], det_ind: Optional[int], keypoints: Optional[np.ndarray] = None):
+    def update(
+        self,
+        bbox: Optional[np.ndarray],
+        cls: Optional[int],
+        det_ind: Optional[int],
+        keypoints: Optional[np.ndarray] = None,
+    ):
         """
-        Update KF with observed bbox; optionally update keypoints.
+        Update tracker state with a matched detection.
         """
         self.det_ind = det_ind
 
@@ -332,13 +438,12 @@ class KalmanBoxTracker:
             self.conf = float(bbox[-1])
             self.cls = int(cls)
 
-            # velocity direction (observation-based)
             if self.last_observation.sum() >= 0:
                 previous_box = None
-                for i in range(self.delta_t):
-                    dt = self.delta_t - i
-                    if self.age - dt in self.observations:
-                        previous_box = self.observations[self.age - dt]
+                for step in range(self.delta_t):
+                    delta = self.delta_t - step
+                    if self.age - delta in self.observations:
+                        previous_box = self.observations[self.age - delta]
                         break
                 if previous_box is None:
                     previous_box = self.last_observation
@@ -354,21 +459,27 @@ class KalmanBoxTracker:
 
             self.kf.update(xyxy2xysr(bbox))
 
-            # keypoints / pose anchors
             if keypoints is not None:
                 self.keypoints = keypoints
-                self.filtered_keypoints = self.filter_keypoints(keypoints, self.keypoint_confidence_threshold)
+                self.filtered_keypoints = self.filter_keypoints(
+                    keypoints,
+                    self.keypoint_confidence_threshold,
+                )
             else:
                 self.keypoints = None
                 self.filtered_keypoints = None
 
-            current_anchors = extract_pose_anchors(self.filtered_keypoints, self.keypoint_confidence_threshold)
-            self._init_or_update_pose_anchor_filters(current_anchors)
+            current_pose_anchors = extract_pose_anchors(
+                self.filtered_keypoints,
+                self.keypoint_confidence_threshold,
+            )
+            self._init_or_update_pose_anchor_filters(current_pose_anchors)
             self.predicted_pose_anchors = {
-                name: dict(info) for name, info in self.pose_anchors.items()
+                anchor_name: dict(anchor_info)
+                for anchor_name, anchor_info in self.pose_anchors.items()
             }
         else:
-            # unmatched: still update KF with None per original design
+            # Preserve original unmatched-track behavior.
             self.kf.update(bbox)
 
     def predict(self):
@@ -380,6 +491,7 @@ class KalmanBoxTracker:
 
         self.kf.predict()
         self.age += 1
+
         if self.time_since_update > 0:
             self.hit_streak = 0
         self.time_since_update += 1
@@ -390,31 +502,39 @@ class KalmanBoxTracker:
 
     def get_state(self):
         """
-        Current bbox estimate.
+        Return current bbox estimate.
         """
         return convert_x_to_bbox(self.kf.x)
 
-    # ------------------------------------------------------------------
-    def _continuous_velocity(self, name: str, k: int = 3, current_frame: Optional[int] = None, max_gap: int = 1):
-        hist = self.joint_histories.get(name, None)
-        if hist is None or len(hist) < k:
+    def _continuous_velocity(
+        self,
+        name: str,
+        k: int = 3,
+        current_frame: Optional[int] = None,
+        max_gap: int = 1,
+    ):
+        """
+        Estimate a velocity vector from a continuous recent joint history.
+        """
+        history = self.joint_histories.get(name, None)
+        if history is None or len(history) < k:
             return None
 
-        sub = list(hist)[-k:]
-        frames = [f for f, _ in sub]
+        recent_samples = list(history)[-k:]
+        frames = [frame_idx for frame_idx, _ in recent_samples]
 
         if frames != list(range(frames[0], frames[0] + k)):
             return None
         if current_frame is not None and (current_frame - frames[-1] > max_gap):
             return None
 
-        p0 = np.asarray(sub[0][1], dtype=float)
-        p1 = np.asarray(sub[-1][1], dtype=float)
+        start_point = np.asarray(recent_samples[0][1], dtype=float)
+        end_point = np.asarray(recent_samples[-1][1], dtype=float)
         dt = frames[-1] - frames[0]
         if dt == 0:
             return None
-        return (p1 - p0) / dt
-    # ------------------------------------------------------------------
+
+        return (end_point - start_point) / dt
 
     def update_map_position(
         self,
@@ -431,72 +551,81 @@ class KalmanBoxTracker:
         dynamic_smoothing_thresh: float = 5,
     ):
         """
-        Update map position using either bbox-based or keypoint-based (foot/ankle) logic.
-        Functionality preserved; made more robust and deterministic.
+        Update map position using bbox-based or foot/ankle-based logic.
         """
-        # ensure history length matches parameter (backward compatible)
         if self.bbox_top_center_history.maxlen != bbox_top_center_history_len:
-            self.bbox_top_center_history = deque(self.bbox_top_center_history, maxlen=bbox_top_center_history_len)
+            self.bbox_top_center_history = deque(
+                self.bbox_top_center_history,
+                maxlen=bbox_top_center_history_len,
+            )
 
-        new_map_pos = None
+        new_map_position = None
 
         if keypoint_indices is None:
-            # bbox-based fallback
-            self.ankle_based_point = np.array([xywh[0], (xywh[1] + xywh[3] / 2.0)], dtype=float)
-            new_map_pos = pixel_mapper.detection_to_map(xywh)
+            self.ankle_based_point = np.array(
+                [xywh[0], (xywh[1] + xywh[3] / 2.0)],
+                dtype=float,
+            )
+            new_map_position = pixel_mapper.detection_to_map(xywh)
 
         else:
-            # top-center of bbox
-            current_top_center = np.array([xywh[0], xywh[1] - (xywh[3] / 2.0)], dtype=float)
+            current_top_center = np.array(
+                [xywh[0], xywh[1] - (xywh[3] / 2.0)],
+                dtype=float,
+            )
             self.joint_histories["bbox"].append((frame_idx, current_top_center))
             self.bbox_top_center_history.append(current_top_center)
 
             ankle_point = None
 
             if keypoints is not None:
-                # foot-based center (heel/toe indices)
-                foot_indices_left = [20, 22, 24]
-                foot_indices_right = [21, 23, 25]
+                left_foot_indices = [20, 22, 24]
+                right_foot_indices = [21, 23, 25]
 
-                def collect_pts(indices: List[int]):
-                    pts = []
-                    for i in indices:
-                        if i < len(keypoints) and keypoints[i][2] > self.keypoint_confidence_threshold:
-                            pts.append(keypoints[i][:2])
-                    return pts
+                def collect_valid_points(indices: List[int]):
+                    valid_points = []
+                    for idx in indices:
+                        if idx < len(keypoints) and keypoints[idx][2] > self.keypoint_confidence_threshold:
+                            valid_points.append(keypoints[idx][:2])
+                    return valid_points
 
-                left_pts = collect_pts(foot_indices_left)
-                right_pts = collect_pts(foot_indices_right)
+                left_foot_points = collect_valid_points(left_foot_indices)
+                right_foot_points = collect_valid_points(right_foot_indices)
 
-                # hip & knee history updates
-                hip_knee_map = {"lhip": 11, "rhip": 12, "lknee": 13, "rknee": 14}
-                for name, idx in hip_knee_map.items():
-                    if idx < len(keypoints) and keypoints[idx][2] > self.keypoint_confidence_threshold:
-                        self.joint_histories[name].append((frame_idx, keypoints[idx][:2]))
+                hip_and_knee_indices = {
+                    "lhip": 11,
+                    "rhip": 12,
+                    "lknee": 13,
+                    "rknee": 14,
+                }
+                for joint_name, joint_index in hip_and_knee_indices.items():
+                    if joint_index < len(keypoints) and keypoints[joint_index][2] > self.keypoint_confidence_threshold:
+                        self.joint_histories[joint_name].append((frame_idx, keypoints[joint_index][:2]))
 
-                if left_pts or right_pts:
-                    left_mean = np.mean(left_pts, axis=0) if left_pts else None
-                    right_mean = np.mean(right_pts, axis=0) if right_pts else None
+                if left_foot_points or right_foot_points:
+                    left_mean = np.mean(left_foot_points, axis=0) if left_foot_points else None
+                    right_mean = np.mean(right_foot_points, axis=0) if right_foot_points else None
+
                     if left_mean is not None and right_mean is not None:
                         ankle_point = (left_mean + right_mean) / 2.0
                     else:
                         ankle_point = left_mean if left_mean is not None else right_mean
                 else:
-                    # ankle fallback from indices
-                    i1, i2 = keypoint_indices
-                    kp1 = keypoints[i1] if i1 < len(keypoints) else None
-                    kp2 = keypoints[i2] if i2 < len(keypoints) else None
-                    valid = []
+                    keypoint_index_1, keypoint_index_2 = keypoint_indices
+                    kp1 = keypoints[keypoint_index_1] if keypoint_index_1 < len(keypoints) else None
+                    kp2 = keypoints[keypoint_index_2] if keypoint_index_2 < len(keypoints) else None
+
+                    valid_ankle_candidates = []
                     for kp in (kp1, kp2):
                         if kp is not None and kp[2] > self.keypoint_confidence_threshold:
-                            valid.append(kp[:2])
-                    if valid:
-                        ankle_point = np.mean(valid, axis=0)
+                            valid_ankle_candidates.append(kp[:2])
+
+                    if valid_ankle_candidates:
+                        ankle_point = np.mean(valid_ankle_candidates, axis=0)
 
             if ankle_point is not None:
                 ankle_point = np.asarray(ankle_point, dtype=float)
 
-                # re-init KF if keypoints were missing too long
                 if self.missing_keypoints_frames >= reappearance_threshold:
                     if self.keypoint_kalman_filter is None:
                         self.keypoint_kalman_filter = KalmanFilterPoint()
@@ -506,83 +635,96 @@ class KalmanBoxTracker:
                     self.keypoint_kalman_filter = KalmanFilterPoint()
                     self.keypoint_kalman_filter.initiate(ankle_point)
 
-                # standard KF cycle for smoothing: predict -> update, then use filtered state
                 self.keypoint_kalman_filter.predict()
                 self.keypoint_kalman_filter.update(ankle_point)
                 filtered_point = self.keypoint_kalman_filter.state[:2].flatten()
 
-                new_map_pos = pixel_mapper.pixel_to_map(filtered_point)
+                new_map_position = pixel_mapper.pixel_to_map(filtered_point)
                 self.ankle_based_point = filtered_point
                 self.missing_keypoints_frames = 0
-
             else:
-                # keypoints missing
                 self.missing_keypoints_frames += 1
+
                 if self.keypoint_kalman_filter is not None:
-                    # choose velocity from highest-priority continuous joint
-                    priority = ["lhip", "rhip", "lknee", "rknee", "bbox"]
-                    vel_candidate = None
-                    for name in priority:
-                        vel_candidate = self._continuous_velocity(name, k=5, current_frame=frame_idx, max_gap=3)
-                        if vel_candidate is not None:
+                    velocity_priority = ["lhip", "rhip", "lknee", "rknee", "bbox"]
+                    estimated_velocity = None
+
+                    for joint_name in velocity_priority:
+                        estimated_velocity = self._continuous_velocity(
+                            joint_name,
+                            k=5,
+                            current_frame=frame_idx,
+                            max_gap=3,
+                        )
+                        if estimated_velocity is not None:
                             break
 
-                    if vel_candidate is not None:
-                        vx, vy = float(vel_candidate[0]), float(vel_candidate[1])
+                    if estimated_velocity is not None:
+                        vx = float(estimated_velocity[0])
+                        vy = float(estimated_velocity[1])
                         self.keypoint_kalman_filter.state[2:] = np.array([vx, vy], dtype=float).reshape(2, 1)
 
                     predicted_point = self.keypoint_kalman_filter.predict()
                     if predicted_point is not None:
-                        new_map_pos = pixel_mapper.pixel_to_map(predicted_point)
+                        new_map_position = pixel_mapper.pixel_to_map(predicted_point)
                         self.ankle_based_point = np.asarray(predicted_point, dtype=float)
-                # else: remain None
 
             self.prev_top_center = current_top_center
 
         self.previous_bbox = xywh
 
-        # dynamic smoothing
-        if new_map_pos is not None and self.current_map_pos is not None:
-            cur = np.asarray(self.current_map_pos, dtype=float)
-            nxt = np.asarray(new_map_pos, dtype=float)
-            position_delta = np.linalg.norm(cur - nxt)
+        if new_map_position is not None and self.current_map_pos is not None:
+            current_map_position = np.asarray(self.current_map_pos, dtype=float)
+            next_map_position = np.asarray(new_map_position, dtype=float)
+            position_delta = np.linalg.norm(current_map_position - next_map_position)
             dynamic_smoothing = max(
                 dynamic_smoothing_min,
-                min(dynamic_smoothing_max, 1.0 - (position_delta / float(dynamic_smoothing_thresh))),
+                min(
+                    dynamic_smoothing_max,
+                    1.0 - (position_delta / float(dynamic_smoothing_thresh)),
+                ),
             )
         else:
             dynamic_smoothing = smoothing_factor
 
-        # apply smoothing + store positions as numpy arrays
         if self.current_map_pos is not None:
             self.last_map_pos = np.asarray(self.current_map_pos, dtype=float)
-            if new_map_pos is not None:
-                nxt = np.asarray(new_map_pos, dtype=float)
-                self.current_map_pos = dynamic_smoothing * nxt + (1.0 - dynamic_smoothing) * self.last_map_pos
+            if new_map_position is not None:
+                next_map_position = np.asarray(new_map_position, dtype=float)
+                self.current_map_pos = (
+                    dynamic_smoothing * next_map_position
+                    + (1.0 - dynamic_smoothing) * self.last_map_pos
+                )
             else:
                 self.current_map_pos = self.last_map_pos
         else:
-            self.current_map_pos = None if new_map_pos is None else np.asarray(new_map_pos, dtype=float)
+            self.current_map_pos = (
+                None if new_map_position is None else np.asarray(new_map_position, dtype=float)
+            )
 
     def calculate_velocity(self):
-        vel = np.array([None, None], dtype=object)
+        """
+        Compute normalized velocity in map space.
+        """
+        velocity = np.array([None, None], dtype=object)
+
         if self.current_map_pos is not None and self.last_map_pos is not None:
-            v = np.asarray(self.current_map_pos, dtype=float) - np.asarray(self.last_map_pos, dtype=float)
-            v = normalize(v.astype(float))
-            vel = v
-        return vel
+            map_delta = np.asarray(self.current_map_pos, dtype=float) - np.asarray(self.last_map_pos, dtype=float)
+            map_delta = normalize(map_delta.astype(float))
+            velocity = map_delta
+
+        return velocity
 
 
-# ==============================
+# ---------------------------------------------------------------------
 # OC-SORT tracker
-# ==============================
+# ---------------------------------------------------------------------
 class OCSort(BaseTracker):
     """
-    OC-SORT Tracker for Video Analysis
+    OC-SORT tracker for video analysis.
     """
 
-    # Special ID reserved for a single pre-existing enemy already inside the room
-    ENEMY_FINAL_ID = 99
+    INROOM_FINAL_ID_START = 99
 
     def __init__(
         self,
@@ -623,6 +765,8 @@ class OCSort(BaseTracker):
         self.asso_func = get_asso_func(asso_func)
         self.inertia = inertia
         self.use_byte = use_byte
+        self.max_obs = max_obs
+
         self.pose_association = self._build_pose_association_config(
             asso_threshold=asso_threshold,
             det_thresh=det_thresh,
@@ -632,9 +776,12 @@ class OCSort(BaseTracker):
             detection_keypoint_mean_conf_threshold=detection_keypoint_mean_conf_threshold,
             legacy_keypoint_mean_conf_threshold=keypoint_mean_conf_threshold,
         )
-        self.entry_conf_threshold = float(entry_conf_threshold) if entry_conf_threshold is not None else float(det_thresh)
 
-        self.max_obs = max_obs
+        self.entry_conf_threshold = (
+            float(entry_conf_threshold)
+            if entry_conf_threshold is not None
+            else float(det_thresh)
+        )
 
         KalmanBoxTracker.count = 0
 
@@ -642,6 +789,12 @@ class OCSort(BaseTracker):
         self.limit_entry = limit_entry
         self.entry_polys = entry_polys
         self.next_final_id = 1
+        self.next_inroom_final_id = self.INROOM_FINAL_ID_START
+
+        self.entry_buffer_scale = 1.15
+        self.inroom_confirmation_frames = max(3, int(self.min_hits))
+        self.inroom_confirmation_hits = max(3, int(self.min_hits))
+        self.entry_buffer_polys = []
 
         if self.limit_entry:
             if not self.entry_polys:
@@ -649,11 +802,16 @@ class OCSort(BaseTracker):
             if self.pixel_mapper is None:
                 raise ValueError("pixel_mapper cannot be None if limit_entry is True")
 
+        if self.entry_polys:
+            self.entry_buffer_polys = [
+                scale(poly, xfact=self.entry_buffer_scale, yfact=self.entry_buffer_scale, origin="center")
+                for poly in self.entry_polys
+            ]
+
         self.entry_window_time = entry_window_time
         self.entry_window_counter = 0
         self.entry_window_active = False
 
-        # boundary padding
         self.boundary = boundary
         if self.boundary is not None:
             self.boundary_padded = (
@@ -664,11 +822,105 @@ class OCSort(BaseTracker):
         else:
             self.boundary_padded = None
 
-        # enemy state
-        self.enemy_active = False
-        self.enemy_done = False
-        self.enemy_was_in_entry = False
         self.track_enemy = track_enemy
+        self.inroom_was_in_entry: Dict[int, bool] = {}
+
+    def _point_in_entry_core(self, map_point: Optional[geo.Point]) -> bool:
+        return bool(
+            map_point is not None
+            and self.entry_polys
+            and any(poly.contains(map_point) for poly in self.entry_polys)
+        )
+
+    def _point_in_entry_buffer(self, map_point: Optional[geo.Point]) -> bool:
+        return bool(
+            map_point is not None
+            and self.entry_buffer_polys
+            and any(poly.contains(map_point) for poly in self.entry_buffer_polys)
+        )
+
+    def _point_in_interior_safe_zone(self, map_point: Optional[geo.Point]) -> bool:
+        if map_point is None or self.boundary is None:
+            return False
+        if not self.boundary.contains(map_point):
+            return False
+        if self._point_in_entry_buffer(map_point):
+            return False
+        return True
+
+    def _classify_birth_location(self, map_point: Optional[geo.Point]) -> str:
+        if map_point is None:
+            return "unknown"
+        if self._point_in_entry_core(map_point):
+            return "entry"
+        if self._point_in_entry_buffer(map_point):
+            return "entry_buffer"
+        if self._point_in_interior_safe_zone(map_point):
+            return "interior"
+        if self.boundary_padded is not None and self.boundary_padded.contains(map_point):
+            return "boundary_band"
+        return "outside"
+
+    def _update_track_role_evidence(self, track: KalmanBoxTracker):
+        map_point = None
+        if track.current_map_pos is not None:
+            current_xy = np.asarray(track.current_map_pos, dtype=float).reshape(-1)
+            if current_xy.size >= 2 and np.isfinite(current_xy[:2]).all():
+                map_point = geo.Point(float(current_xy[0]), float(current_xy[1]))
+
+        track.frames_since_birth += 1
+
+        if self._point_in_entry_core(map_point):
+            track.frames_in_entry += 1
+        if self._point_in_entry_buffer(map_point):
+            track.frames_in_entry_buffer += 1
+        if self._point_in_interior_safe_zone(map_point):
+            track.frames_in_interior += 1
+            track.consecutive_interior_frames += 1
+        else:
+            track.consecutive_interior_frames = 0
+
+    def _maybe_assign_track_role(self, track: KalmanBoxTracker):
+        if track.role_locked:
+            return
+
+        if track.frames_in_entry > 0:
+            track.identity_role = "entry"
+            track.role_locked = True
+            if track.final_id is None:
+                track.final_id = self.next_final_id
+                self.next_final_id += 1
+            return
+
+        if (
+            self.track_enemy
+            and track.frames_in_entry == 0
+            and track.frames_in_entry_buffer == 0
+            and track.frames_in_interior >= self.inroom_confirmation_frames
+            and track.consecutive_interior_frames >= self.inroom_confirmation_frames
+            and track.hit_streak >= self.inroom_confirmation_hits
+        ):
+            track.identity_role = "inroom"
+            track.role_locked = True
+            if track.final_id is None:
+                track.final_id = self._allocate_inroom_final_id()
+                self.inroom_was_in_entry[track.final_id] = False
+            return
+
+        if track.birth_location == "entry":
+            track.identity_role = "entry_candidate"
+        elif track.birth_location == "interior":
+            track.identity_role = "inroom_candidate"
+        else:
+            track.identity_role = "unknown"
+
+    def _is_inroom_final_id(self, final_id: Optional[int]) -> bool:
+        return final_id is not None and int(final_id) >= self.INROOM_FINAL_ID_START
+
+    def _allocate_inroom_final_id(self) -> int:
+        final_id = self.next_inroom_final_id
+        self.next_inroom_final_id += 1
+        return final_id
 
     @staticmethod
     def _build_pose_association_config(
@@ -686,9 +938,11 @@ class OCSort(BaseTracker):
         if mean_conf_threshold is None:
             mean_conf_threshold = det_thresh
 
+        pose_weight = float(np.clip(pose_weight, 0.0, 1.0))
+
         return PoseAssociationConfig(
             enabled=bool(pose_hybrid_enabled),
-            weight=float(pose_weight),
+            weight=pose_weight,
             min_affinity=float(pose_min_affinity),
             detection_mean_conf_threshold=float(mean_conf_threshold),
             primary=PoseAssociationGateConfig(
@@ -710,38 +964,51 @@ class OCSort(BaseTracker):
         keypoints: Optional[np.ndarray],
         detection_keypoint_mean_conf_threshold: float,
     ):
-        confs = dets[:, 4]
+        """
+        Split detections into primary and secondary groups based on detection
+        confidence and mean keypoint confidence.
+        """
+        detection_confidences = dets[:, 4]
 
         if keypoints is not None:
-            kp_mean_confs = np.asarray(
-                [float(np.mean(kp[:, 2])) if kp is not None and len(kp) > 0 else 0.0 for kp in keypoints],
+            keypoint_mean_confidences = np.asarray(
+                [
+                    float(np.mean(kp[:, 2])) if kp is not None and len(kp) > 0 else 0.0
+                    for kp in keypoints
+                ],
                 dtype=float,
             )
         else:
-            kp_mean_confs = None
+            keypoint_mean_confidences = None
 
-        inds_low = confs > 0.1
-        inds_high = confs < det_thresh
-        inds_second = np.logical_and(inds_low, inds_high)
+        low_confidence_mask = detection_confidences > 0.1
+        below_primary_threshold_mask = detection_confidences < det_thresh
+        secondary_detection_mask = np.logical_and(low_confidence_mask, below_primary_threshold_mask)
 
-        if kp_mean_confs is not None:
-            inds_second = np.logical_and(inds_second, kp_mean_confs > detection_keypoint_mean_conf_threshold)
+        if keypoint_mean_confidences is not None:
+            secondary_detection_mask = np.logical_and(
+                secondary_detection_mask,
+                keypoint_mean_confidences > detection_keypoint_mean_conf_threshold,
+            )
 
-        remain_inds = confs > det_thresh
-        if kp_mean_confs is not None:
-            remain_inds = np.logical_and(remain_inds, kp_mean_confs > detection_keypoint_mean_conf_threshold)
+        primary_detection_mask = detection_confidences > det_thresh
+        if keypoint_mean_confidences is not None:
+            primary_detection_mask = np.logical_and(
+                primary_detection_mask,
+                keypoint_mean_confidences > detection_keypoint_mean_conf_threshold,
+            )
 
-        dets_first = dets[remain_inds]
-        dets_second = dets[inds_second]
+        primary_detections = dets[primary_detection_mask]
+        secondary_detections = dets[secondary_detection_mask]
 
         if keypoints is not None:
-            keypoints_first = keypoints[remain_inds]
-            keypoints_second = keypoints[inds_second]
+            primary_keypoints = keypoints[primary_detection_mask]
+            secondary_keypoints = keypoints[secondary_detection_mask]
         else:
-            keypoints_first = None
-            keypoints_second = None
+            primary_keypoints = None
+            secondary_keypoints = None
 
-        return dets_first, dets_second, keypoints_first, keypoints_second
+        return primary_detections, secondary_detections, primary_keypoints, secondary_keypoints
 
     def _compute_pose_metrics(
         self,
@@ -750,20 +1017,24 @@ class OCSort(BaseTracker):
         keypoints: Optional[np.ndarray],
         keypoint_confidence_threshold: float,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Compute pose affinity and reliability matrices for a detection set.
+        """
         if keypoints is None or len(tracks) == 0 or len(detections) == 0:
             return None, None
 
         pose_affinity = np.zeros((len(detections), len(tracks)), dtype=float)
         pose_reliability = np.zeros((len(detections), len(tracks)), dtype=float)
-        for det_idx in range(len(detections)):
-            sims, reliabilities = compute_detection_track_pose_metrics(
-                keypoints[det_idx],
+
+        for detection_index in range(len(detections)):
+            similarities, reliabilities = compute_detection_track_pose_metrics(
+                keypoints[detection_index],
                 tracks,
-                detections[det_idx, 0:4],
+                detections[detection_index, 0:4],
                 keypoint_confidence_threshold,
             )
-            pose_affinity[det_idx, :] = sims
-            pose_reliability[det_idx, :] = reliabilities
+            pose_affinity[detection_index, :] = similarities
+            pose_reliability[detection_index, :] = reliabilities
 
         pose_affinity[pose_affinity < self.pose_association.min_affinity] = 0.0
         pose_reliability[pose_affinity <= 0.0] = 0.0
@@ -779,6 +1050,432 @@ class OCSort(BaseTracker):
         track.keypoint_confidence_threshold = float(keypoint_confidence_threshold)
         track.update(detection[:5], detection[5], detection[6], keypoints=keypoints)
 
+    def _predict_active_tracks(self):
+        """
+        Predict all active tracks forward one step and remove invalid predictions.
+
+        Returns:
+          - predicted tracker boxes array of shape [N, 5]
+        """
+        predicted_track_boxes = np.zeros((len(self.active_tracks), 5), dtype=float)
+        invalid_track_indices = []
+
+        for track_index in range(len(predicted_track_boxes)):
+            predicted_box = self.active_tracks[track_index].predict()[0]
+            predicted_track_boxes[track_index, :] = [
+                predicted_box[0],
+                predicted_box[1],
+                predicted_box[2],
+                predicted_box[3],
+                0.0,
+            ]
+            if np.any(np.isnan(predicted_box)):
+                invalid_track_indices.append(track_index)
+
+        predicted_track_boxes = np.ma.compress_rows(np.ma.masked_invalid(predicted_track_boxes))
+
+        for track_index in reversed(invalid_track_indices):
+            self.active_tracks.pop(track_index)
+
+        return predicted_track_boxes
+
+    def _run_primary_association(
+        self,
+        detections: np.ndarray,
+        predicted_track_boxes: np.ndarray,
+        primary_keypoints: Optional[np.ndarray],
+        keypoint_confidence_threshold: float,
+        image_width: int,
+        image_height: int,
+    ):
+        pose_affinity, pose_reliability = self._compute_pose_metrics(
+            detections,
+            self.active_tracks,
+            primary_keypoints,
+            keypoint_confidence_threshold,
+        )
+
+        track_velocities = np.array(
+            [
+                track.velocity if track.velocity is not None else np.array((0.0, 0.0))
+                for track in self.active_tracks
+            ],
+            dtype=float,
+        )
+        previous_boxes = np.array([track.last_observation for track in self.active_tracks], dtype=float)
+        k_step_observations = np.array(
+            [
+                k_previous_obs(track.observations, track.age, self.delta_t)
+                for track in self.active_tracks
+            ],
+            dtype=float,
+        )
+
+        matches, unmatched_detections, unmatched_tracks = associate(
+            detections[:, 0:5],
+            predicted_track_boxes,
+            self.asso_func,
+            self.asso_threshold,
+            track_velocities,
+            k_step_observations,
+            self.inertia,
+            image_width,
+            image_height,
+            pose_affinity=pose_affinity,
+            pose_reliability=pose_reliability,
+            pose_weight=self.pose_association.weight if self.pose_association.enabled else 0.0,
+            hybrid_threshold=self.pose_association.primary.hybrid_threshold,
+            box_threshold_floor=self.pose_association.primary.box_evidence_floor,
+            pose_threshold_floor=self.pose_association.primary.pose_evidence_floor,
+        )
+
+        return matches, unmatched_detections, unmatched_tracks, previous_boxes
+
+    def _apply_primary_matches(
+        self,
+        matches: np.ndarray,
+        detections: np.ndarray,
+        primary_keypoints: Optional[np.ndarray],
+        keypoint_confidence_threshold: float,
+    ):
+        for match_pair in matches:
+            detection_index, track_index = match_pair[0], match_pair[1]
+            matched_keypoints = primary_keypoints[detection_index] if primary_keypoints is not None else None
+            self._update_track_with_detection(
+                self.active_tracks[track_index],
+                detections[detection_index],
+                matched_keypoints,
+                keypoint_confidence_threshold,
+            )
+
+    def _run_byte_second_association(
+        self,
+        secondary_detections: np.ndarray,
+        unmatched_track_indices: np.ndarray,
+        predicted_track_boxes: np.ndarray,
+        secondary_keypoints: Optional[np.ndarray],
+        keypoint_confidence_threshold: float,
+    ):
+        if not self.use_byte or len(secondary_detections) == 0 or unmatched_track_indices.shape[0] == 0:
+            return unmatched_track_indices
+
+        unmatched_predicted_boxes = predicted_track_boxes[unmatched_track_indices]
+        iou_similarity = np.array(self.asso_func(secondary_detections, unmatched_predicted_boxes))
+
+        if iou_similarity.max() <= self.asso_threshold:
+            return unmatched_track_indices
+
+        matched_indices = linear_assignment(-iou_similarity)
+        matched_track_indices_to_remove = []
+
+        for match_pair in matched_indices:
+            secondary_detection_index = match_pair[0]
+            unmatched_track_subindex = match_pair[1]
+            track_index = unmatched_track_indices[unmatched_track_subindex]
+
+            if iou_similarity[secondary_detection_index, unmatched_track_subindex] < self.asso_threshold:
+                continue
+
+            matched_keypoints = (
+                secondary_keypoints[secondary_detection_index]
+                if secondary_keypoints is not None
+                else None
+            )
+
+            self._update_track_with_detection(
+                self.active_tracks[track_index],
+                secondary_detections[secondary_detection_index],
+                matched_keypoints,
+                keypoint_confidence_threshold,
+            )
+            matched_track_indices_to_remove.append(track_index)
+
+        return np.setdiff1d(unmatched_track_indices, np.array(matched_track_indices_to_remove))
+
+    def _run_rematch_association(
+        self,
+        unmatched_detection_indices: np.ndarray,
+        unmatched_track_indices: np.ndarray,
+        detections: np.ndarray,
+        previous_boxes: np.ndarray,
+        primary_keypoints: Optional[np.ndarray],
+        keypoint_confidence_threshold: float,
+        image_width: int,
+        image_height: int,
+    ):
+        if unmatched_detection_indices.shape[0] == 0 or unmatched_track_indices.shape[0] == 0:
+            return unmatched_detection_indices, unmatched_track_indices
+
+        unmatched_detections = detections[unmatched_detection_indices]
+        unmatched_track_boxes = previous_boxes[unmatched_track_indices]
+        rematch_tracks = [self.active_tracks[track_index] for track_index in unmatched_track_indices]
+
+        rematch_pose_affinity, rematch_pose_reliability = self._compute_pose_metrics(
+            unmatched_detections,
+            rematch_tracks,
+            primary_keypoints[unmatched_detection_indices] if primary_keypoints is not None else None,
+            keypoint_confidence_threshold,
+        )
+
+        rematch_matches, _, _ = associate(
+            unmatched_detections[:, 0:5],
+            unmatched_track_boxes,
+            self.asso_func,
+            self.asso_threshold,
+            np.zeros((len(unmatched_track_indices), 2), dtype=float),
+            unmatched_track_boxes,
+            0.0,
+            image_width,
+            image_height,
+            pose_affinity=rematch_pose_affinity,
+            pose_reliability=rematch_pose_reliability,
+            pose_weight=self.pose_association.weight if self.pose_association.enabled else 0.0,
+            hybrid_threshold=self.pose_association.rematch.hybrid_threshold,
+            box_threshold_floor=self.pose_association.rematch.box_evidence_floor,
+            pose_threshold_floor=self.pose_association.rematch.pose_evidence_floor,
+        )
+
+        if rematch_matches.size == 0:
+            return unmatched_detection_indices, unmatched_track_indices
+
+        matched_detection_indices_to_remove = []
+        matched_track_indices_to_remove = []
+
+        for match_pair in rematch_matches:
+            detection_index = unmatched_detection_indices[match_pair[0]]
+            track_index = unmatched_track_indices[match_pair[1]]
+            matched_keypoints = primary_keypoints[detection_index] if primary_keypoints is not None else None
+
+            self._update_track_with_detection(
+                self.active_tracks[track_index],
+                detections[detection_index],
+                matched_keypoints,
+                keypoint_confidence_threshold,
+            )
+            matched_detection_indices_to_remove.append(detection_index)
+            matched_track_indices_to_remove.append(track_index)
+
+        unmatched_detection_indices = np.setdiff1d(
+            unmatched_detection_indices,
+            np.array(matched_detection_indices_to_remove),
+        )
+        unmatched_track_indices = np.setdiff1d(
+            unmatched_track_indices,
+            np.array(matched_track_indices_to_remove),
+        )
+
+        return unmatched_detection_indices, unmatched_track_indices
+
+    def _mark_unmatched_tracks(self, unmatched_track_indices: np.ndarray):
+        for track_index in unmatched_track_indices:
+            self.active_tracks[track_index].update(None, None, None)
+
+    def _make_map_point_from_detection(self, detection_xyxy: np.ndarray) -> Optional[geo.Point]:
+        if self.pixel_mapper is None:
+            return None
+
+        map_xy = self.pixel_mapper.detection_to_map(xyxy2xywh(detection_xyxy))
+        map_xy = np.asarray(map_xy, dtype=float).reshape(-1)
+
+        if map_xy.size >= 2 and np.isfinite(map_xy[:2]).all():
+            return geo.Point(float(map_xy[0]), float(map_xy[1]))
+        return None
+
+    def _should_create_new_track(
+        self,
+        birth_location: str,
+        detection_confidence: float,
+    ) -> bool:
+        create_track = False
+
+        if birth_location == "interior" and self.track_enemy:
+            create_track = True
+        elif self.limit_entry:
+            if self.entry_window_active:
+                if (
+                    self.entry_window_time is not None
+                    and self.entry_window_counter >= self.entry_window_time
+                ):
+                    return False
+
+            if birth_location in {"entry", "entry_buffer"} and detection_confidence >= self.entry_conf_threshold:
+                create_track = True
+
+            if create_track and birth_location == "entry" and not self.entry_window_active:
+                self.entry_window_active = True
+                self.entry_window_counter = 0
+        else:
+            create_track = True
+
+        return create_track
+
+    def _create_new_tracks(
+        self,
+        unmatched_detection_indices: np.ndarray,
+        detections: np.ndarray,
+        primary_keypoints: Optional[np.ndarray],
+        keypoint_confidence_threshold: float,
+    ):
+        if unmatched_detection_indices.shape[0] == 0:
+            return
+
+        for detection_index in unmatched_detection_indices:
+            detection_keypoints = (
+                primary_keypoints[detection_index]
+                if primary_keypoints is not None
+                else None
+            )
+            detection_confidence = float(detections[detection_index, 4])
+
+            map_point = self._make_map_point_from_detection(detections[detection_index, 0:4])
+            birth_location = self._classify_birth_location(map_point)
+
+            if not self._should_create_new_track(birth_location, detection_confidence):
+                continue
+
+            new_track = KalmanBoxTracker(
+                detections[detection_index, :5],
+                detections[detection_index, 5],
+                detections[detection_index, 6],
+                delta_t=self.delta_t,
+                max_obs=self.max_obs,
+                keypoints=detection_keypoints,
+                keypoint_confidence_threshold=keypoint_confidence_threshold,
+            )
+            new_track.birth_frame = self.frame_count
+            new_track.birth_location = birth_location
+
+            if birth_location == "entry":
+                new_track.identity_role = "entry_candidate"
+            elif birth_location == "interior":
+                new_track.identity_role = "inroom_candidate"
+            else:
+                new_track.identity_role = "unknown"
+
+            self.active_tracks.append(new_track)
+
+    def _build_track_output(
+        self,
+        track: KalmanBoxTracker,
+        tlwh: np.ndarray,
+        map_velocity,
+    ) -> Dict[str, Any]:
+        track_output = {
+            "top_left_x": tlwh[0],
+            "top_left_y": tlwh[1],
+            "width": tlwh[2],
+            "height": tlwh[3],
+            "track_id": track.final_id,
+            "track_id_raw": track.id + 1,
+            "confidence": track.conf,
+            "class": track.cls,
+            "detection_index": track.det_ind,
+            "keypoints": track.filtered_keypoints,
+            "ankle_based_point": track.ankle_based_point,
+            "identity_role": track.identity_role,
+            "birth_location": track.birth_location,
+            "is_inroom": track.identity_role == "inroom",
+            "is_entry": track.identity_role == "entry",
+        }
+
+        if self.pixel_mapper is not None:
+            track_output["current_map_pos"] = track.current_map_pos
+            track_output["map_velocity"] = map_velocity
+        else:
+            track_output["current_map_pos"] = None
+            track_output["map_velocity"] = [None, None]
+
+        return track_output
+
+    def _update_tracks_and_collect_outputs(
+        self,
+        keypoint_indices: Optional[Tuple[int, int]],
+    ) -> List[Dict[str, Any]]:
+        outputs: List[Dict[str, Any]] = []
+
+        track_index = len(self.active_tracks)
+        for track in reversed(self.active_tracks):
+            if track.last_observation.sum() < 0:
+                tlwh = xyxy2tlwh(track.get_state()[0])
+            else:
+                tlwh = xyxy2tlwh(track.last_observation)
+
+            if self.pixel_mapper is not None:
+                track.update_map_position(
+                    self.pixel_mapper,
+                    xyxy2xywh(track.get_state()[0]),
+                    self.frame_count,
+                    keypoints=track.filtered_keypoints,
+                    keypoint_indices=keypoint_indices,
+                    smoothing_factor=0.7,
+                )
+                map_velocity = track.calculate_velocity()
+            else:
+                map_velocity = [None, None]
+
+            if track.time_since_update < 1:
+                self._update_track_role_evidence(track)
+                self._maybe_assign_track_role(track)
+
+            if (
+                track.time_since_update < 1
+                and track.hit_streak >= self.min_hits
+                and track.final_id is not None
+            ):
+                outputs.append(self._build_track_output(track, tlwh, map_velocity))
+
+            track_index -= 1
+            if track.time_since_update > self.max_age:
+                self.active_tracks.pop(track_index)
+
+        return outputs
+
+    def _run_inroom_exit_logic(self):
+        if not self.track_enemy or self.boundary is None:
+            return
+
+        for track in list(self.active_tracks):
+            final_id = getattr(track, "final_id", None)
+            if not self._is_inroom_final_id(final_id):
+                continue
+
+            if self.pixel_mapper is not None and track.current_map_pos is None:
+                xywh = xyxy2xywh(track.get_state()[0])
+                fallback_map = self.pixel_mapper.detection_to_map(xywh)
+                fallback_map = np.asarray(fallback_map, dtype=float).reshape(-1)
+                if fallback_map.size >= 2 and np.isfinite(fallback_map[:2]).all():
+                    track.current_map_pos = fallback_map[:2]
+
+            if track.current_map_pos is None:
+                continue
+
+            current_xy = np.asarray(track.current_map_pos, dtype=float).reshape(-1)
+            if current_xy.size >= 2 and np.isfinite(current_xy[:2]).all():
+                map_point = geo.Point(float(current_xy[0]), float(current_xy[1]))
+            else:
+                map_point = None
+
+            if map_point is None:
+                continue
+
+            if self.entry_polys and not self.inroom_was_in_entry.get(final_id, False):
+                self.inroom_was_in_entry[final_id] = any(
+                    poly.contains(map_point) for poly in self.entry_polys
+                )
+
+            if self.inroom_was_in_entry.get(final_id, False) and (not self.boundary.contains(map_point)):
+                self.active_tracks.remove(track)
+                self.inroom_was_in_entry.pop(final_id, None)
+
+        active_inroom_ids = {
+            int(getattr(track, "final_id", -1))
+            for track in self.active_tracks
+            if self._is_inroom_final_id(getattr(track, "final_id", None))
+        }
+        for final_id in list(self.inroom_was_in_entry.keys()):
+            if final_id not in active_inroom_ids:
+                self.inroom_was_in_entry.pop(final_id, None)
+
     @PerClassDecorator
     def update(
         self,
@@ -789,339 +1486,81 @@ class OCSort(BaseTracker):
         keypoint_confidence_threshold: float = 0.5,
         keypoint_indices: Optional[Tuple[int, int]] = None,
     ) -> np.ndarray:
-        assert isinstance(dets, np.ndarray), f"Unsupported 'dets' input format '{type(dets)}', valid format is np.ndarray"
-        assert len(dets.shape) == 2, "Unsupported 'dets' dimensions, valid number of dimensions is two"
-        assert dets.shape[1] == 6, "Unsupported 'dets' 2nd dimension length, valid length is 6"
+        assert isinstance(dets, np.ndarray), (
+            f"Unsupported 'dets' input format '{type(dets)}', valid format is np.ndarray"
+        )
+        assert len(dets.shape) == 2, (
+            "Unsupported 'dets' dimensions, valid number of dimensions is two"
+        )
+        assert dets.shape[1] == 6, (
+            "Unsupported 'dets' 2nd dimension length, valid length is 6"
+        )
 
         self.frame_count += 1
 
         if self.limit_entry and self.entry_window_active:
             self.entry_window_counter += 1
 
-        h, w = img.shape[0:2]
+        image_height, image_width = img.shape[0:2]
 
-        # append detection indices
         dets = np.hstack([dets, np.arange(len(dets)).reshape(-1, 1)])
 
-        dets, dets_second, keypoints_first, keypoints_second = self._split_detections_by_confidence(
-            dets,
-            self.det_thresh,
-            keypoints,
-            self.pose_association.detection_mean_conf_threshold,
+        primary_detections, secondary_detections, primary_keypoints, secondary_keypoints = (
+            self._split_detections_by_confidence(
+                dets,
+                self.det_thresh,
+                keypoints,
+                self.pose_association.detection_mean_conf_threshold,
+            )
         )
 
+        predicted_track_boxes = self._predict_active_tracks()
 
-        # get predicted locations from existing trackers
-        trks = np.zeros((len(self.active_tracks), 5), dtype=float)
-        to_del = []
-        outputs: List[Dict[str, Any]] = []
+        matches, unmatched_detections, unmatched_tracks, previous_boxes = self._run_primary_association(
+            primary_detections,
+            predicted_track_boxes,
+            primary_keypoints,
+            keypoint_confidence_threshold,
+            image_width,
+            image_height,
+        )
 
-        for t in range(len(trks)):
-            pos = self.active_tracks[t].predict()[0]
-            trks[t, :] = [pos[0], pos[1], pos[2], pos[3], 0.0]
-            if np.any(np.isnan(pos)):
-                to_del.append(t)
-
-        trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
-        for t in reversed(to_del):
-            self.active_tracks.pop(t)
-
-        pose_affinity, pose_reliability = self._compute_pose_metrics(
-            dets,
-            self.active_tracks,
-            keypoints_first,
+        self._apply_primary_matches(
+            matches,
+            primary_detections,
+            primary_keypoints,
             keypoint_confidence_threshold,
         )
 
-        velocities = np.array(
-            [trk.velocity if trk.velocity is not None else np.array((0.0, 0.0)) for trk in self.active_tracks],
-            dtype=float,
-        )
-        last_boxes = np.array([trk.last_observation for trk in self.active_tracks], dtype=float)
-        k_observations = np.array([k_previous_obs(trk.observations, trk.age, self.delta_t) for trk in self.active_tracks], dtype=float)
-
-        # ---------------- First association ----------------
-        matched, unmatched_dets, unmatched_trks = associate(
-            dets[:, 0:5],
-            trks,
-            self.asso_func,
-            self.asso_threshold,
-            velocities,
-            k_observations,
-            self.inertia,
-            w,
-            h,
-            pose_affinity=pose_affinity,
-            pose_reliability=pose_reliability,
-            pose_weight=self.pose_association.weight if self.pose_association.enabled else 0.0,
-            hybrid_threshold=self.pose_association.primary.hybrid_threshold,
-            box_threshold_floor=self.pose_association.primary.box_evidence_floor,
-            pose_threshold_floor=self.pose_association.primary.pose_evidence_floor,
+        unmatched_tracks = self._run_byte_second_association(
+            secondary_detections,
+            unmatched_tracks,
+            predicted_track_boxes,
+            secondary_keypoints,
+            keypoint_confidence_threshold,
         )
 
-        for m in matched:
-            det_idx, trk_idx = m[0], m[1]
-            kp = keypoints_first[det_idx] if keypoints_first is not None else None
-            self._update_track_with_detection(
-                self.active_tracks[trk_idx],
-                dets[det_idx],
-                kp,
-                keypoint_confidence_threshold,
-            )
+        unmatched_detections, unmatched_tracks = self._run_rematch_association(
+            unmatched_detections,
+            unmatched_tracks,
+            primary_detections,
+            previous_boxes,
+            primary_keypoints,
+            keypoint_confidence_threshold,
+            image_width,
+            image_height,
+        )
 
-        # ---------------- Second association (BYTE) ----------------
-        if self.use_byte and len(dets_second) > 0 and unmatched_trks.shape[0] > 0:
-            u_trks = trks[unmatched_trks]
-            iou_left = np.array(self.asso_func(dets_second, u_trks))
-            if iou_left.max() > self.asso_threshold:
-                matched_indices = linear_assignment(-iou_left)
-                to_remove_trk_indices = []
-                for m in matched_indices:
-                    det_ind, trk_ind = m[0], unmatched_trks[m[1]]
-                    if iou_left[m[0], m[1]] < self.asso_threshold:
-                        continue
-                    kp = keypoints_second[m[0]] if keypoints_second is not None else None
-                    self._update_track_with_detection(
-                        self.active_tracks[trk_ind],
-                        dets_second[det_ind],
-                        kp,
-                        keypoint_confidence_threshold,
-                    )
-                    to_remove_trk_indices.append(trk_ind)
-                unmatched_trks = np.setdiff1d(unmatched_trks, np.array(to_remove_trk_indices))
+        self._mark_unmatched_tracks(unmatched_tracks)
 
-        # ---------------- Rematch unmatched dets/trks ----------------
-        if unmatched_dets.shape[0] > 0 and unmatched_trks.shape[0] > 0:
-            left_dets = dets[unmatched_dets]
-            left_trks = last_boxes[unmatched_trks]
+        self._create_new_tracks(
+            unmatched_detections,
+            primary_detections,
+            primary_keypoints,
+            keypoint_confidence_threshold,
+        )
 
-            rematch_tracks = [self.active_tracks[idx] for idx in unmatched_trks]
-            rematch_pose, rematch_pose_reliability = self._compute_pose_metrics(
-                left_dets,
-                rematch_tracks,
-                keypoints_first[unmatched_dets] if keypoints_first is not None else None,
-                keypoint_confidence_threshold,
-            )
+        outputs = self._update_tracks_and_collect_outputs(keypoint_indices)
+        self._run_inroom_exit_logic()
 
-            rematch_matched, _, _ = associate(
-                left_dets[:, 0:5],
-                left_trks,
-                self.asso_func,
-                self.asso_threshold,
-                np.zeros((len(unmatched_trks), 2), dtype=float),
-                left_trks,
-                0.0,
-                w,
-                h,
-                pose_affinity=rematch_pose,
-                pose_reliability=rematch_pose_reliability,
-                pose_weight=self.pose_association.weight if self.pose_association.enabled else 0.0,
-                hybrid_threshold=self.pose_association.rematch.hybrid_threshold,
-                box_threshold_floor=self.pose_association.rematch.box_evidence_floor,
-                pose_threshold_floor=self.pose_association.rematch.pose_evidence_floor,
-            )
-
-            if rematch_matched.size > 0:
-                to_remove_det_indices = []
-                to_remove_trk_indices = []
-                for m in rematch_matched:
-                    det_ind, trk_ind = unmatched_dets[m[0]], unmatched_trks[m[1]]
-                    kp = keypoints_first[det_ind] if keypoints_first is not None else None
-                    self._update_track_with_detection(
-                        self.active_tracks[trk_ind],
-                        dets[det_ind],
-                        kp,
-                        keypoint_confidence_threshold,
-                    )
-                    to_remove_det_indices.append(det_ind)
-                    to_remove_trk_indices.append(trk_ind)
-                unmatched_dets = np.setdiff1d(unmatched_dets, np.array(to_remove_det_indices))
-                unmatched_trks = np.setdiff1d(unmatched_trks, np.array(to_remove_trk_indices))
-
-        # mark unmatched tracks
-        for m in unmatched_trks:
-            self.active_tracks[m].update(None, None, None)
-
-        # ---------------- Create new tracks for unmatched detections ----------------
-        if unmatched_dets.shape[0] > 0:
-            for i in unmatched_dets:
-                kp_i = keypoints_first[i] if keypoints_first is not None else None
-                det_conf = float(dets[i, 4])
-
-                # Convert detection centre to map point (if mapper available)
-                map_point = None
-                if self.pixel_mapper is not None:
-                    map_xy = self.pixel_mapper.detection_to_map(xyxy2xywh(dets[i, 0:4]))
-                    map_xy = np.asarray(map_xy, dtype=float).reshape(-1)
-                    if map_xy.size >= 2 and np.isfinite(map_xy[:2]).all():
-                        map_point = geo.Point(float(map_xy[0]), float(map_xy[1]))
-
-                # If the point is inside an entry polygon (door/entry zone), do NOT classify it as the pre-existing enemy.
-                # This prevents door entrants from being incorrectly assigned ENEMY_FINAL_ID.
-                # Also, once we accept an entrant through the entry logic below, we will mark
-                # `enemy_done = True` so the remaining tracks are treated as participants.
-                in_entry = False
-                if (map_point is not None) and self.entry_polys:
-                    in_entry = any(poly.contains(map_point) for poly in self.entry_polys)
-
-                # enemy handling
-                if (
-                    self.track_enemy
-                    and (not self.enemy_active)
-                    and (not self.enemy_done)
-                    and (map_point is not None)
-                    and (self.boundary_padded is not None)
-                    and self.boundary_padded.contains(map_point)
-                    and (not in_entry)
-                ):
-                    trk = KalmanBoxTracker(
-                        dets[i, :5],
-                        dets[i, 5],
-                        dets[i, 6],
-                        delta_t=self.delta_t,
-                        max_obs=self.max_obs,
-                        keypoints=kp_i,
-                        keypoint_confidence_threshold=keypoint_confidence_threshold,
-                    )
-                    trk.final_id = self.ENEMY_FINAL_ID
-                    self.active_tracks.append(trk)
-                    self.enemy_active = True
-                    continue
-
-                create = False
-                if self.limit_entry:
-                    if self.entry_window_active:
-                        if self.entry_window_time is not None and self.entry_window_counter >= self.entry_window_time:
-                            continue
-
-                    if map_point is None and self.pixel_mapper is not None:
-                        map_xy = self.pixel_mapper.detection_to_map(xyxy2xywh(dets[i, 0:4]))
-                        map_xy = np.asarray(map_xy, dtype=float).reshape(-1)
-                        if map_xy.size >= 2 and np.isfinite(map_xy[:2]).all():
-                            map_point = geo.Point(float(map_xy[0]), float(map_xy[1]))
-
-                    for poly in self.entry_polys:
-                        if poly.contains(map_point) and det_conf >= self.entry_conf_threshold:
-                            create = True
-                            break
-
-                    # Require both spatial entry confirmation and sufficient detection
-                    # confidence before allowing a new track to be born from an entry region.
-                    # This helps suppress one-off false detections near the doorway from
-                    # later maturing into valid room identities after they drift elsewhere.
-                    if create and not self.entry_window_active:
-                        self.entry_window_active = True
-                        self.entry_window_counter = 0
-                else:
-                    create = True
-
-                if create:
-                    trk = KalmanBoxTracker(
-                        dets[i, :5],
-                        dets[i, 5],
-                        dets[i, 6],
-                        delta_t=self.delta_t,
-                        max_obs=self.max_obs,
-                        keypoints=kp_i,
-                        keypoint_confidence_threshold=keypoint_confidence_threshold,
-                    )
-                    self.active_tracks.append(trk)
-
-                    # Once a person is legitimately born from an entry region, treat the
-                    # scene as having no pre-existing in-room enemy. From this point on,
-                    # all entrants are participants and normal participant IDs should start
-                    # from 1 instead of allowing a later non-entry detection to be labeled
-                    # as ENEMY_FINAL_ID.
-                    if self.limit_entry and in_entry:
-                        self.enemy_active = False
-                        self.enemy_done = True
-                        self.enemy_was_in_entry = False
-
-        # ---------------- Build outputs + remove dead tracks ----------------
-        i = len(self.active_tracks)
-        for trk in reversed(self.active_tracks):
-            if trk.last_observation.sum() < 0:
-                tlwh = xyxy2tlwh(trk.get_state()[0])
-            else:
-                tlwh = xyxy2tlwh(trk.last_observation)
-
-            if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits):
-                if trk.final_id is None:
-                    trk.final_id = self.next_final_id
-                    self.next_final_id += 1
-
-                track_dict = {
-                    "top_left_x": tlwh[0],
-                    "top_left_y": tlwh[1],
-                    "width": tlwh[2],
-                    "height": tlwh[3],
-                    "track_id": trk.final_id,
-                    "track_id_raw": trk.id + 1,
-                    "confidence": trk.conf,
-                    "class": trk.cls,
-                    "detection_index": trk.det_ind,
-                    "keypoints": trk.filtered_keypoints,
-                    "ankle_based_point": trk.ankle_based_point,
-                }
-
-                if self.pixel_mapper is not None:
-                    trk.update_map_position(
-                        self.pixel_mapper,
-                        xyxy2xywh(trk.get_state()[0]),
-                        self.frame_count,
-                        keypoints=trk.filtered_keypoints,
-                        keypoint_indices=keypoint_indices,
-                        smoothing_factor=0.7,
-                    )
-                    map_vel = trk.calculate_velocity()
-                    track_dict["current_map_pos"] = trk.current_map_pos
-                    track_dict["map_velocity"] = map_vel
-                else:
-                    track_dict["current_map_pos"] = None
-                    track_dict["map_velocity"] = [None, None]
-
-                outputs.append(track_dict)
-
-            i -= 1
-            if trk.time_since_update > self.max_age:
-                self.active_tracks.pop(i)
-
-        # ---------------- Enemy exit logic ----------------
-        if self.track_enemy and self.enemy_active:
-            enemy_trk = next((t for t in self.active_tracks if getattr(t, "final_id", None) == self.ENEMY_FINAL_ID), None)
-
-            if enemy_trk is None:
-                self.enemy_active = False
-                self.enemy_done = True
-                self.enemy_was_in_entry = False
-            else:
-                # Ensure enemy has a map position even before it becomes output-eligible
-                if self.pixel_mapper is not None and enemy_trk.current_map_pos is None:
-                    # Use bbox-based mapping as a fallback for enemy bookkeeping
-                    xywh = xyxy2xywh(enemy_trk.get_state()[0])
-                    fallback_map = self.pixel_mapper.detection_to_map(xywh)
-                    fallback_map = np.asarray(fallback_map, dtype=float).reshape(-1)
-                    if fallback_map.size >= 2 and np.isfinite(fallback_map[:2]).all():
-                        enemy_trk.current_map_pos = fallback_map[:2]
-
-                if enemy_trk.current_map_pos is not None and self.boundary is not None:
-                    cur_xy = np.asarray(enemy_trk.current_map_pos, dtype=float).reshape(-1)
-                    if cur_xy.size >= 2 and np.isfinite(cur_xy[:2]).all():
-                        pt = geo.Point(float(cur_xy[0]), float(cur_xy[1]))
-                    else:
-                        pt = None
-
-                    if pt is not None:
-                        # If the enemy touches any entry polygon, remember it
-                        if not self.enemy_was_in_entry and self.entry_polys:
-                            self.enemy_was_in_entry = any(poly.contains(pt) for poly in self.entry_polys)
-
-                        # Only declare “enemy left” when it was in entry once *and* is now outside boundary
-                        if self.enemy_was_in_entry and (not self.boundary.contains(pt)):
-                            self.active_tracks.remove(enemy_trk)
-                            self.enemy_active = False
-                            self.enemy_done = True
-                            self.enemy_was_in_entry = False
-
-        # NOTE: preserved original return type (np.array of dicts -> dtype=object)
         return np.array(outputs) if len(outputs) > 0 else np.array([])

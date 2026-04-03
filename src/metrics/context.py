@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+
 @dataclass
 class MetricContext:
     tracker_output: List[Dict[str, Any]] = field(default_factory=list)
@@ -11,15 +12,19 @@ class MetricContext:
     keypoint_details: Dict[Tuple[int, int], Any] = field(default_factory=dict)
     fall_frames: Dict[int, Optional[int]] = field(default_factory=dict)
     map_points: List[Tuple[int, int, float, float]] = field(default_factory=list)
-    
+
+    # Semantic track groups resolved by the tracker / processing engine.
+    entry_ids: List[int] = field(default_factory=list)
+    inroom_ids: List[int] = field(default_factory=list)
+
     # room_coverage: a dict containing coverage info:
-    #   "coverage_per_frame"       -> List[Tuple[int, float]] (frame index, fraction covered)
-    #   "time_to_full"             -> float (seconds from first non-enemy frame to full coverage) or None
-    #   "final_fraction"           -> float (coverage fraction at last frame)
-    #   "first_non_enemy_frame"    -> int (first frame index with non-enemy gaze) or None
+    #   "coverage_per_frame"    -> List[Tuple[int, float]] (frame index, fraction covered)
+    #   "time_to_full"          -> float (seconds from first non-inroom frame to full coverage) or None
+    #   "final_fraction"        -> float (coverage fraction at last frame)
+    #   "first_non_enemy_frame" -> int (legacy cache key; first frame index with non-inroom gaze) or None
     room_coverage: Optional[Dict[str, Any]] = None
 
-    # Mapping: enemy_id -> (first_clear_frame, last_clear_frame, clearing_friend_id)
+    # Mapping: inroom_id -> (first_clear_frame, last_clear_frame, clearing_friend_id)
     threat_clearance: Dict[int, Tuple[Optional[int], Optional[int], Optional[int]]] = field(default_factory=dict)
 
     # Mapping of POD index to capture info:
