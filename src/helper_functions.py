@@ -1431,7 +1431,7 @@ def assign_pods_by_entry(
     boundary: Optional[Polygon] = None,
     pod_groups: Optional[List[str]] = None,
     frame_rate: float = 30.0,
-    entry_direction_k_sec: float = 1.0,
+    entry_direction_k_sec: float = 2.0,
 ) -> Dict[int, Optional[int]]:
     if boundary is None:
         raise ValueError("`boundary` Polygon is required.")
@@ -1840,7 +1840,7 @@ def run_pod_analysis(
         boundary=boundary,
         pod_groups=pod_groups,
         frame_rate=frame_rate,
-        entry_direction_k_sec=1.0,
+        entry_direction_k_sec=2.0,
     )
 
     initial_work_areas = compute_pod_working_areas(

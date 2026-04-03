@@ -30,7 +30,7 @@ class EntranceVectors_Metric(AbstractMetric):
 
     def getFinalScore(self) -> float:
         frame_rate = float(self.config.get("frame_rate", 30.0) or 30.0)
-        k_sec = float(self.config.get("entrance_vector_window_sec", 1.0))
+        k_sec = float(self.config.get("entrance_vector_window_sec", 2.0))
         k_frames = max(1, int(round(k_sec * frame_rate)))
 
         tracks = list(self.tracks.values())
