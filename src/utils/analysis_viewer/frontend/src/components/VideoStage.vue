@@ -72,6 +72,7 @@
 import { computed, watch } from 'vue';
 import { useSessionStore } from '@/stores/session';
 import { usePlaybackStore, type VideoMode } from '@/stores/playback';
+import { useUIStore } from '@/stores/ui';
 import { videoUrl } from '@/api/client';
 import VideoPlayer from './VideoPlayer.vue';
 import SubtitleOverlay from './SubtitleOverlay.vue';
@@ -83,6 +84,22 @@ type PlayerSpec = { role: PlayerRole; src: string | null; muted: boolean };
 
 const session = useSessionStore();
 const playback = usePlaybackStore();
+const ui = useUIStore();
+
+// Pause playback whenever we leave analysis mode. VideoStage stays mounted
+// (v-show) behind the Compare view, so without this the video would keep
+// playing — audio and all — while the user is comparing. Only acts if it was
+// actually playing, so an already-paused video is left untouched.
+watch(
+  () => ui.viewMode,
+  (mode) => {
+    if (mode !== 'analysis' && playback.isPlaying) {
+      playerRefs.get('primary')?.pause();
+      playerRefs.get('aux')?.pause();
+      playback.isPlaying = false;
+    }
+  },
+);
 
 const speedOptions = [0.25, 0.5, 1, 1.5, 2, 4];
 const playerRefs = new Map<PlayerRole, PlayerInstance>();

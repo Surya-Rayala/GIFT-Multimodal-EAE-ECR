@@ -257,15 +257,22 @@ function imageSrc(absPath: string): string {
   max-height: 56vh;
 }
 
-/* Phones / small tablets: the row grid already collapses to one column
- * (auto-fit min 360px); just keep each image from eating the whole screen
- * so users can scroll between the stacked compare cards comfortably. */
+/* Phones / small tablets. Two things:
+ *  1. Cap image height so a card doesn't eat the whole screen.
+ *  2. Honour an explicit "Side by side" choice even here — the desktop 360px
+ *     column floor can't fit twice on a phone, so auto-fit would silently drop
+ *     to one column. Lower the floor so the user's toggle actually shows two
+ *     columns sharing the width (smaller charts; "Stacked" remains the default
+ *     for full-width readability). Wider panes still pack more columns. */
 @media (max-width: 1000px) {
   .viz-img {
     max-height: 52vh;
   }
+  .viz-stack.row {
+    grid-template-columns: repeat(auto-fit, minmax(min(150px, 47%), 1fr));
+  }
   .viz-stack.row .viz-img {
-    max-height: 48vh;
+    max-height: 40vh;
   }
 }
 

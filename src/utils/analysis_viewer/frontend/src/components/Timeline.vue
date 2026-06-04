@@ -20,6 +20,12 @@
       </div>
       <div ref="canvasContainer" class="canvas-container always-scroll"></div>
     </div>
+    <span
+      v-if="ripple"
+      :key="ripple.key"
+      class="tap-ripple"
+      :style="{ left: `${ripple.x}px`, top: `${ripple.y}px` }"
+    ></span>
     <div
       v-if="tooltip"
       class="tooltip"
@@ -66,6 +72,64 @@ let scene: TimelineScene | null = null;
 
 const tooltip = ref<{ x: number; y: number; label: string; below: boolean } | null>(null);
 const metricLabels = ref<MetricLabelInfo[]>([]);
+
+// Subtle tap confirmation: a small ring blooms at the press point and fades.
+// It's transient + pointer-events:none, so it never obstructs other events.
+const ripple = ref<{ x: number; y: number; key: number } | null>(null);
+let rippleSeq = 0;
+let rippleTimer: number | null = null;
+function showRipple(clientX: number, clientY: number): void {
+  if (!rootEl.value) return;
+  const rect = rootEl.value.getBoundingClientRect();
+  ripple.value = { x: clientX - rect.left, y: clientY - rect.top, key: ++rippleSeq };
+  if (rippleTimer != null) clearTimeout(rippleTimer);
+  rippleTimer = window.setTimeout(() => {
+    ripple.value = null;
+  }, 450);
+}
+
+// Drag-to-pan for touch/pen. Desktop mouse keeps its existing wheel/scrollbar
+// scrolling untouched (we ignore mouse here). A tap (no drag) shows the ripple;
+// Pixi separately handles the seek/selection for that tap.
+const PAN_TOLERANCE = 4;
+let panId: number | null = null;
+let panStartX = 0;
+let panStartY = 0;
+let panScrollL = 0;
+let panScrollT = 0;
+let panMoved = false;
+let panCanScroll = false;
+
+function onTlPointerDown(ev: PointerEvent): void {
+  if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+  panId = ev.pointerId;
+  panStartX = ev.clientX;
+  panStartY = ev.clientY;
+  panMoved = false;
+  panCanScroll = ev.pointerType !== 'mouse';
+  const c = canvasContainer.value;
+  if (panCanScroll && c) {
+    panScrollL = c.scrollLeft;
+    panScrollT = c.scrollTop;
+  }
+}
+function onTlPointerMove(ev: PointerEvent): void {
+  if (ev.pointerId !== panId) return;
+  const dx = ev.clientX - panStartX;
+  const dy = ev.clientY - panStartY;
+  if (!panMoved && Math.hypot(dx, dy) < PAN_TOLERANCE) return;
+  panMoved = true;
+  const c = canvasContainer.value;
+  if (panCanScroll && c) {
+    c.scrollLeft = panScrollL - dx;
+    c.scrollTop = panScrollT - dy;
+  }
+}
+function onTlPointerUp(ev: PointerEvent): void {
+  if (ev.pointerId !== panId) return;
+  panId = null;
+  if (!panMoved) showRipple(ev.clientX, ev.clientY);
+}
 
 // Visible range follows the active video mode.
 const visibleRange = computed(() => {
@@ -116,11 +180,18 @@ onMounted(async () => {
   // never moves sideways, so labels can't overlap canvas content.
   canvasContainer.value.addEventListener('scroll', onCanvasScroll, { passive: true });
 
+  // Drag-to-pan (touch/pen) + tap-ripple, on the scroll container.
+  canvasContainer.value.addEventListener('pointerdown', onTlPointerDown);
+  canvasContainer.value.addEventListener('pointermove', onTlPointerMove);
+  canvasContainer.value.addEventListener('pointerup', onTlPointerUp);
+  canvasContainer.value.addEventListener('pointercancel', onTlPointerUp);
+
   pushData();
   scene.setRange(visibleRange.value.start, visibleRange.value.end);
   scene.setMetricVisibility(ui.metricVisibility);
   scene.setSelectedMetric(ui.selectedMetricId);
   scene.setSelectedFlag(ui.selectedFlagId);
+  scene.setSelectedItem(ui.selectedItemId);
   scene.setCurrentFrame(playback.currentFrame);
 });
 
@@ -262,6 +333,10 @@ watch(
   },
 );
 watch(
+  () => ui.selectedItemId,
+  (id) => scene?.setSelectedItem(id),
+);
+watch(
   () => playback.currentFrame,
   (f) => scene?.setCurrentFrame(f),
 );
@@ -284,7 +359,15 @@ function onJumpToFirst(): void {
 }
 
 onBeforeUnmount(() => {
-  canvasContainer.value?.removeEventListener('scroll', onCanvasScroll);
+  const c = canvasContainer.value;
+  if (c) {
+    c.removeEventListener('scroll', onCanvasScroll);
+    c.removeEventListener('pointerdown', onTlPointerDown);
+    c.removeEventListener('pointermove', onTlPointerMove);
+    c.removeEventListener('pointerup', onTlPointerUp);
+    c.removeEventListener('pointercancel', onTlPointerUp);
+  }
+  if (rippleTimer != null) clearTimeout(rippleTimer);
   scene?.destroy();
   scene = null;
 });
@@ -452,5 +535,39 @@ onBeforeUnmount(() => {
 }
 .muted {
   color: var(--color-muted);
+}
+
+/* Tap confirmation ring — blooms once at the press point, then fades. Sits
+ * above the canvas but is pointer-transparent and gone in <0.5s, so it never
+ * hides neighbouring events. */
+.tap-ripple {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  margin: -8px 0 0 -8px;
+  border-radius: 50%;
+  border: 2px solid var(--color-accent);
+  background: var(--color-accent-bg);
+  pointer-events: none;
+  z-index: 6;
+  animation: tl-tap-ripple 0.45s ease-out forwards;
+}
+@keyframes tl-tap-ripple {
+  0% {
+    transform: scale(0.4);
+    opacity: 0.95;
+  }
+  100% {
+    transform: scale(2.3);
+    opacity: 0;
+  }
+}
+
+/* Touch: the container is panned via JS (Timeline.vue pointer handlers), so
+ * stop the browser from also trying to scroll/zoom it. Desktop is unaffected. */
+@media (hover: none) {
+  .canvas-container {
+    touch-action: none;
+  }
 }
 </style>

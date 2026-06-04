@@ -196,6 +196,8 @@ export class TimelineScene {
   private readonly vectorsLayer = new Container();
   private readonly flagsLayer = new Container();
   private readonly drillMarkersLayer = new Container();
+  // Drawn above the markers: a persistent ring around the selected event.
+  private readonly selectionLayer = new Container();
   private readonly playhead = new Graphics();
 
   private container: HTMLElement | null = null;
@@ -215,6 +217,15 @@ export class TimelineScene {
   private metricVisibility: Record<string, boolean> = {};
   private selectedMetricId: string | null = null;
   private selectedFlagId: string | null = null;
+  // The directly-clicked event (entry/vector/bar/flag). Drives the persistent
+  // selection ring. Cleared when an empty spot or another event is clicked.
+  private selectedItemId: string | null = null;
+  // id -> shape geometry, rebuilt every redraw, used to draw the selection ring.
+  private selGeom = new Map<
+    string,
+    | { kind: 'circle'; cx: number; cy: number; r: number }
+    | { kind: 'rect'; x: number; y: number; w: number; h: number }
+  >();
   /** Pointer-down state for click-vs-pan discrimination on the empty track.
    *  A seek only fires on pointerup when total movement is ≤ TAP_TOLERANCE_PX. */
   private stagePointerDown: { x: number; y: number; frame: number } | null = null;
@@ -246,10 +257,11 @@ export class TimelineScene {
     container.appendChild(this.app.canvas);
     this.app.canvas.style.display = 'block';
     this.app.canvas.style.cursor = 'pointer';
-    // Let finger swipes scroll the (overflow) container both ways while taps
-    // still register as Pixi pointer events for seeking/selecting. Without this
-    // Pixi sets touch-action:none and the timeline can't be panned on touch.
-    this.app.canvas.style.touchAction = 'pan-x pan-y';
+    // Disable the browser's own touch gestures on the canvas; Timeline.vue
+    // implements explicit drag-to-pan on the scroll container for touch/pen
+    // (native overflow scrolling is unreliable here because Pixi intercepts the
+    // touch stream). Taps still register as Pixi pointer events for seek/select.
+    this.app.canvas.style.touchAction = 'none';
 
     this.app.stage.addChild(this.root);
     this.root.addChild(this.trackBar);
@@ -261,6 +273,7 @@ export class TimelineScene {
     this.root.addChild(this.vectorsLayer);
     this.root.addChild(this.flagsLayer);
     this.root.addChild(this.drillMarkersLayer);
+    this.root.addChild(this.selectionLayer);
     this.root.addChild(this.playhead);
 
     this.app.stage.eventMode = 'static';
@@ -336,6 +349,13 @@ export class TimelineScene {
   setSelectedFlag(flagId: string | null): void {
     if (this.selectedFlagId === flagId) return;
     this.selectedFlagId = flagId;
+    this.redraw();
+  }
+
+  /** Track the directly-clicked event so it gets a persistent selection ring. */
+  setSelectedItem(itemId: string | null): void {
+    if (this.selectedItemId === itemId) return;
+    this.selectedItemId = itemId;
     this.redraw();
   }
 
@@ -585,6 +605,7 @@ export class TimelineScene {
 
   private redraw(): void {
     this.layout = this.computeLayout();
+    this.selGeom.clear();
     this.resizeCanvas();
     this.drawTrack();
     this.drawDrillOverlay();
@@ -593,8 +614,45 @@ export class TimelineScene {
     this.drawVectors();
     this.drawFlags();
     this.drawDrillMarkers();
+    this.drawSelection();
     this.drawPlayhead();
     this.callbacks.onLayoutChanged?.(this.buildMetricLabels());
+  }
+
+  // -- selection ring -------------------------------------------------------
+
+  private regCircle(id: string, cx: number, cy: number, r: number): void {
+    this.selGeom.set(id, { kind: 'circle', cx, cy, r });
+  }
+  private regRect(id: string, x: number, y: number, w: number, h: number): void {
+    this.selGeom.set(id, { kind: 'rect', x, y, w, h });
+  }
+
+  /** Draw a persistent ring around the selected event, matching its shape.
+   * A reserved white ring (with a dark halo for contrast on any background) is
+   * used so it never collides with metric colours. */
+  private drawSelection(): void {
+    this.selectionLayer.removeChildren();
+    const id = this.selectedItemId ?? this.selectedFlagId;
+    if (!id) return;
+    const geom = this.selGeom.get(id);
+    if (!geom) return; // selected event is off-range or its metric is hidden
+
+    const g = new Graphics();
+    const PAD = 3.5;
+    if (geom.kind === 'circle') {
+      const rr = geom.r + PAD;
+      g.circle(geom.cx, geom.cy, rr).stroke({ color: 0x0b0e14, width: 4, alpha: 0.55 });
+      g.circle(geom.cx, geom.cy, rr).stroke({ color: 0xffffff, width: 2, alpha: 0.95 });
+    } else {
+      const x = geom.x - PAD;
+      const y = geom.y - PAD;
+      const w = geom.w + PAD * 2;
+      const h = geom.h + PAD * 2;
+      g.roundRect(x, y, w, h, 3).stroke({ color: 0x0b0e14, width: 4, alpha: 0.55 });
+      g.roundRect(x, y, w, h, 3).stroke({ color: 0xffffff, width: 2, alpha: 0.95 });
+    }
+    this.selectionLayer.addChild(g);
   }
 
   private buildMetricLabels(): MetricLabelInfo[] {
@@ -707,6 +765,7 @@ export class TimelineScene {
     bar.cursor = 'pointer';
     bar.hitArea = new Rectangle(0, barY - BAR_HIT_VPAD, overlap.w, BAR_HEIGHT + BAR_HIT_VPAD * 2);
     this.attachClickAndHover(bar, item.item_id, item.start_frame, 'item');
+    this.regRect(item.item_id, overlap.x, barY, overlap.w, BAR_HEIGHT);
     c.addChild(bar);
 
     const pairTag = `P${item.data.pair_number}`;
@@ -763,6 +822,7 @@ export class TimelineScene {
     bar.cursor = 'pointer';
     bar.hitArea = new Rectangle(0, barY - BAR_HIT_VPAD, overlap.w, BAR_HEIGHT + BAR_HIT_VPAD * 2);
     this.attachClickAndHover(bar, item.item_id, item.start_frame, 'item');
+    this.regRect(item.item_id, overlap.x, barY, overlap.w, BAR_HEIGHT);
     c.addChild(bar);
     return c;
   }
@@ -795,6 +855,7 @@ export class TimelineScene {
     bar.cursor = 'pointer';
     bar.hitArea = new Rectangle(0, barY - BAR_HIT_VPAD, drawnW, BAR_HEIGHT + BAR_HIT_VPAD * 2);
     this.attachClickAndHover(bar, item.item_id, item.start_frame, 'item');
+    this.regRect(item.item_id, overlap.x, barY, drawnW, BAR_HEIGHT);
     c.addChild(bar);
     return c;
   }
@@ -813,6 +874,7 @@ export class TimelineScene {
       g.cursor = 'pointer';
       g.hitArea = new Circle(0, y, DOT_HIT_RADIUS);
       this.attachClickAndHover(g, item.item_id, item.frame, 'item');
+      this.regCircle(item.item_id, this.xOf(item.frame), y, ENTRY_RADIUS);
       this.entriesLayer.addChild(g);
     }
   }
@@ -833,6 +895,7 @@ export class TimelineScene {
       g.cursor = 'pointer';
       g.hitArea = new Circle(0, pos.mainCenterY, DOT_HIT_RADIUS);
       this.attachClickAndHover(g, item.item_id, item.frame, 'item');
+      this.regCircle(item.item_id, this.xOf(item.frame), pos.mainCenterY, VECTOR_RADIUS);
       this.vectorsLayer.addChild(g);
     }
   }
@@ -862,6 +925,7 @@ export class TimelineScene {
       g.cursor = 'pointer';
       g.hitArea = new Circle(0, y, FLAG_HIT_RADIUS);
       this.attachClickAndHover(g, flag.flag_id, flag.frame, 'flag');
+      this.regCircle(flag.flag_id, this.xOf(flag.frame), y, FLAG_RADIUS);
       this.flagsLayer.addChild(g);
     }
   }
