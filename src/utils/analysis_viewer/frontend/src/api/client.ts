@@ -1,15 +1,18 @@
 // Typed fetch helpers for the FastAPI sidecar.
 //
-// Port resolution priority:
+// Base-URL resolution priority:
 //   1. Tauri runtime  → invoke('get_sidecar_port') (the Rust shell knows the
-//      port it bound the Python sidecar to)
+//      port it bound the Python sidecar to) → http://127.0.0.1:<port>
 //   2. window.__SIDECAR_PORT__ (best-effort eval injection from Tauri)
 //   3. import.meta.env.VITE_SIDECAR_PORT (Vite dev override)
-//   4. 8765 default (matches the port used by the manual sidecar smoke tests)
+//   4. SAME-ORIGIN (relative URLs) — the LAN web-server mode, where the FastAPI
+//      backend serves this built frontend itself. A remote browser must talk to
+//      the host it loaded the page from, never 127.0.0.1.
 
 import type { AnalysisSession, CompareResult, RunSummary } from '@/types/models';
 
 let cachedPort: number | null = null;
+let portResolved = false;
 
 function isTauri(): boolean {
   // Tauri 2 exposes both `__TAURI_INTERNALS__` and `__TAURI__`. Either is fine.
@@ -21,40 +24,40 @@ function isTauri(): boolean {
 
 /**
  * Resolves the sidecar port asynchronously and caches it. Call once at app
- * startup before any other API helper, since the rest are sync.
+ * startup before any other API helper, since the rest are sync. Returns null
+ * when no explicit port source exists — that's the same-origin web mode.
  */
-export async function initSidecarPort(): Promise<number> {
-  if (cachedPort != null) return cachedPort;
+export async function initSidecarPort(): Promise<number | null> {
+  if (portResolved) return cachedPort;
+  portResolved = true;
 
   if (isTauri()) {
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       const port = await invoke<number | null>('get_sidecar_port');
-      if (typeof port === 'number' && port > 0) {
-        cachedPort = port;
-        return port;
-      }
+      if (typeof port === 'number' && port > 0) cachedPort = port;
     } catch {
       // fall through to other resolvers
     }
   }
 
-  if (typeof window !== 'undefined' && typeof window.__SIDECAR_PORT__ === 'number') {
+  if (cachedPort == null && typeof window !== 'undefined' && typeof window.__SIDECAR_PORT__ === 'number') {
     cachedPort = window.__SIDECAR_PORT__;
-    return cachedPort;
   }
 
-  const env = import.meta.env.VITE_SIDECAR_PORT;
-  cachedPort = env ? Number(env) : 8765;
+  if (cachedPort == null) {
+    const env = import.meta.env.VITE_SIDECAR_PORT;
+    if (env) cachedPort = Number(env);
+  }
+
   return cachedPort;
 }
 
 export function sidecarBaseUrl(): string {
-  // Once `initSidecarPort` has resolved, this is sync. Before then it falls
-  // back to 8765, which is the dev-default and still likely to work in the
-  // common case where the user runs the sidecar manually.
-  const port = cachedPort ?? 8765;
-  return `http://127.0.0.1:${port}`;
+  // Desktop / dev: an explicit port means the backend is on localhost.
+  if (cachedPort != null && cachedPort > 0) return `http://127.0.0.1:${cachedPort}`;
+  // Web mode: backend serves this page — use same origin via relative URLs.
+  return '';
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -73,6 +76,16 @@ export function fetchSession(jsonPath: string): Promise<AnalysisSession> {
 
 export function fetchHealth(): Promise<{ ok: boolean; service: string }> {
   return getJson(`/health`);
+}
+
+export interface ServerConfig {
+  outputs_root: string | null;
+  serve_mode: boolean;
+}
+
+/** Runtime server config. In web mode, `outputs_root` is the folder Compare can browse. */
+export function fetchConfig(): Promise<ServerConfig> {
+  return getJson<ServerConfig>(`/config`);
 }
 
 export function videoUrl(videoPath: string, sessionPath: string): string {

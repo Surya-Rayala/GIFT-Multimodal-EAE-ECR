@@ -360,6 +360,72 @@ Each run folder is one of the per-run directories the engine writes under `outpu
 
 A native window opens. Node.js is auto-installed on first launch and frontend packages install once into the shared workspace `node_modules`; later launches start in seconds. The Rust shell spawns the Python sidecar internally and tears it down on window close — no other terminals to manage.
 
+### Host it on the network (multiple viewers, one machine)
+
+Instead of the desktop window, you can host the viewer from the machine where the
+output folders live, and let people open sessions from their own laptops/tablets
+on the same network — each viewing a different session at the same time.
+
+```bash
+conda activate gift-meae
+python -m src.utils.analysis_viewer --serve --outputs-root /path/to/output
+# options: --host (default 0.0.0.0) · --port (default 8000) · --rebuild
+```
+
+This builds the frontend once and runs a web server (no desktop window). It prints
+the URLs to share. To open a specific session, append its **host-machine folder
+path** to the URL.
+
+#### Reading the URL
+
+```
+http://<host-ip>:8000/?run=/path/to/output/trainee_Test_Video_20260521_165915
+└─┬─┘  └──┬───┘ └─┬┘ └┬┘└───────────────────────┬──────────────────────────┘
+scheme   host    port  query  the run folder's path ON THE HOST MACHINE
+```
+
+| Part | Meaning |
+|---|---|
+| `http://` | plain HTTP (no certificate) — intended for a trusted LAN |
+| `<host-ip>` | the **serving machine's** IP on the network (the `--serve` command prints it, e.g. `192.168.1.42`). From the host itself you can also use `127.0.0.1`. |
+| `:8000` | the `--port` the server is listening on |
+| `/?run=…` | which session to open. The value is the **absolute path to the run folder on the host**, exactly as it exists on the serving machine's disk — *not* a path on the viewer's own device. |
+
+So the same link works from any device on the network; the path is always resolved
+on the host. You can also point `?run=` at the `..._Analysis.json` file inside a run
+folder — either form works. Omitting `?run=` opens the app empty (use **Open…** to
+type a path). Each browser/tab is independent, so multiple people can view different
+sessions at once.
+
+#### What people can and can't reach
+
+The folder you pass to `--outputs-root` when starting the server is the **only**
+place the server will read from:
+
+- A `?run=` path is accepted **only if it resolves inside `--outputs-root`**;
+  anything else (e.g. `?run=/etc/passwd` or another user's home folder) is refused
+  with `403 Forbidden`. The same limit applies to every data request the page makes
+  (session JSON, videos, images, transcription, drill-window, and **Compare**).
+- **Compare** can therefore reach *any* run **under that root** — that's how it lists
+  sibling runs and expert references — but nothing above or outside it.
+- The restriction is by real path, so symlinks pointing outside the root don't escape it.
+- There is **no login or password** — anyone who can reach `http://<host-ip>:8000`
+  can view everything under the root. Host it only on a trusted network, and point
+  `--outputs-root` at just the folder you intend to share (e.g. one project's
+  `output/`, not your whole home directory).
+
+#### Finding the host IP and connecting
+
+`<host-ip>` is the address of the **machine running `--serve`** — printed on startup,
+or found with: macOS `ipconfig getifaddr en0` · Linux `hostname -I` · Windows
+`ipconfig`. Other devices must use this LAN IP; `127.0.0.1`/`localhost` only works on
+the host itself.
+
+Devices must be on the **same Wi-Fi/subnet** with the host **firewall** allowing the
+port. If a device still can't connect, it's usually **client isolation** (common on
+guest/enterprise Wi-Fi — blocks device-to-device traffic; use a private network or
+hotspot). Test from another device with `http://<host-ip>:8000/health` → `{"ok": true}`.
+
 
 ## Usage
 

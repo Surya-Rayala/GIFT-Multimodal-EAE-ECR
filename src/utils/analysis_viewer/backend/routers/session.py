@@ -9,6 +9,7 @@ from typing import Any, Dict
 
 from fastapi import APIRouter, HTTPException, Query
 
+from ..config import enforce_under_root
 from ..loader import SessionLoadError, collect_whitelist_paths, load_session
 from ..security import WHITELIST
 
@@ -17,6 +18,7 @@ router = APIRouter()
 
 @router.get("/session")
 def get_session(path: str = Query(..., description="Run folder (with RunInfo.json) or {basename}_Analysis.json")) -> Dict[str, Any]:
+    path = enforce_under_root(path)
     try:
         data = load_session(path)
     except SessionLoadError as exc:
@@ -30,6 +32,7 @@ def get_session(path: str = Query(..., description="Run folder (with RunInfo.jso
 
 @router.get("/resolve_video")
 def resolve_video(path: str = Query(..., description="Run folder or session JSON")) -> Dict[str, Any]:
+    path = enforce_under_root(path)
     try:
         data = load_session(path)
     except SessionLoadError as exc:

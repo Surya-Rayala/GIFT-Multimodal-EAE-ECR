@@ -20,16 +20,28 @@ import SplitPane from '@/components/SplitPane.vue';
 import LeftPanel from '@/components/LeftPanel.vue';
 import CenterPanel from '@/components/CenterPanel.vue';
 import RightPanel from '@/components/RightPanel.vue';
+import { fetchConfig } from '@/api/client';
 import { useSessionStore } from '@/stores/session';
+import { useCompareStore } from '@/stores/compare';
 
 const session = useSessionStore();
+const compare = useCompareStore();
 
-onMounted(() => {
-  // Priority: ?session=… in the URL > VITE_INITIAL_SESSION (set by the Python
-  // launcher when a path was passed on the CLI) > last successfully-loaded
-  // path remembered by LeftPanel via localStorage.
+onMounted(async () => {
+  // In LAN web mode, learn the served outputs root so Compare can browse every
+  // run under it (and so a deep-linked session's siblings show up).
+  try {
+    const cfg = await fetchConfig();
+    if (cfg.outputs_root) compare.outputsRoot = cfg.outputs_root;
+  } catch {
+    // desktop mode / endpoint absent — ignore
+  }
+
+  // Which session to open. Priority: ?run=…/?session=… in the URL (the host
+  // path to a run folder, used for network deep-links) > VITE_INITIAL_SESSION
+  // (set by the desktop launcher) > last-loaded path remembered in localStorage.
   const params = new URLSearchParams(window.location.search);
-  const fromUrl = params.get('session');
+  const fromUrl = params.get('run') || params.get('session');
   const fromEnv = import.meta.env.VITE_INITIAL_SESSION;
   const fromStorage = (() => {
     try {

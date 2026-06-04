@@ -20,6 +20,7 @@ from fastapi import APIRouter, HTTPException, Query
 from src.processing_engine import ProcessingEngine
 from src.utils.run_info import load_run_info
 
+from ..config import enforce_under_root
 from ..security import WHITELIST
 
 router = APIRouter()
@@ -56,8 +57,10 @@ def compare(
     metric_id: str = Query(..., description="Metric identifier (upper-snake, e.g. ENTRANCE_VECTORS)"),
     session: str = Query(..., description="Path to the current session's Analysis.json (whitelist key)"),
 ) -> Dict[str, Any]:
-    cur = os.path.abspath(os.path.expanduser(current_run))
-    oth = os.path.abspath(os.path.expanduser(other_run))
+    # Both run folders must be under the served outputs root in server mode
+    # (no-op on desktop). Compare can thus reach any run beside the open one.
+    cur = enforce_under_root(current_run)
+    oth = enforce_under_root(other_run)
     if not os.path.isdir(cur):
         raise HTTPException(status_code=404, detail=f"Current run folder not found: {cur}")
     if not os.path.isdir(oth):

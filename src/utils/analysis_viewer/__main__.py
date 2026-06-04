@@ -19,21 +19,85 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
 from typing import Tuple
 
-from ..node_runtime import ensure_workspace_packages, prepare_runtime
+from ..node_runtime import REPO_ROOT, ensure_workspace_packages, prepare_runtime
 
 HERE = Path(__file__).resolve().parent
 FRONTEND_DIR = HERE / "frontend"
+DIST_DIR = FRONTEND_DIR / "dist"
 LABEL = "analysis-viewer"
 
 
 def fail(msg: str, code: int = 1) -> "None":
     sys.stderr.write(f"[{LABEL}] {msg}\n")
     sys.exit(code)
+
+
+def _lan_ip() -> str:
+    """Best-effort primary LAN IP (no packets are actually sent)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def _serve(host: str, port: int, outputs_root: Path, rebuild: bool) -> None:
+    """Host the viewer as a LAN web app served from a single origin.
+
+    Builds the Vue frontend once (Node auto-provisioned), then runs the FastAPI
+    sidecar bound to ``host:port`` serving both the UI and the API. Access is
+    restricted to session folders under ``outputs_root``; people open a specific
+    session by deep-linking its host path: ``/?run=/abs/path/to/<run_folder>``.
+    """
+    if rebuild or not (DIST_DIR / "index.html").is_file():
+        print(f"[{LABEL}] building frontend (one-time)…")
+        runtime = prepare_runtime(LABEL)
+        build_env = dict(runtime["env"])
+        npm = str(runtime["npm"])
+        ensure_workspace_packages(LABEL, build_env, npm)
+        subprocess.run([npm, "run", "build"], cwd=FRONTEND_DIR, env=build_env, check=True)
+
+    env = os.environ.copy()
+    env["GIFT_VIEWER_OUTPUTS_ROOT"] = str(outputs_root)
+    env["GIFT_VIEWER_DIST"] = str(DIST_DIR)
+
+    lan = _lan_ip()
+    print(f"\n[{LABEL}] serving the Analysis Viewer over the network")
+    print(f"    outputs root (accessible): {outputs_root}")
+    print(f"    this machine:  http://127.0.0.1:{port}")
+    if host == "0.0.0.0":
+        print(f"    other devices: http://{lan}:{port}")
+    print(f"    open a session by appending its folder path, e.g.:")
+    print(f"        http://{lan if host == '0.0.0.0' else host}:{port}/?run=<run_folder_under_outputs_root>")
+    print(f"    (only folders under the outputs root above can be opened)\n")
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "src.utils.analysis_viewer.backend.sidecar_main",
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--log-level",
+        "info",
+    ]
+    try:
+        subprocess.run(cmd, cwd=str(REPO_ROOT), env=env, check=True)
+    except KeyboardInterrupt:
+        pass
+    except subprocess.CalledProcessError as exc:
+        sys.exit(exc.returncode)
 
 
 def _resolve_run(path: str) -> Tuple[Path, Path]:
@@ -93,10 +157,44 @@ def main() -> None:
         action="store_true",
         help="Build a distributable bundle instead of launching dev mode.",
     )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help=(
+            "Host the viewer as a LAN web app (no desktop window). People on the "
+            "network open sessions by deep-linking a run folder: /?run=<path>."
+        ),
+    )
+    parser.add_argument("--host", default="0.0.0.0", help="Serve bind host (default 0.0.0.0).")
+    parser.add_argument("--port", type=int, default=8000, help="Serve port (default 8000).")
+    parser.add_argument(
+        "--outputs-root",
+        help=(
+            "Folder the server may expose (only sessions under it are openable). "
+            "Defaults to the run's parent if a run is given, else ./output."
+        ),
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Force a frontend rebuild before serving (otherwise reuse dist/).",
+    )
     args = parser.parse_args()
 
     if not FRONTEND_DIR.is_dir():
         fail(f"Frontend directory missing: {FRONTEND_DIR}")
+
+    if args.serve:
+        if args.outputs_root:
+            root = Path(args.outputs_root).expanduser().resolve()
+        elif args.run:
+            root = Path(args.run).expanduser().resolve().parent
+        else:
+            root = (REPO_ROOT / "output").resolve()
+        if not root.is_dir():
+            fail(f"Outputs root not found or not a directory: {root}")
+        _serve(args.host, args.port, root, args.rebuild)
+        return
 
     runtime = prepare_runtime(LABEL)
     env = dict(runtime["env"])

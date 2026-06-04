@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query
+
+from ..config import enforce_under_root
 
 router = APIRouter()
 
@@ -27,7 +28,8 @@ def get_drillwindow(
 
 
 def _load_json(path: str) -> Dict[str, Any]:
-    abs_path = str(Path(path).expanduser().resolve())
+    # Restricted to the configured outputs root in server mode (no-op on desktop).
+    abs_path = enforce_under_root(path)
     if not os.path.isfile(abs_path):
         raise HTTPException(status_code=404, detail=f"File not found: {abs_path}")
     try:
