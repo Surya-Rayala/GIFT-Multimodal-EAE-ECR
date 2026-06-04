@@ -59,7 +59,12 @@ onMounted(async () => {
 
 <style scoped>
 .app-shell {
+  /* width:100% (not 100vw) avoids a horizontal scrollbar from the vw/scrollbar
+   * mismatch; dvh tracks the dynamic viewport so mobile browser chrome (URL
+   * bar) doesn't clip the bottom. Falls back to vh on older engines. */
+  width: 100%;
   height: 100vh;
-  width: 100vw;
+  height: 100dvh;
+  overflow: hidden;
 }
 </style>

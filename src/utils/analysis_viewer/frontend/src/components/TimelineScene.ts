@@ -230,6 +230,11 @@ export class TimelineScene {
     this.callbacks = callbacks;
 
     await this.app.init({
+      // Pin WebGL. Pixi v8 otherwise auto-selects WebGPU when the browser
+      // exposes it (Chrome on localhost/127.0.0.1, desktop Safari 17+), and
+      // WebGPU can silently render nothing (blank canvas, no error) in served /
+      // remote / Safari contexts. WebGL is universally supported and reliable.
+      preference: 'webgl',
       backgroundAlpha: 0,
       antialias: true,
       autoDensity: true,
@@ -241,6 +246,10 @@ export class TimelineScene {
     container.appendChild(this.app.canvas);
     this.app.canvas.style.display = 'block';
     this.app.canvas.style.cursor = 'pointer';
+    // Let finger swipes scroll the (overflow) container both ways while taps
+    // still register as Pixi pointer events for seeking/selecting. Without this
+    // Pixi sets touch-action:none and the timeline can't be panned on touch.
+    this.app.canvas.style.touchAction = 'pan-x pan-y';
 
     this.app.stage.addChild(this.root);
     this.root.addChild(this.trackBar);

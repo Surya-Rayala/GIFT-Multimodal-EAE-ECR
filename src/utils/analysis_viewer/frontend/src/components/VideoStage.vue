@@ -332,6 +332,18 @@ watch(
   min-height: 0;
 }
 
+/* Phones / small tablets: two side-by-side videos become unreadably narrow.
+ * Stack them vertically, each taking an equal half of the available height. */
+@media (max-width: 1000px) {
+  .video-grid {
+    min-height: 0;
+  }
+  .video-grid.grid-2 {
+    grid-template-columns: 1fr;
+    grid-auto-rows: 1fr;
+  }
+}
+
 .transport {
   display: flex;
   align-items: center;

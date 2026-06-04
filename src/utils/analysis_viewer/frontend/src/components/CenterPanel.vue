@@ -86,4 +86,21 @@ const ui = useUIStore();
 .muted {
   color: var(--color-muted);
 }
+
+/* Phones / small tablets: the fixed 240px video + 160px timeline don't both
+ * fit on a short screen. Shrink the floors and trim the timeline so the video
+ * keeps usable space. Desktop heights above are unchanged. */
+@media (max-width: 1000px) {
+  .video-region {
+    min-height: 150px;
+  }
+  .timeline-region {
+    height: 140px;
+  }
+}
+@media (max-width: 1000px) and (max-height: 560px) {
+  .timeline-region {
+    height: 116px;
+  }
+}
 </style>

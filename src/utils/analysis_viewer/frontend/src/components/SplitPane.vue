@@ -1,21 +1,55 @@
 <template>
-  <div class="split-pane" :style="gridStyle">
-    <div class="pane left"><slot name="left" /></div>
+  <div
+    class="split-pane"
+    :class="{ narrow: isNarrow }"
+    :style="isNarrow ? undefined : gridStyle"
+  >
+    <!-- Phones & portrait tablets: one pane on screen at a time, picked by a
+         tab bar. Panes stay mounted (v-show) so the video keeps playing when
+         you switch tabs. Desktop/laptop (and wide/landscape tablets) keep the
+         original 3-pane grid below, unchanged. -->
+    <nav v-if="isNarrow" class="mobile-tabs" role="tablist">
+      <button
+        v-for="t in tabs"
+        :key="t.key"
+        class="mtab"
+        :class="{ active: tab === t.key }"
+        role="tab"
+        :aria-selected="tab === t.key"
+        @click="tab = t.key"
+      >
+        {{ t.label }}
+      </button>
+    </nav>
+
+    <div class="pane left" v-show="!isNarrow || tab === 'left'"><slot name="left" /></div>
+
     <div
+      v-if="!isNarrow"
       class="resizer"
       :class="{ active: activeSide === 'left' }"
       @pointerdown="onPointerDown('left', $event)"
     ></div>
-    <div class="pane center"><slot name="center" /></div>
+
+    <div class="pane center" v-show="!isNarrow || tab === 'center'"><slot name="center" /></div>
+
+    <template v-if="!isNarrow">
+      <div
+        v-if="!ui.rightCollapsed"
+        class="resizer"
+        :class="{ active: activeSide === 'right' }"
+        @pointerdown="onPointerDown('right', $event)"
+      ></div>
+      <div v-else class="resizer collapsed-spacer"></div>
+    </template>
+
     <div
-      v-if="!ui.rightCollapsed"
-      class="resizer"
-      :class="{ active: activeSide === 'right' }"
-      @pointerdown="onPointerDown('right', $event)"
-    ></div>
-    <div v-else class="resizer collapsed-spacer"></div>
-    <div class="pane right" :class="{ collapsed: ui.rightCollapsed }">
+      class="pane right"
+      v-show="!isNarrow || tab === 'right'"
+      :class="{ collapsed: !isNarrow && ui.rightCollapsed }"
+    >
       <button
+        v-if="!isNarrow"
         class="collapse-toggle"
         :title="ui.rightCollapsed ? 'Show details panel' : 'Hide details panel'"
         :aria-label="ui.rightCollapsed ? 'Show details panel' : 'Hide details panel'"
@@ -39,7 +73,7 @@
           />
         </svg>
       </button>
-      <div v-show="!ui.rightCollapsed" class="pane-content">
+      <div v-show="isNarrow || !ui.rightCollapsed" class="pane-content">
         <slot name="right" />
       </div>
     </div>
@@ -47,10 +81,30 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useUIStore } from '@/stores/ui';
 
 const ui = useUIStore();
+
+// Below this width we drop the 3-pane grid for a tabbed single-pane layout
+// (phones, small/portrait tablets). At/above it, the desktop grid is used —
+// so laptops and wide/landscape tablets are unaffected.
+const NARROW_QUERY = '(max-width: 1000px)';
+// Seed synchronously so the correct layout paints on first render (no flash
+// from desktop→tabs on a phone). The listener in onMounted keeps it live.
+const isNarrow = ref(
+  typeof window !== 'undefined' && window.matchMedia(NARROW_QUERY).matches,
+);
+const tab = ref<'left' | 'center' | 'right'>('center');
+const tabs = [
+  { key: 'left' as const, label: 'Sessions' },
+  { key: 'center' as const, label: 'Viewer' },
+  { key: 'right' as const, label: 'Details' },
+];
+let mql: MediaQueryList | null = null;
+function syncNarrow(): void {
+  isNarrow.value = mql?.matches ?? false;
+}
 
 const MIN_LEFT = 200;
 const MAX_LEFT = 600;
@@ -108,7 +162,16 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
 
-onBeforeUnmount(onPointerUp);
+onMounted(() => {
+  mql = window.matchMedia(NARROW_QUERY);
+  syncNarrow();
+  mql.addEventListener('change', syncNarrow);
+});
+
+onBeforeUnmount(() => {
+  mql?.removeEventListener('change', syncNarrow);
+  onPointerUp();
+});
 </script>
 
 <style scoped>
@@ -198,5 +261,54 @@ onBeforeUnmount(onPointerUp);
 }
 .chevron {
   display: block;
+}
+
+/* ----------------------------------------------------------------------
+ * Narrow layout (phones / small & portrait tablets): a top tab bar swaps a
+ * single full-screen pane. Desktop styles above are untouched. */
+.split-pane.narrow {
+  display: flex;
+  flex-direction: column;
+}
+.mobile-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  background: var(--color-bg-elev);
+  border-bottom: 1px solid var(--color-border);
+  padding-top: env(safe-area-inset-top, 0);
+}
+.mtab {
+  flex: 1 1 0;
+  min-height: 44px;
+  background: transparent;
+  color: var(--color-muted);
+  border: none;
+  border-right: 1px solid var(--color-border);
+  font-size: 0.9em;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+}
+.mtab:last-child {
+  border-right: none;
+}
+.mtab.active {
+  color: var(--color-text);
+  box-shadow: inset 0 -2px 0 var(--color-accent);
+}
+/* The visible pane fills the area under the tab bar; hidden panes are
+ * display:none via v-show, so they don't take column space. */
+.split-pane.narrow .pane {
+  width: 100%;
+  height: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.split-pane.narrow .pane.right {
+  display: flex;
+}
+.split-pane.narrow .pane.right .pane-content {
+  width: 100%;
+  flex: 1 1 auto;
 }
 </style>

@@ -257,6 +257,18 @@ function imageSrc(absPath: string): string {
   max-height: 56vh;
 }
 
+/* Phones / small tablets: the row grid already collapses to one column
+ * (auto-fit min 360px); just keep each image from eating the whole screen
+ * so users can scroll between the stacked compare cards comfortably. */
+@media (max-width: 1000px) {
+  .viz-img {
+    max-height: 52vh;
+  }
+  .viz-stack.row .viz-img {
+    max-height: 48vh;
+  }
+}
+
 .viz-caption {
   margin: 0;
   padding: 10px 14px 14px;

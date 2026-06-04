@@ -37,7 +37,7 @@
         <button class="zoom-btn" title="Fit to range" @click="onFit">Fit</button>
         <button class="zoom-btn" title="Zoom in" @click="onZoomIn">+</button>
       </div>
-      <span class="hint muted">Drag scrollbar or scroll wheel to navigate · click empty track to seek</span>
+      <span class="hint muted">Swipe, drag, or scroll to navigate · tap an empty track to seek</span>
       <span class="range-readout muted">{{ rangeLabel }}</span>
     </div>
   </div>
@@ -427,11 +427,25 @@ onBeforeUnmount(() => {
 .zoom-btn:last-child {
   border-right: none;
 }
-.zoom-btn:hover {
+.zoom-btn:hover,
+.zoom-btn:active {
   background: var(--color-border);
 }
 .hint {
   flex: 1;
+}
+
+/* Touch: enlarge the zoom/jump buttons to comfortable tap targets and let the
+ * bottom bar wrap instead of clipping the hint on a narrow screen. */
+@media (hover: none) {
+  .zoom-btn {
+    min-width: 42px;
+    padding: 9px 12px;
+  }
+  .bar {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
 }
 .range-readout {
   font-variant-numeric: tabular-nums;
