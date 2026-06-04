@@ -91,7 +91,9 @@ function showRipple(clientX: number, clientY: number): void {
 // Drag-to-pan for touch/pen. Desktop mouse keeps its existing wheel/scrollbar
 // scrolling untouched (we ignore mouse here). A tap (no drag) shows the ripple;
 // Pixi separately handles the seek/selection for that tap.
-const PAN_TOLERANCE = 4;
+// Matches the timeline's tap tolerance: a finger must move more than this
+// before it pans, so small jitter during a tap still seeks instead of panning.
+const PAN_TOLERANCE = 5;
 let panId: number | null = null;
 let panStartX = 0;
 let panStartY = 0;

@@ -87,20 +87,15 @@ const ui = useUIStore();
   color: var(--color-muted);
 }
 
-/* Phones / small tablets: the panel stacks into the page scroll, so it takes
- * its natural height and the video + timeline get explicit (viewport-relative)
- * heights instead of filling the screen. Desktop heights above are unchanged. */
+/* Phones / small tablets: the Viewer fills its (bounded) side-by-side cell, so
+ * keep the desktop fill behaviour but with smaller floors and a shorter
+ * timeline so the narrower video still has room. Desktop is unchanged. */
 @media (max-width: 1000px) {
-  .center-panel {
-    height: auto;
-  }
   .video-region {
-    flex: 0 0 auto;
-    height: 46vh;
-    min-height: 200px;
+    min-height: 110px;
   }
   .timeline-region {
-    height: 200px;
+    height: 150px;
   }
 }
 </style>

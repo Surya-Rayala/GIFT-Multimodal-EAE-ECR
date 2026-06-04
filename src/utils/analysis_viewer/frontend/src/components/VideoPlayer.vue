@@ -47,6 +47,14 @@ const props = defineProps<{
 // latched intent, the next readiness event resumes it without user input.
 let desiredPlaying = false;
 
+// Latched desired seek target. Mobile browsers often downgrade ``preload`` to
+// save data, so a ``currentTime = …`` issued right after a timeline tap can be
+// ignored because the element isn't ready / buffered yet (selection ring shows,
+// but the video never moves — typically only on slower small phones). We record
+// the intent and re-apply it on the next readiness event (loadedmetadata /
+// canplay / seeked) so the seek eventually lands.
+let desiredSeekTime: number | null = null;
+
 const emit = defineEmits<{
   frame: [frameIdx: number, timeSec: number];
   ready: [duration: number, totalFrames: number];
@@ -92,6 +100,7 @@ function onLoadedMetadata(): void {
   if (props.role === 'primary') {
     stopFrameLoop();
     startFrameLoop();
+    applyDesiredSeek();
     applyDesiredPlayState();
     return;
   }
@@ -105,8 +114,24 @@ function onLoadedMetadata(): void {
 function onCanPlay(): void {
   // Fired whenever enough data is buffered to play forward — including
   // after a seek. Reapplying the desired state here is what unsticks aux
-  // when its initial autoplay raced the buffer and silently rejected.
+  // when its initial autoplay raced the buffer and silently rejected, and
+  // lands a seek that was requested before the element was ready.
+  applyDesiredSeek();
   applyDesiredPlayState();
+}
+
+function isReady(v: HTMLVideoElement): boolean {
+  return !Number.isNaN(v.duration) && Number.isFinite(v.duration);
+}
+
+function applyDesiredSeek(): void {
+  const v = videoEl.value;
+  if (!v || desiredSeekTime == null || !isReady(v)) return;
+  const target = Math.max(0, Math.min(v.duration, desiredSeekTime));
+  // Clear first: setting currentTime can synchronously fire 'seeked', which
+  // re-enters this function — without clearing we'd loop.
+  desiredSeekTime = null;
+  v.currentTime = target;
 }
 
 function applyDesiredPlayState(): void {
@@ -199,7 +224,10 @@ defineExpose({
     applyDesiredPlayState();
   },
   seek: (timeSec: number) => {
-    if (videoEl.value) videoEl.value.currentTime = timeSec;
+    // Latch + apply: if the element isn't ready yet (common on small phones
+    // with throttled preload), the readiness handlers re-apply it.
+    desiredSeekTime = timeSec;
+    applyDesiredSeek();
   },
   setRate: (rate: number) => {
     if (videoEl.value) videoEl.value.playbackRate = rate;

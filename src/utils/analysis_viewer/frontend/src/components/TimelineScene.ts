@@ -146,7 +146,7 @@ const BAR_HIT_VPAD = 4;
 
 // Max pointer movement (in px) between pointerdown and pointerup that still
 // counts as a tap rather than a drag-pan. Matches MapperCanvas's threshold.
-const TAP_TOLERANCE_PX = 4;
+const TAP_TOLERANCE_PX = 5;
 
 const METRIC_STACK_START_Y = 8;
 const ROW_HEIGHT = 16;

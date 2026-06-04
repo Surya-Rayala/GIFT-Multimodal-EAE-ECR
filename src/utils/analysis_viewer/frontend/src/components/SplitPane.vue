@@ -9,19 +9,7 @@
          — no tab-switching. Desktop/laptop (and wide/landscape tablets) keep
          the original 3-pane grid, unchanged. -->
     <div class="pane left">
-      <button
-        v-if="isNarrow"
-        class="m-head"
-        :class="{ collapsed: collapsed.left }"
-        :aria-expanded="!collapsed.left"
-        @click="toggleSection('left')"
-      >
-        <svg class="m-chev" viewBox="0 0 12 12" width="11" height="11" aria-hidden="true">
-          <polyline points="3,4.5 6,7.5 9,4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
-        </svg>
-        <span class="m-title">Session</span>
-      </button>
-      <div class="pane-body" v-show="!isNarrow || !collapsed.left"><slot name="left" /></div>
+      <div class="pane-body"><slot name="left" /></div>
     </div>
 
     <div
@@ -32,19 +20,7 @@
     ></div>
 
     <div class="pane center">
-      <button
-        v-if="isNarrow"
-        class="m-head"
-        :class="{ collapsed: collapsed.center }"
-        :aria-expanded="!collapsed.center"
-        @click="toggleSection('center')"
-      >
-        <svg class="m-chev" viewBox="0 0 12 12" width="11" height="11" aria-hidden="true">
-          <polyline points="3,4.5 6,7.5 9,4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
-        </svg>
-        <span class="m-title">Viewer</span>
-      </button>
-      <div class="pane-body" v-show="!isNarrow || !collapsed.center"><slot name="center" /></div>
+      <div class="pane-body"><slot name="center" /></div>
     </div>
 
     <template v-if="!isNarrow">
@@ -64,9 +40,9 @@
       <button
         v-if="isNarrow"
         class="m-head"
-        :class="{ collapsed: collapsed.right }"
-        :aria-expanded="!collapsed.right"
-        @click="toggleSection('right')"
+        :class="{ collapsed: !detailsOpen }"
+        :aria-expanded="detailsOpen"
+        @click="detailsOpen = !detailsOpen"
       >
         <svg class="m-chev" viewBox="0 0 12 12" width="11" height="11" aria-hidden="true">
           <polyline points="3,4.5 6,7.5 9,4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
@@ -99,7 +75,7 @@
         </svg>
       </button>
       <div
-        v-show="isNarrow ? !collapsed.right : !ui.rightCollapsed"
+        v-show="isNarrow ? detailsOpen : !ui.rightCollapsed"
         class="pane-content"
       >
         <slot name="right" />
@@ -124,16 +100,10 @@ const isNarrow = ref(
   typeof window !== 'undefined' && window.matchMedia(NARROW_QUERY).matches,
 );
 
-// Per-section collapse state — only used in the narrow stacked layout. All
-// expanded by default so the first view shows everything.
-const collapsed = ref<{ left: boolean; center: boolean; right: boolean }>({
-  left: false,
-  center: false,
-  right: false,
-});
-function toggleSection(key: 'left' | 'center' | 'right'): void {
-  collapsed.value[key] = !collapsed.value[key];
-}
+// Narrow layout: Session + Viewer sit side by side; Details is a dropdown along
+// the bottom, collapsed by default so the main area gets full height. Tap the
+// "Details" bar to open it.
+const detailsOpen = ref(false);
 
 let mql: MediaQueryList | null = null;
 function syncNarrow(): void {
@@ -298,52 +268,55 @@ onBeforeUnmount(() => {
 }
 
 /* ----------------------------------------------------------------------
- * Narrow layout (phones / small & portrait tablets): the three areas stack
- * into one scrolling column. Each pane takes its natural height (panels are
- * height:100% → resolves to content height under an auto-height parent), so
- * the whole column scrolls as a single page — no nested scrollbars, no tabs.
- * Desktop styles above are untouched. */
+ * Narrow layout (phones / small & portrait tablets): Session and Viewer sit
+ * side by side (like desktop, minus the resizers) so tapping a flag updates the
+ * viewer without scrolling; Details collapses into a dropdown along the bottom.
+ * Each area scrolls internally, just like desktop. Desktop styles above are
+ * untouched. */
 .split-pane.narrow {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: minmax(116px, 36%) 1fr;
+  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-areas:
+    'left center'
+    'right right';
   height: 100%;
-  overflow-y: auto;
-  -webkit-overflow-scrolling: touch;
-}
-.split-pane.narrow .pane {
-  width: 100%;
-  height: auto;
-  flex: 0 0 auto;
-  overflow: visible;
-}
-/* Primary content (video + timeline) on top, then session, then details. */
-.split-pane.narrow .pane.center {
-  order: 0;
+  overflow: hidden;
 }
 .split-pane.narrow .pane.left {
-  order: 1;
+  grid-area: left;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  border-right: 1px solid var(--color-border);
+}
+.split-pane.narrow .pane.center {
+  grid-area: center;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
 }
 .split-pane.narrow .pane.right {
-  order: 2;
+  grid-area: right;
   display: flex;
   flex-direction: column;
+  min-height: 0;
+  border-top: 1px solid var(--color-border);
 }
 .split-pane.narrow .pane.right .pane-content {
   width: 100%;
-  height: auto;
-  overflow: visible;
+  max-height: 45vh;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
-/* Pane body wrapper: fills the pane on desktop, flows on mobile. */
+/* Pane body wrapper: fills the pane on desktop and inside the narrow grid. */
 .pane-body {
   height: 100%;
   min-height: 0;
 }
-.split-pane.narrow .pane-body {
-  height: auto;
-}
 
-/* Collapsible section headers — narrow layout only. */
+/* Details dropdown header — narrow layout only. */
 .m-head {
   display: none;
 }
@@ -356,8 +329,6 @@ onBeforeUnmount(() => {
   padding: 0 14px;
   background: var(--color-bg-elev);
   border: none;
-  border-top: 1px solid var(--color-border);
-  border-bottom: 1px solid var(--color-border);
   color: var(--color-text-secondary);
   font-size: 0.74em;
   font-weight: 700;
