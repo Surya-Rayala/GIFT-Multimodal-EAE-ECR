@@ -93,10 +93,12 @@ The runtime auto-selects per device:
 | cpu  | ONNX-CPU-EP → TorchScript → PyTorch |
 | mps  | TorchScript-MPS → PyTorch (ONNX/CoreML skipped — graph fragments) |
 
-Confirm which backend was picked:
+Confirm which backend gets picked **for a given device** — the choice is
+device-specific, so pass the device you actually run on (`cpu`, `cuda`, or `mps`):
 
 ```bash
-python -c "from libs.giftpose.runtime.autoselect import select_backend; print(type(select_backend('models/detect-best-mAP.pth', 'models/pose.pth', device='mps')).__name__)"
+# replace `mps` with `cpu` or `cuda` for your machine
+python -c "import sys; from libs.giftpose.runtime.autoselect import select_backend; print(type(select_backend('models/detect-best-mAP.pth', 'models/pose.pth', device=sys.argv[1])).__name__)" mps
 ```
 
 ## Desktop tools — the setup pipeline
