@@ -60,13 +60,37 @@ Prints your Hugging Face username + email when the token is valid.
 
 ### CUDA users
 
-PyTorch picks the right CUDA build at install. For the optional ONNX-CUDA backend, swap `onnxruntime` for `onnxruntime-gpu`:
+The conda env's PyTorch is **not guaranteed to be a CUDA build**, so verify and fix it.
+
+1. Check your driver / CUDA toolkit version:
+
+   ```bash
+   nvidia-smi    # note the "CUDA Version" shown top-right
+   ```
+
+2. Confirm PyTorch actually sees the GPU:
+
+   ```bash
+   python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
+   ```
+
+   If this prints `True` and a CUDA version, you're done — skip to ONNX/TensorRT below.
+
+3. If it prints `False` / `None`, install the CUDA wheel **for the version this repo pins** — `torch 2.8.*` / `torchvision 0.23.*` / `torchaudio 2.8.*` (keep this version; pyannote.audio pins `torch==2.8.0`, and a mismatch breaks the torchvision ABI). Uninstall the current build, then from <https://pytorch.org/get-started/previous-versions/> grab the **v2.8.0** command whose `cu###` matches your `nvidia-smi` CUDA version:
+
+   ```bash
+   pip uninstall -y torch torchvision torchaudio
+   # example (CUDA 12.6) — pick the cu### for YOUR toolkit from the link:
+   pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
+   ```
+
+For the optional ONNX-CUDA backend, swap `onnxruntime` for `onnxruntime-gpu`:
 
 ```bash
 pip install --force-reinstall onnxruntime-gpu
 ```
 
-For the TensorRT backend (`*.engine`), install `tensorrt` via pip per NVIDIA's pip-install guide for your CUDA version: <https://docs.nvidia.com/deeplearning/tensorrt/latest/installing-tensorrt/install-pip.html>.
+For the TensorRT backend (`*.engine`), install `tensorrt` matching your CUDA version per NVIDIA's pip guide: <https://docs.nvidia.com/deeplearning/tensorrt/latest/installing-tensorrt/install-pip.html>.
 
 ### Optional — accelerated runtime artifacts
 
