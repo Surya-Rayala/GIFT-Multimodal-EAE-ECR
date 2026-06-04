@@ -1,8 +1,9 @@
 <template>
   <div
+    ref="rootRef"
     class="split-pane"
     :class="{ narrow: isNarrow }"
-    :style="isNarrow ? undefined : gridStyle"
+    :style="isNarrow ? narrowGridStyle : gridStyle"
   >
     <!-- Phones & small/portrait tablets: the three areas stack into one
          scrolling column (video first), so everything is visible by scrolling
@@ -10,6 +11,19 @@
          the original 3-pane grid, unchanged. -->
     <div class="pane left">
       <div class="pane-body"><slot name="left" /></div>
+    </div>
+
+    <!-- Narrow: press-and-hold this grip, then drag, to resize Session|Viewer. -->
+    <div
+      v-if="isNarrow"
+      class="m-grip"
+      :class="{ active: resizing }"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Press and hold, then drag to resize"
+      @pointerdown="onGripDown"
+    >
+      <span class="m-grip-bar"></span>
     </div>
 
     <div
@@ -105,6 +119,67 @@ const isNarrow = ref(
 // "Details" bar to open it.
 const detailsOpen = ref(false);
 
+// Resizable Session|Viewer split on the narrow layout. Width of the Session
+// column as a % of the row. Adjusted only via the grip, which must be
+// press-and-held before it drags (so an accidental brush never resizes).
+const rootRef = ref<HTMLElement | null>(null);
+const mobileLeftPct = ref(36);
+const resizing = ref(false);
+const narrowGridStyle = computed(() => ({
+  gridTemplateColumns: `${mobileLeftPct.value}% 12px 1fr`,
+}));
+
+const GRIP_HOLD_MS = 280;
+let gripId: number | null = null;
+let gripHoldTimer: number | null = null;
+let gripStartX = 0;
+let gripStartPct = 0;
+let gripArmed = false;
+
+function onGripDown(ev: PointerEvent): void {
+  gripId = ev.pointerId;
+  gripStartX = ev.clientX;
+  gripStartPct = mobileLeftPct.value;
+  gripArmed = false;
+  (ev.currentTarget as HTMLElement).setPointerCapture?.(ev.pointerId);
+  // Arm only after a deliberate hold.
+  gripHoldTimer = window.setTimeout(() => {
+    gripArmed = true;
+    resizing.value = true;
+    try {
+      navigator.vibrate?.(8);
+    } catch {
+      /* vibrate unsupported — ignore */
+    }
+  }, GRIP_HOLD_MS);
+  window.addEventListener('pointermove', onGripMove);
+  window.addEventListener('pointerup', endGrip);
+  window.addEventListener('pointercancel', endGrip);
+}
+function onGripMove(ev: PointerEvent): void {
+  if (ev.pointerId !== gripId) return;
+  const dx = ev.clientX - gripStartX;
+  if (!gripArmed) {
+    // Moved before the hold armed → it's a scroll/accidental, not a resize.
+    if (Math.abs(dx) > 8) endGrip();
+    return;
+  }
+  const w = rootRef.value?.clientWidth || window.innerWidth || 1;
+  mobileLeftPct.value = clamp(gripStartPct + (dx / w) * 100, 24, 60);
+}
+function endGrip(): void {
+  if (gripHoldTimer != null) {
+    clearTimeout(gripHoldTimer);
+    gripHoldTimer = null;
+  }
+  gripId = null;
+  gripArmed = false;
+  resizing.value = false;
+  window.removeEventListener('pointermove', onGripMove);
+  window.removeEventListener('pointerup', endGrip);
+  window.removeEventListener('pointercancel', endGrip);
+}
+
 let mql: MediaQueryList | null = null;
 function syncNarrow(): void {
   isNarrow.value = mql?.matches ?? false;
@@ -175,6 +250,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   mql?.removeEventListener('change', syncNarrow);
   onPointerUp();
+  endGrip();
 });
 </script>
 
@@ -275,11 +351,11 @@ onBeforeUnmount(() => {
  * untouched. */
 .split-pane.narrow {
   display: grid;
-  grid-template-columns: minmax(116px, 36%) 1fr;
+  /* grid-template-columns is set inline (resizable Session width). */
   grid-template-rows: minmax(0, 1fr) auto;
   grid-template-areas:
-    'left center'
-    'right right';
+    'left grip center'
+    'right right right';
   height: 100%;
   overflow: hidden;
 }
@@ -288,7 +364,44 @@ onBeforeUnmount(() => {
   height: 100%;
   min-height: 0;
   overflow: hidden;
-  border-right: 1px solid var(--color-border);
+}
+
+/* Resize grip between Session and Viewer (narrow only). */
+.m-grip {
+  display: none;
+}
+.split-pane.narrow .m-grip {
+  grid-area: grip;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  background: var(--color-border);
+  cursor: col-resize;
+  touch-action: none;
+}
+.split-pane.narrow .m-grip.active {
+  background: var(--color-accent);
+}
+/* Widen the touch target beyond the thin visible column. */
+.split-pane.narrow .m-grip::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -9px;
+  right: -9px;
+}
+.m-grip-bar {
+  width: 3px;
+  height: 36px;
+  border-radius: 2px;
+  background: var(--color-muted);
+  pointer-events: none;
+}
+.split-pane.narrow .m-grip.active .m-grip-bar {
+  background: var(--color-bg);
 }
 .split-pane.narrow .pane.center {
   grid-area: center;
