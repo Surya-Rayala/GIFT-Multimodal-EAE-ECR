@@ -4,25 +4,25 @@
     :class="{ narrow: isNarrow }"
     :style="isNarrow ? undefined : gridStyle"
   >
-    <!-- Phones & portrait tablets: one pane on screen at a time, picked by a
-         tab bar. Panes stay mounted (v-show) so the video keeps playing when
-         you switch tabs. Desktop/laptop (and wide/landscape tablets) keep the
-         original 3-pane grid below, unchanged. -->
-    <nav v-if="isNarrow" class="mobile-tabs" role="tablist">
+    <!-- Phones & small/portrait tablets: the three areas stack into one
+         scrolling column (video first), so everything is visible by scrolling
+         — no tab-switching. Desktop/laptop (and wide/landscape tablets) keep
+         the original 3-pane grid, unchanged. -->
+    <div class="pane left">
       <button
-        v-for="t in tabs"
-        :key="t.key"
-        class="mtab"
-        :class="{ active: tab === t.key }"
-        role="tab"
-        :aria-selected="tab === t.key"
-        @click="tab = t.key"
+        v-if="isNarrow"
+        class="m-head"
+        :class="{ collapsed: collapsed.left }"
+        :aria-expanded="!collapsed.left"
+        @click="toggleSection('left')"
       >
-        {{ t.label }}
+        <svg class="m-chev" viewBox="0 0 12 12" width="11" height="11" aria-hidden="true">
+          <polyline points="3,4.5 6,7.5 9,4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span class="m-title">Session</span>
       </button>
-    </nav>
-
-    <div class="pane left" v-show="!isNarrow || tab === 'left'"><slot name="left" /></div>
+      <div class="pane-body" v-show="!isNarrow || !collapsed.left"><slot name="left" /></div>
+    </div>
 
     <div
       v-if="!isNarrow"
@@ -31,7 +31,21 @@
       @pointerdown="onPointerDown('left', $event)"
     ></div>
 
-    <div class="pane center" v-show="!isNarrow || tab === 'center'"><slot name="center" /></div>
+    <div class="pane center">
+      <button
+        v-if="isNarrow"
+        class="m-head"
+        :class="{ collapsed: collapsed.center }"
+        :aria-expanded="!collapsed.center"
+        @click="toggleSection('center')"
+      >
+        <svg class="m-chev" viewBox="0 0 12 12" width="11" height="11" aria-hidden="true">
+          <polyline points="3,4.5 6,7.5 9,4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span class="m-title">Viewer</span>
+      </button>
+      <div class="pane-body" v-show="!isNarrow || !collapsed.center"><slot name="center" /></div>
+    </div>
 
     <template v-if="!isNarrow">
       <div
@@ -45,9 +59,20 @@
 
     <div
       class="pane right"
-      v-show="!isNarrow || tab === 'right'"
       :class="{ collapsed: !isNarrow && ui.rightCollapsed }"
     >
+      <button
+        v-if="isNarrow"
+        class="m-head"
+        :class="{ collapsed: collapsed.right }"
+        :aria-expanded="!collapsed.right"
+        @click="toggleSection('right')"
+      >
+        <svg class="m-chev" viewBox="0 0 12 12" width="11" height="11" aria-hidden="true">
+          <polyline points="3,4.5 6,7.5 9,4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span class="m-title">Details</span>
+      </button>
       <button
         v-if="!isNarrow"
         class="collapse-toggle"
@@ -73,7 +98,10 @@
           />
         </svg>
       </button>
-      <div v-show="isNarrow || !ui.rightCollapsed" class="pane-content">
+      <div
+        v-show="isNarrow ? !collapsed.right : !ui.rightCollapsed"
+        class="pane-content"
+      >
         <slot name="right" />
       </div>
     </div>
@@ -86,21 +114,27 @@ import { useUIStore } from '@/stores/ui';
 
 const ui = useUIStore();
 
-// Below this width we drop the 3-pane grid for a tabbed single-pane layout
-// (phones, small/portrait tablets). At/above it, the desktop grid is used —
-// so laptops and wide/landscape tablets are unaffected.
+// Below this width we drop the 3-pane grid for a single stacked, scrolling
+// column (phones, small/portrait tablets). At/above it, the desktop grid is
+// used — so laptops and wide/landscape tablets are unaffected.
 const NARROW_QUERY = '(max-width: 1000px)';
 // Seed synchronously so the correct layout paints on first render (no flash
-// from desktop→tabs on a phone). The listener in onMounted keeps it live.
+// from grid→stack on a phone). The listener in onMounted keeps it live.
 const isNarrow = ref(
   typeof window !== 'undefined' && window.matchMedia(NARROW_QUERY).matches,
 );
-const tab = ref<'left' | 'center' | 'right'>('center');
-const tabs = [
-  { key: 'left' as const, label: 'Sessions' },
-  { key: 'center' as const, label: 'Viewer' },
-  { key: 'right' as const, label: 'Details' },
-];
+
+// Per-section collapse state — only used in the narrow stacked layout. All
+// expanded by default so the first view shows everything.
+const collapsed = ref<{ left: boolean; center: boolean; right: boolean }>({
+  left: false,
+  center: false,
+  right: false,
+});
+function toggleSection(key: 'left' | 'center' | 'right'): void {
+  collapsed.value[key] = !collapsed.value[key];
+}
+
 let mql: MediaQueryList | null = null;
 function syncNarrow(): void {
   isNarrow.value = mql?.matches ?? false;
@@ -264,51 +298,78 @@ onBeforeUnmount(() => {
 }
 
 /* ----------------------------------------------------------------------
- * Narrow layout (phones / small & portrait tablets): a top tab bar swaps a
- * single full-screen pane. Desktop styles above are untouched. */
+ * Narrow layout (phones / small & portrait tablets): the three areas stack
+ * into one scrolling column. Each pane takes its natural height (panels are
+ * height:100% → resolves to content height under an auto-height parent), so
+ * the whole column scrolls as a single page — no nested scrollbars, no tabs.
+ * Desktop styles above are untouched. */
 .split-pane.narrow {
   display: flex;
   flex-direction: column;
+  height: 100%;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
-.mobile-tabs {
-  flex: 0 0 auto;
-  display: flex;
-  background: var(--color-bg-elev);
-  border-bottom: 1px solid var(--color-border);
-  padding-top: env(safe-area-inset-top, 0);
-}
-.mtab {
-  flex: 1 1 0;
-  min-height: 44px;
-  background: transparent;
-  color: var(--color-muted);
-  border: none;
-  border-right: 1px solid var(--color-border);
-  font-size: 0.9em;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  cursor: pointer;
-}
-.mtab:last-child {
-  border-right: none;
-}
-.mtab.active {
-  color: var(--color-text);
-  box-shadow: inset 0 -2px 0 var(--color-accent);
-}
-/* The visible pane fills the area under the tab bar; hidden panes are
- * display:none via v-show, so they don't take column space. */
 .split-pane.narrow .pane {
   width: 100%;
   height: auto;
-  flex: 1 1 auto;
-  min-height: 0;
+  flex: 0 0 auto;
+  overflow: visible;
+}
+/* Primary content (video + timeline) on top, then session, then details. */
+.split-pane.narrow .pane.center {
+  order: 0;
+}
+.split-pane.narrow .pane.left {
+  order: 1;
 }
 .split-pane.narrow .pane.right {
+  order: 2;
   display: flex;
+  flex-direction: column;
 }
 .split-pane.narrow .pane.right .pane-content {
   width: 100%;
-  flex: 1 1 auto;
+  height: auto;
+  overflow: visible;
+}
+
+/* Pane body wrapper: fills the pane on desktop, flows on mobile. */
+.pane-body {
+  height: 100%;
+  min-height: 0;
+}
+.split-pane.narrow .pane-body {
+  height: auto;
+}
+
+/* Collapsible section headers — narrow layout only. */
+.m-head {
+  display: none;
+}
+.split-pane.narrow .m-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 42px;
+  padding: 0 14px;
+  background: var(--color-bg-elev);
+  border: none;
+  border-top: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+  font-size: 0.74em;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.m-chev {
+  flex-shrink: 0;
+  transition: transform 140ms ease;
+}
+.split-pane.narrow .m-head.collapsed .m-chev {
+  transform: rotate(-90deg);
 }
 </style>
