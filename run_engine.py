@@ -1,5 +1,4 @@
 import argparse
-from distutils.log import ERROR
 import logging
 from xmlrpc.server import SimpleXMLRPCServer
 from src.processing_engine import ProcessingEngine
@@ -25,7 +24,6 @@ def main():
     # Start the XML RPC server on local host at the port specified via command line args
     server = SimpleXMLRPCServer(("localhost", args.port))
     server.logRequests = 0
-    #server.allow_none = 1
 
     # Instantiate the class used for this server instance:
     server.register_instance(ProcessingEngine(args.force_transcode))

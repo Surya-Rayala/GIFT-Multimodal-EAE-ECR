@@ -1,4 +1,3 @@
-import glob
 import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -8,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from .metric import AbstractMetric
+from ._shared import pick_latest
 
 
 class IdentifyAndCapturePods_Metric(AbstractMetric):
@@ -40,12 +40,7 @@ class IdentifyAndCapturePods_Metric(AbstractMetric):
         config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        def _pick_latest(folder: str, pattern: str) -> Optional[str]:
-            matches = glob.glob(os.path.join(folder, pattern))
-            if not matches:
-                return None
-            matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return matches[0]
+        _pick_latest = pick_latest
 
         def _load_pod_cache(folder: str) -> pd.DataFrame:
             cache_path = _pick_latest(folder, "*_PodCache.txt")
@@ -215,7 +210,7 @@ class IdentifyAndCapturePods_Metric(AbstractMetric):
             return {
                 "Name": "IDENTIFY_AND_CAPTURE_POD",
                 "Type": "SideBySide",
-                "ExpertImageLocation": expert_img_path,
+                "ReferenceImageLocation": expert_img_path,
                 "TraineeImageLocation": trainee_img_path,
                 "TxtLocation": txt_path,
                 "Text": err_text,
@@ -427,7 +422,7 @@ class IdentifyAndCapturePods_Metric(AbstractMetric):
         return {
             "Name": "IDENTIFY_AND_CAPTURE_POD",
             "Type": "SideBySide",
-            "ExpertImageLocation": expert_img_path,
+            "ReferenceImageLocation": expert_img_path,
             "TraineeImageLocation": trainee_img_path,
             "TxtLocation": txt_path,
             "Text": text,

@@ -1,0 +1,38 @@
+# macOS
+.DS_Store
+
+# Editor / agent local config
+.claude/
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Node / Rust / Tauri build artifacts (regenerated on first launch)
+node_modules/
+dist/
+dist-ssr/
+.vite/
+.build/
+**/src-tauri/target/
+**/src-tauri/gen/schemas/
+.node/
+
+# Data / weights / scratch — never shared; supplied separately or regenerated
+/output/*
+/models/*
+/work_dirs/
+/tests/
+
+# Keep the input folder present but empty when shared
+/input/*
+
+# Developer-only doc
+DESCRIPTION.md
+
+# Keep the .gitkeep placeholders that hold empty dirs in git
+!**/.gitkeep

@@ -1,4 +1,3 @@
-import glob
 import os
 from typing import List, Optional, Tuple
 
@@ -7,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from .metric import AbstractMetric
+from ._shared import pick_latest
 
 
 class RoomCoverage_Metric(AbstractMetric):
@@ -30,12 +30,7 @@ class RoomCoverage_Metric(AbstractMetric):
 
     @staticmethod
     def expertCompare(session_folder: str, expert_folder: str, map_image=None, config=None):
-        def _pick_latest(folder: str, pattern: str) -> Optional[str]:
-            matches = glob.glob(os.path.join(folder, pattern))
-            if not matches:
-                return None
-            matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return matches[0]
+        _pick_latest = pick_latest
 
         def _load_room_coverage_cache(folder: str) -> Tuple[pd.DataFrame, dict]:
             path = _pick_latest(folder, "*_RoomCoverageCache.txt")

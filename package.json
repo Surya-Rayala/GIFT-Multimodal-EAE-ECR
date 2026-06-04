@@ -1,0 +1,11 @@
+{
+  "name": "gift-multimodal-viewers",
+  "version": "0.1.0",
+  "private": true,
+  "description": "npm workspace root for the GIFT desktop viewers — one hoisted node_modules shared by all three Tauri + Vue frontends (scaled point / mapper / analysis).",
+  "workspaces": [
+    "src/utils/scaled_point_viewer/frontend",
+    "src/utils/mapper_viewer/frontend",
+    "src/utils/analysis_viewer/frontend"
+  ]
+}

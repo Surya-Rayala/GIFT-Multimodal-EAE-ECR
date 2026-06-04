@@ -1,12 +1,22 @@
 import json
 import logging
 import os
+import threading
 import warnings
 from typing import Dict, List, Optional, Tuple
 
+# torchvision's image extension imports a host libjpeg.9.dylib that the conda
+# stack does not ship — we never use ``torchvision.io``, so silence its
+# import-time warning before the first transitive import of torchvision.
+warnings.filterwarnings(
+    "ignore",
+    message="Failed to load image Python extension.*",
+    category=UserWarning,
+)
+
 import cv2
 import numpy as np
-from mmpose.apis import MMPoseInferencer
+from libs.giftpose.inferencer import MMPoseInferencer
 from shapely.geometry import Point, Polygon
 from shapely.ops import nearest_points
 from tqdm import tqdm
@@ -35,9 +45,22 @@ from src.helper_functions import (
 )
 
 from .metrics import *
+from .metrics._shared import load_door_axes
 from .metrics.context import MetricContext
+from .metrics.metric import AbstractMetric
+from .analysis import build_analysis_session
+from .utils.audio import attach_audio_in_place, has_audio_stream
 from .utils.config import load_config, load_vmeta
+from .utils.run_info import load_run_info, make_run_id, save_run_info
+from .utils.run_metadata import load_run_metadata, save_run_metadata
+from .utils.drill_window import (
+    DrillWindow,
+    compute_drill_window,
+    find_drill_start_frame,
+    save_drill_window_sidecar,
+)
 from .utils.transcode import transcode
+from .utils.transcription import transcribe_video
 from .utils.video import count_video_frames, get_video_framerate
 from .utils.vmeta import generate_vmeta
 
@@ -45,8 +68,6 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-logging.getLogger("mmengine").setLevel(logging.ERROR)
-logging.getLogger("mmdet").setLevel(logging.ERROR)
 logging.getLogger("libs.Track.trackers.basetracker").setLevel(logging.ERROR)
 
 
@@ -62,11 +83,245 @@ VIS_VMETA_SUFFIX: Dict[str, str] = {
 }
 
 DEFAULT_ENABLED_VISUALIZATIONS: List[str] = [
+    # Visualizations produced on every run, regardless of which metrics are
+    # active. Each one declares its compute dependencies in
+    # ``VIS_COMPUTE_DEPS`` below — enabling a viz here automatically pulls
+    # in the helpers it needs. Plain camera/map tracking is dependency-free;
+    # the gaze pair only needs the per-frame gaze vectors that the pose
+    # loop already produces, so it's free to keep on.
+    "annotate_camera_video",
+    "annotate_map_video",
     "annotate_camera_with_gaze_triangle",
     "annotate_map_with_gaze",
-    "annotate_map_pod_with_paths_video",
-    "annotate_camera_tracking_with_clearance",
 ]
+
+# Master toggle for which metrics run during ``ProcessingEngine.__assess()``.
+# Disabled entries keep their class definitions intact (still imported via
+# ``from .metrics import *``) so re-enabling is a one-line flip here. The
+# downstream heavy-compute helpers (POD analysis, threat clearance, room
+# coverage) are gated below against METRIC_COMPUTE_DEPS so flipping a metric
+# back on automatically restores its inputs.
+ENABLED_METRICS: Dict[str, bool] = {
+    "EntranceVectors_Metric": True,
+    "EntranceHesitation_Metric": True,
+    "TotalEntryTime_Metric": True,
+    "MoveAlongWall_Metric": True,
+    "IdentifyAndCapturePods_Metric": False,
+    "CapturePodTime_Metric": False,
+    "ThreatClearance_Metric": False,
+    "TeammateCoverage_Metric": False,
+    "ThreatCoverage_Metric": False,
+    "RoomCoverage_Metric": False,
+    "TotalRoomCoverageTime_Metric": False,
+}
+
+# Compute families — each name is a feature flag that, when True, makes the
+# corresponding helper run inside ``__assess``. The dependency maps below
+# resolve to a set of these names per active metric / visualization.
+#
+#   "pod"              → run_pod_analysis (assignment, dynamic_work_areas,
+#                        pod_capture_data; populates context.pod_capture)
+#   "threat_clearance" → compute_threat_clearance (clearance_map; populates
+#                        context.threat_clearance)
+#   "room_coverage"    → compute_room_coverage (coverage_data; populates
+#                        context.room_coverage)
+#
+# Future compute families: declare the constant here, give it a gating
+# branch in ``__assess``, and add it to whichever metrics / visualizations
+# need it.
+METRIC_COMPUTE_DEPS: Dict[str, frozenset] = {
+    "EntranceVectors_Metric": frozenset(),
+    "EntranceHesitation_Metric": frozenset(),
+    "TotalEntryTime_Metric": frozenset(),
+    # MoveAlongWall reads pod_capture for per-track end-frames but treats it
+    # as optional (empty dict → full scoring window). Per product spec wall
+    # adherence is scored from frame 1 → drill_end_frame, so we deliberately
+    # don't pull POD in for it.
+    "MoveAlongWall_Metric": frozenset(),
+    "IdentifyAndCapturePods_Metric": frozenset({"pod"}),
+    "CapturePodTime_Metric": frozenset({"pod"}),
+    "ThreatClearance_Metric": frozenset({"threat_clearance"}),
+    "TeammateCoverage_Metric": frozenset({"room_coverage"}),
+    "ThreatCoverage_Metric": frozenset({"room_coverage"}),
+    "RoomCoverage_Metric": frozenset({"room_coverage"}),
+    "TotalRoomCoverageTime_Metric": frozenset({"room_coverage"}),
+}
+
+VIS_COMPUTE_DEPS: Dict[str, frozenset] = {
+    "annotate_camera_video": frozenset(),
+    "annotate_camera_with_gaze_triangle": frozenset(),
+    "annotate_map_video": frozenset(),
+    "annotate_map_with_gaze": frozenset(),
+    "annotate_clearance_video": frozenset({"threat_clearance"}),
+    "annotate_camera_tracking_with_clearance": frozenset({"threat_clearance"}),
+    "annotate_map_pod_video": frozenset({"pod"}),
+    "annotate_map_pod_with_paths_video": frozenset({"pod"}),
+}
+
+
+# Human-readable labels for the comparison payload. Keyed by upper-snake metric
+# id as understood by ``compare_expert``.
+_COMPARE_METRIC_LABELS: Dict[str, str] = {
+    "ENTRANCE_HESITATION": "Entrance Hesitation",
+    "ENTRANCE_VECTORS": "Entrance Vectors",
+    "STAY_ALONG_WALL": "Stay Along Wall",
+    "IDENTIFY_AND_HOLD_DESIGNATED_AREA": "Hold Designated Area",
+    "TOTAL_TIME_OF_ENTRY": "Total Time of Entry",
+    "IDENTIFY_AND_CAPTURE_POD": "Identify & Capture PODs",
+    "POD_CAPTURE_TIME": "POD Capture Time",
+    "THREAT_CLEARANCE": "Threat Clearance",
+    "TEAMMATE_COVERAGE": "Teammate Coverage",
+    "THREAT_COVERAGE": "Threat Coverage",
+    "FLOOR_COVERAGE": "Floor Coverage",
+    "TOTAL_FLOOR_COVERAGE_TIME": "Total Floor Coverage Time",
+}
+
+
+# Default visualization captions per metric id. Two-image metrics use
+# ("current", "other") tuple ordering; one-image metrics use a single string.
+# Layman-friendly, no jargon. Each caption is written from the trainee's POV.
+_COMPARE_CAPTIONS: Dict[str, Tuple[str, ...]] = {
+    "ENTRANCE_VECTORS": (
+        "Your team's entry directions. Each arrow shows where one teammate was facing as they crossed the door.",
+        "The reference team's entry directions. Compare how the arrows fan out across sides.",
+    ),
+    "ENTRANCE_HESITATION": (
+        "Pause time at the door per entrant — shorter bars are better. Your run vs the reference are overlaid for direct comparison.",
+    ),
+    "TOTAL_TIME_OF_ENTRY": (
+        "Total elapsed time from the first to the last entrant. Shorter is generally better.",
+    ),
+    "STAY_ALONG_WALL": (
+        "Your team's paths from door to first position. Lines staying close to the walls (the shaded safe band) are preferred.",
+        "The reference team's paths along the wall.",
+    ),
+    "IDENTIFY_AND_CAPTURE_POD": (
+        "Which Points-Of-Domination (PODs) your team identified and reached.",
+        "The reference team's POD coverage.",
+    ),
+    "IDENTIFY_AND_HOLD_DESIGNATED_AREA": (
+        "Designated areas your team held over the drill.",
+        "The reference team's designated-area coverage.",
+    ),
+    "POD_CAPTURE_TIME": (
+        "Time-to-capture for each POD. Shorter bars are better.",
+    ),
+    "THREAT_CLEARANCE": (
+        "Where and when threats were cleared during the drill.",
+    ),
+    "THREAT_COVERAGE": (
+        "Visual coverage of threats over time.",
+    ),
+    "TEAMMATE_COVERAGE": (
+        "How well teammates covered each other's sectors.",
+    ),
+    "FLOOR_COVERAGE": (
+        "Heatmap of where the room was visually swept. Brighter areas were attended to more.",
+    ),
+    "TOTAL_FLOOR_COVERAGE_TIME": (
+        "How long the floor was under visual coverage. Longer / fuller is better.",
+    ),
+}
+
+
+def _read_metrics_csv(run_dir: str) -> Dict[str, float]:
+    """Return ``{metric_name: score}`` from a run folder's ``*_Metrics.csv``.
+
+    Used to populate the comparison payload with the score the live engine
+    actually computed, without re-running ``metric.getFinalScore`` against
+    cached data.
+    """
+    import csv as _csv
+    import glob as _glob
+
+    matches = _glob.glob(os.path.join(run_dir, "*_Metrics.csv"))
+    if not matches:
+        return {}
+    matches.sort(key=os.path.getmtime, reverse=True)
+    out: Dict[str, float] = {}
+    try:
+        with open(matches[0], "r", encoding="utf-8", newline="") as fh:
+            reader = _csv.DictReader(fh)
+            for row in reader:
+                name = (row.get("metric_name") or "").strip()
+                if not name:
+                    continue
+                try:
+                    out[name] = float(row.get("score") or 0.0)
+                except (TypeError, ValueError):
+                    pass
+    except OSError:
+        return {}
+    return out
+
+
+def _harvest_visualizations(
+    legacy: Dict[str, object],
+    metric_id: str,
+    source_dir: str,
+    output_dir: str,
+) -> List[Dict[str, object]]:
+    """Move legacy comparison images out of the run folder into ``output_dir``.
+
+    The legacy ``expertCompare`` return dict carries image paths under various
+    keys (``ImgLocation``, ``ReferenceImageLocation``, ``TraineeImageLocation``).
+    We move each into ``output_dir`` and pair it with a per-metric caption so
+    the viewer never sees the verbose legacy ``Text`` / ``TxtLocation`` fields.
+    """
+    import shutil as _shutil
+
+    if not isinstance(legacy, dict):
+        return []
+
+    captions = _COMPARE_CAPTIONS.get(metric_id, ())
+
+    def _emit(src: Optional[str], default_label: str, caption_idx: int) -> Optional[Dict[str, object]]:
+        if not isinstance(src, str) or not src:
+            return None
+        if not os.path.isfile(src):
+            return None
+        dest = os.path.join(output_dir, os.path.basename(src))
+        try:
+            if os.path.abspath(src) != os.path.abspath(dest):
+                _shutil.move(src, dest)
+        except OSError:
+            try:
+                _shutil.copyfile(src, dest)
+            except OSError:
+                return None
+        caption = captions[caption_idx] if caption_idx < len(captions) else ""
+        return {
+            "image_path": os.path.abspath(dest),
+            "label": default_label,
+            "caption": caption,
+        }
+
+    out: List[Dict[str, object]] = []
+    trainee_img = legacy.get("TraineeImageLocation") or legacy.get("ImgLocation")
+    reference_img = legacy.get("ReferenceImageLocation")
+
+    if trainee_img and reference_img:
+        a = _emit(trainee_img, "Your run", 0)
+        b = _emit(reference_img, "Reference", 1)
+        if a is not None:
+            out.append(a)
+        if b is not None:
+            out.append(b)
+    elif trainee_img:
+        a = _emit(trainee_img, "Comparison", 0)
+        if a is not None:
+            out.append(a)
+
+    # Discard any legacy TXT dumps to keep the run folder clean and avoid
+    # leaking the verbose tabular content into the new payload.
+    txt = legacy.get("TxtLocation")
+    if isinstance(txt, str) and os.path.isfile(txt):
+        try:
+            os.remove(txt)
+        except OSError:
+            pass
+
+    return out
 
 
 class ProcessingEngine:
@@ -86,16 +341,17 @@ class ProcessingEngine:
         if vmeta_path is None:
             return
 
-        point_mapping_path = os.path.join(os.path.dirname(vmeta_path), self.config["point_mapping_path"])
+        # ``load_config`` already resolved point_mapping_path to absolute via
+        # the central path-anchor registry; no further joining needed.
         self.mapper = load_pixel_mapper(
-            point_mapping_path,
+            self.config["point_mapping_path"],
             ransac_reproj_threshold=float(self.config.get("homography_ransac_thresh", 3.0)),
             confidence=float(self.config.get("homography_confidence", 0.999)),
             max_iters=int(self.config.get("homography_max_iters", 2000)),
         )
 
-        entry_polys_path = os.path.join(os.path.dirname(vmeta_path), self.config["entry_polys_path"])
-        self.entry_polys = load_entry_polygons(entry_polys_path)
+        # entry_polys_path is also pre-resolved by load_config.
+        self.entry_polys = load_entry_polygons(self.config["entry_polys_path"])
 
         self.boundary = self.config.get("Boundary", None)
         if self.boundary is not None and not hasattr(self.boundary, "contains"):
@@ -113,6 +369,8 @@ class ProcessingEngine:
             det_model=self.config["det_model"],
             det_weights=self.config["det_weights"],
             det_cat_ids=self.config.get("det_cat_ids", (0,)),
+            flip_test=self.config.get("flip_test"),
+            compile_for_inference=self.config.get("compile_for_inference"),
         )
 
         self.tracker = OCSORT(
@@ -181,11 +439,14 @@ class ProcessingEngine:
         self.msg_keys = all_keys
 
     def __load_config(self, vmeta_path, output_path):
-        config_path, video_path, start_time = load_vmeta(vmeta_path)
+        config_path, video_path, start_time, role, title = load_vmeta(vmeta_path)
         config = load_config(config_path)
         config["start_time"] = start_time
         config["video_path"] = video_path
         config["output_path"] = output_path
+        config["role"] = role
+        config["title"] = title
+        config["vmeta_path"] = os.path.abspath(vmeta_path)
         if self.force_transcode:
             video_path = transcode(video_path)
         fps = get_video_framerate(video_path)
@@ -257,27 +518,154 @@ class ProcessingEngine:
         min_threat_interaction_time_sec = float(config.get("min_threat_interaction_time_sec", 1.0))
         threat_interaction_frames = int(min_threat_interaction_time_sec * config.get("frame_rate", 30.0))
 
-        metrics: List[AbstractMetric] = [
-            IdentifyAndCapturePods_Metric(config),
-            CapturePodTime_Metric(config),
-            MoveAlongWall_Metric(config),
-            EntranceVectors_Metric(config),
-            EntranceHesitation_Metric(config),
-            ThreatClearance_Metric(config),
-            TeammateCoverage_Metric(config),
-            ThreatCoverage_Metric(config),
-            RoomCoverage_Metric(config),
-            TotalRoomCoverageTime_Metric(config),
+        # (name, class) pairs filtered by ``ENABLED_METRICS`` — disabled
+        # entries are skipped here so their ``process(ctx)`` never runs and
+        # no metric_flags / scores are emitted for them. Class imports stay
+        # intact so flipping the toggle re-enables a metric without code
+        # changes anywhere else.
+        _candidate_metrics: List[Tuple[str, type]] = [
+            ("EntranceVectors_Metric", EntranceVectors_Metric),
+            ("EntranceHesitation_Metric", EntranceHesitation_Metric),
+            ("TotalEntryTime_Metric", TotalEntryTime_Metric),
+            ("MoveAlongWall_Metric", MoveAlongWall_Metric),
+            ("IdentifyAndCapturePods_Metric", IdentifyAndCapturePods_Metric),
+            ("CapturePodTime_Metric", CapturePodTime_Metric),
+            ("ThreatClearance_Metric", ThreatClearance_Metric),
+            ("TeammateCoverage_Metric", TeammateCoverage_Metric),
+            ("ThreatCoverage_Metric", ThreatCoverage_Metric),
+            ("RoomCoverage_Metric", RoomCoverage_Metric),
+            ("TotalRoomCoverageTime_Metric", TotalRoomCoverageTime_Metric),
         ]
+        metrics: List[AbstractMetric] = [
+            cls(config)
+            for name, cls in _candidate_metrics
+            if ENABLED_METRICS.get(name, False)
+        ]
+
+        # Resolve which compute families need to run by taking the union of
+        # the deps declared by each enabled metric and each enabled
+        # visualization. New metrics / visualizations only need to update
+        # the *_COMPUTE_DEPS maps above; the gating branches below stay
+        # untouched.
+        required_compute: set = set()
+        for name, enabled in ENABLED_METRICS.items():
+            if enabled:
+                required_compute |= METRIC_COMPUTE_DEPS.get(name, frozenset())
+        for viz_name in self.enabled_visualizations:
+            required_compute |= VIS_COMPUTE_DEPS.get(viz_name, frozenset())
+
+        needs_pod_processing = "pod" in required_compute
+        needs_threat_clearance = "threat_clearance" in required_compute
+        needs_room_coverage = "room_coverage" in required_compute
 
         vs = cv2.VideoCapture(config["video_path"])
         frame_total = count_video_frames(vs)
 
-        self.output_directory = os.path.abspath(config["output_path"])
+        outputs_root = os.path.abspath(config["output_path"])
         self.video_basename = os.path.splitext(os.path.basename(config["video_path"]))[0]
 
-        cv2.imwrite(os.path.join(self.output_directory, "EmptyMap.jpg"), config["Map Image"])
-        logging.debug(f"Saved map cache to: {os.path.join(self.output_directory, 'EmptyMap.jpg')}")
+        role = config.get("role") or "trainee"
+        title = config.get("title") or self.video_basename
+        run_id = make_run_id(role, title)
+        self.run_id = run_id
+        config["run_id"] = run_id
+        self.output_directory = os.path.join(outputs_root, run_id)
+        os.makedirs(self.output_directory, exist_ok=True)
+
+        save_run_info(
+            self.output_directory,
+            run_id=run_id,
+            role=role,
+            title=title,
+            video_basename=self.video_basename,
+            vmeta_path=config.get("vmeta_path") or "",
+            analysis_file=f"{self.video_basename}_Analysis.json",
+        )
+
+        # PNG is lossless — JPG would smear fine map lines (grid markings,
+        # thin annotations) that the live tracking videos preserve because
+        # they render straight from the in-memory ``config["Map Image"]``.
+        cv2.imwrite(os.path.join(self.output_directory, "EmptyMap.png"), config["Map Image"])
+        logging.debug(f"Saved map cache to: {os.path.join(self.output_directory, 'EmptyMap.png')}")
+
+        # Drill-window detection deferes transcription until after the
+        # pose+tracker loop has identified the first entry frame, then
+        # transcribes only the audio slice from that frame onward (or skips
+        # transcription entirely when no entry is detected). When
+        # ``drill_window_enabled`` is False we keep the legacy behavior of
+        # running transcription in parallel with the pose loop.
+        assert config is not None  # narrowed for the closure below
+        drill_window_enabled = bool(config.get("drill_window_enabled", True))
+        enable_transcription = bool(config.get("enable_transcription", False))
+
+        def _invoke_transcribe(
+            audio_start_sec: Optional[float] = None,
+            cfg: Dict = config,
+            out_dir: str = self.output_directory,
+            basename: str = self.video_basename,
+        ) -> None:
+            """Run whisperx with the project's standard args.
+
+            Layer-1 toggles come from config; Layer-2 expert knobs are pinned
+            here so all tuning happens in one place. ``audio_start_sec`` lets
+            the deferred path transcribe only the post-entry slice. The dict-
+            and string-typed bindings are captured via default args so that
+            pyright preserves narrowing across the closure boundary.
+            """
+            try:
+                transcribe_video(
+                    source_video_path=cfg["video_path"],
+                    output_dir=out_dir,
+                    video_basename=basename,
+                    # === Config-exposed (Layer 1) — only the toggles + device ===
+                    device=cfg.get("transcription_device", "cpu"),
+                    denoise_model=(
+                        "dns48" if cfg.get("enable_denoise", False) else None
+                    ),
+                    denoise_device=cfg.get("denoise_device"),
+                    # === Drill-window slice ===
+                    audio_start_sec=audio_start_sec,
+                    # === Hardcoded developer defaults (Layer 2) ===
+                    model="large-v2",
+                    language="en",
+                    compute_type=None,
+                    batch_size=16,
+                    beam_size=5,
+                    temperature=0.0,
+                    temperature_increment_on_fallback=0.2,
+                    compression_ratio_threshold=2.4,
+                    logprob_threshold=-1.0,
+                    no_speech_threshold=0.6,
+                    condition_on_previous_text=False,
+                    suppress_numerals=False,
+                    initial_prompt=None,
+                    hotwords=None,
+                    vad_method="pyannote",
+                    vad_onset=0.7,
+                    vad_offset=0.363,
+                    chunk_size=30,
+                    run_alignment=True,
+                    return_char_alignments=False,
+                    interpolate_method="nearest",
+                    threads=4,
+                    denoise_dry=0.5,
+                    keep_denoised_wav=True,
+                )
+            except Exception:
+                logging.exception("Transcription failed; pipeline continuing.")
+
+        # Legacy parallel-thread mode: drill-window detection is OFF so we
+        # have no reason to defer transcription. Thread joins later, before
+        # metric scoring.
+        transcription_thread: Optional[threading.Thread] = None
+        if enable_transcription and not drill_window_enabled:
+            transcription_thread = threading.Thread(
+                target=_invoke_transcribe,
+                name="transcription",
+                daemon=False,
+            )
+            transcription_thread.start()
+            logging.info("Started transcription thread (parallel with pose pipeline)")
 
         tracker_output: List[dict] = []
         all_map_points: List[list] = []
@@ -446,8 +834,94 @@ class ProcessingEngine:
 
         fall_frames = None
 
+        # ------------------------------------------------------------------
+        # Drill-window detection
+        # ------------------------------------------------------------------
+        # When enabled, derive ``drill_start_frame`` from the tracker output
+        # and (synchronously) transcribe only the post-entry audio slice. If
+        # no entry was detected, transcription is skipped entirely. The
+        # detected window is later threaded into MetricContext, the coverage/
+        # POD/clearance helpers, and the annotation calls so all downstream
+        # work operates on just the actual drill segment.
+        fps = float(config.get("frame_rate", 30.0) or 30.0)
+
+        if drill_window_enabled:
+            drill_start_frame_detected = find_drill_start_frame(tracker_output)
+            if drill_start_frame_detected is not None and enable_transcription:
+                drill_start_sec = float(drill_start_frame_detected) / fps if fps > 0 else 0.0
+                logging.info(
+                    "Running deferred transcription on audio slice from %.3fs (frame %d) onward.",
+                    drill_start_sec, drill_start_frame_detected,
+                )
+                _invoke_transcribe(audio_start_sec=drill_start_sec)
+            elif drill_start_frame_detected is None:
+                logging.info(
+                    "Skipping transcription: no entry crossing detected by tracker."
+                )
+
+            transcription_path = os.path.join(
+                self.output_directory, f"{self.video_basename}_Transcription.json"
+            )
+            drill_window = compute_drill_window(
+                transcription_path=transcription_path if enable_transcription else None,
+                drill_start_frame=drill_start_frame_detected,
+                total_frames=processed_frames,
+                frame_rate=fps,
+                config=config,
+            )
+        else:
+            # Legacy path: parallel transcription thread is still running.
+            if transcription_thread is not None:
+                transcription_thread.join()
+                logging.info("Transcription thread joined (legacy parallel mode).")
+            drill_window = DrillWindow(
+                start_frame=1,
+                end_frame=processed_frames,
+                end_uncertain=False,
+                decision_reason="drill_window_disabled",
+                start_time_sec=0.0,
+                end_time_sec=processed_frames / fps if fps > 0 else None,
+            )
+
+        save_drill_window_sidecar(
+            drill_window,
+            output_directory=self.output_directory,
+            video_basename=self.video_basename,
+        )
+
+        drill_start_frame = int(drill_window.start_frame)
+        drill_end_frame = int(drill_window.end_frame)
+        drill_start_sec = drill_window.start_time_sec or 0.0
+        drill_end_sec = drill_window.end_time_sec or (processed_frames / fps if fps > 0 else None)
+
         save_position_cache(all_map_points, self.output_directory, self.video_basename)
         save_gaze_cache(gaze_info, self.output_directory, self.video_basename)
+
+        preserve_audio_enabled = (
+            bool(config.get("preserve_audio", True))
+            and has_audio_stream(config["video_path"])
+        )
+
+        def _attach_audio(viz_key: str) -> None:
+            # Always muxes from the ORIGINAL source. Even when denoising is
+            # enabled, only the transcription consumes the denoised WAV;
+            # saved annotated videos retain the un-denoised audio. When the
+            # annotated video is trimmed to the drill window, the source
+            # audio is sliced to the same range so the two stay in sync.
+            if not preserve_audio_enabled:
+                return
+            suffix = VIS_VMETA_SUFFIX.get(viz_key)
+            if not suffix:
+                return
+            annotated_path = os.path.join(
+                self.output_directory, f"{self.video_basename}{suffix}.mp4"
+            )
+            attach_audio_in_place(
+                annotated_path,
+                config["video_path"],
+                audio_start_sec=drill_start_sec if drill_start_sec > 0 else None,
+                audio_end_sec=drill_end_sec,
+            )
 
         if "annotate_camera_video" in self.enabled_visualizations:
             annotate_camera_video(
@@ -458,7 +932,10 @@ class ProcessingEngine:
                 inroom_ids=inroom_ids,
                 gaze_conf_threshold=self.pose_conf_threshold,
                 video_path=config["video_path"],
+                start_frame=drill_start_frame,
+                end_frame=drill_end_frame,
             )
+            _attach_audio("annotate_camera_video")
 
         if "annotate_camera_with_gaze_triangle" in self.enabled_visualizations:
             annotate_camera_with_gaze_triangle(
@@ -472,7 +949,10 @@ class ProcessingEngine:
                 alpha=0.2,
                 show_inroom_gaze=False,
                 video_path=config["video_path"],
+                start_frame=drill_start_frame,
+                end_frame=drill_end_frame,
             )
+            _attach_audio("annotate_camera_with_gaze_triangle")
 
         if "annotate_map_video" in self.enabled_visualizations:
             annotate_map_video(
@@ -483,6 +963,8 @@ class ProcessingEngine:
                 self.video_basename,
                 total_frames=processed_frames,
                 inroom_ids=inroom_ids,
+                start_frame=drill_start_frame,
+                end_frame=drill_end_frame,
             )
 
         coverage_data = None
@@ -502,19 +984,24 @@ class ProcessingEngine:
                     alpha=0.1,
                     total_frames=processed_frames,
                     accumulated_clear=True,
+                    start_frame=drill_start_frame,
+                    end_frame=drill_end_frame,
                 )
 
-            coverage_data = compute_room_coverage(
-                map_image=config["Map Image"],
-                pixel_mapper=self.mapper,
-                gaze_info=gaze_info,
-                room_boundary_coords=list(self.boundary.exterior.coords),
-                frame_rate=config["frame_rate"],
-                total_frames=processed_frames,
-                inroom_ids=inroom_ids,
-                half_angle_deg=half_visual_angle_deg,
-            )
-            save_room_coverage_cache(coverage_data, self.output_directory, self.video_basename)
+            if needs_room_coverage:
+                coverage_data = compute_room_coverage(
+                    map_image=config["Map Image"],
+                    pixel_mapper=self.mapper,
+                    gaze_info=gaze_info,
+                    room_boundary_coords=list(self.boundary.exterior.coords),
+                    frame_rate=config["frame_rate"],
+                    total_frames=processed_frames,
+                    inroom_ids=inroom_ids,
+                    half_angle_deg=half_visual_angle_deg,
+                    start_frame=drill_start_frame,
+                    end_frame=drill_end_frame,
+                )
+                save_room_coverage_cache(coverage_data, self.output_directory, self.video_basename)
 
         tracker_json_path = os.path.join(self.output_directory, f"{self.video_basename}_TrackerOutput.json")
         with open(tracker_json_path, "w") as f:
@@ -524,54 +1011,89 @@ class ProcessingEngine:
             f"Saved PositionCache to: {os.path.join(self.output_directory, f'{self.video_basename}_PositionCache.txt')}"
         )
 
-        pods_cfg = config.get("POD", [])
-        pod_groups = config.get("pod_groups", None)
-        working_radius = config.get("pod_working_radius", 40.0)
-        capture_threshold = config.get("pod_capture_threshold_sec", 0.1)
+        # Persist the runtime fps (read from the actual video) so offline
+        # comparisons against this session's caches can recover the same
+        # value rather than trusting the map JSON, which can drift.
+        try:
+            save_run_metadata(
+                self.output_directory,
+                self.video_basename,
+                fps=float(config.get("frame_rate") or 0.0),
+                video_path=config.get("video_path"),
+            )
+        except Exception:
+            logging.warning("Failed to write run-metadata sidecar.", exc_info=True)
 
-        assignment, dynamic_work_areas, pod_capture_data = run_pod_analysis(
-            tracks_by_id=tracks_by_id,
-            tracker_output=tracker_output,
-            pods_cfg=pods_cfg,
-            pod_groups=pod_groups,
-            pixel_mapper=self.mapper,
-            boundary=self.boundary,
-            inroom_ids=inroom_ids,
-            working_radius=working_radius,
-            frame_rate=config["frame_rate"],
-            capture_threshold_sec=capture_threshold,
-            save_cache=True,
-            output_directory=self.output_directory,
-            video_basename=self.video_basename,
-        )
+        assignment = {}
+        dynamic_work_areas = {}
+        pod_capture_data: Dict[int, Dict[str, Optional[float]]] = {}
+        if needs_pod_processing:
+            pods_cfg = config.get("POD", [])
+            pod_groups = config.get("pod_groups", None)
+            working_radius = config.get("pod_working_radius", 40.0)
+            capture_threshold = config.get("pod_capture_threshold_sec", 0.1)
 
-        if "annotate_map_pod_video" in self.enabled_visualizations:
-            annotate_map_pod_video(
-                config["Map Image"],
-                all_map_points=all_map_points,
-                assignment=assignment,
-                dynamic_work_areas=dynamic_work_areas,
-                pod_capture_data=pod_capture_data,
+            # Build door axes (per-door (p̂_A, p̂_B, n_in, type)) so POD-by-entry
+            # assignment uses the same direction frame as the entrance-vectors metric.
+            door_axes = []
+            if self.boundary is not None and getattr(self, "entry_polys", None):
+                try:
+                    boundary_pts = list(self.boundary.exterior.coords)
+                    door_polys = [list(p.exterior.coords) for p in self.entry_polys]
+                    door_axes = load_door_axes(boundary_pts, door_polys)
+                except Exception:
+                    door_axes = []
+
+            assignment, dynamic_work_areas, pod_capture_data = run_pod_analysis(
+                tracks_by_id=tracks_by_id,
+                tracker_output=tracker_output,
+                pods_cfg=pods_cfg,
+                pod_groups=pod_groups,
+                pixel_mapper=self.mapper,
+                boundary=self.boundary,
+                inroom_ids=inroom_ids,
+                working_radius=working_radius,
                 frame_rate=config["frame_rate"],
+                capture_threshold_sec=capture_threshold,
+                save_cache=True,
                 output_directory=self.output_directory,
                 video_basename=self.video_basename,
-                total_frames=processed_frames,
-                inroom_ids=inroom_ids,
+                start_frame=drill_start_frame,
+                end_frame=drill_end_frame,
+                door_axes=door_axes,
             )
 
-        if "annotate_map_pod_with_paths_video" in self.enabled_visualizations:
-            annotate_map_pod_with_paths_video(
-                config["Map Image"],
-                all_map_points=all_map_points,
-                assignment=assignment,
-                dynamic_work_areas=dynamic_work_areas,
-                pod_capture_data=pod_capture_data,
-                frame_rate=config["frame_rate"],
-                output_directory=self.output_directory,
-                video_basename=self.video_basename,
-                total_frames=processed_frames,
-                inroom_ids=inroom_ids,
-            )
+            if "annotate_map_pod_video" in self.enabled_visualizations:
+                annotate_map_pod_video(
+                    config["Map Image"],
+                    all_map_points=all_map_points,
+                    assignment=assignment,
+                    dynamic_work_areas=dynamic_work_areas,
+                    pod_capture_data=pod_capture_data,
+                    frame_rate=config["frame_rate"],
+                    output_directory=self.output_directory,
+                    video_basename=self.video_basename,
+                    total_frames=processed_frames,
+                    inroom_ids=inroom_ids,
+                    start_frame=drill_start_frame,
+                    end_frame=drill_end_frame,
+                )
+
+            if "annotate_map_pod_with_paths_video" in self.enabled_visualizations:
+                annotate_map_pod_with_paths_video(
+                    config["Map Image"],
+                    all_map_points=all_map_points,
+                    assignment=assignment,
+                    dynamic_work_areas=dynamic_work_areas,
+                    pod_capture_data=pod_capture_data,
+                    frame_rate=config["frame_rate"],
+                    output_directory=self.output_directory,
+                    video_basename=self.video_basename,
+                    total_frames=processed_frames,
+                    inroom_ids=inroom_ids,
+                    start_frame=drill_start_frame,
+                    end_frame=drill_end_frame,
+                )
 
         bbox_details = {}
         keypoint_details = {}
@@ -595,67 +1117,160 @@ class ProcessingEngine:
             inroom_ids=inroom_ids,
             room_coverage=coverage_data,
             pod_capture=pod_capture_data,
+            drill_start_frame=drill_start_frame,
+            drill_end_frame=drill_end_frame,
+            drill_window_meta=drill_window.to_dict(),
+            pixel_mapper=self.mapper,
         )
 
-        clearance_map = compute_threat_clearance(
-            tracker_output,
-            keypoint_details,
-            gaze_info,
-            inroom_ids=inroom_ids,
-            visual_angle_deg=visual_angle_deg,
-            intersection_frames=threat_interaction_frames,
-            wrist_frames=max(1, int(threat_interaction_frames * 0.1)),
-            gaze_frames=max(1, int(threat_interaction_frames * 0.5)),
-        )
-
-        if "annotate_clearance_video" in self.enabled_visualizations:
-            annotate_clearance_video(
-                tracker_output=tracker_output,
-                clearance_map=clearance_map,
-                frame_rate=config["frame_rate"],
-                output_directory=self.output_directory,
-                video_basename=self.video_basename,
+        if needs_threat_clearance:
+            clearance_map = compute_threat_clearance(
+                tracker_output,
+                keypoint_details,
+                gaze_info,
                 inroom_ids=inroom_ids,
-                video_path=config["video_path"],
+                visual_angle_deg=visual_angle_deg,
+                intersection_frames=threat_interaction_frames,
+                wrist_frames=max(1, int(threat_interaction_frames * 0.1)),
+                gaze_frames=max(1, int(threat_interaction_frames * 0.5)),
+                start_frame=drill_start_frame,
+                end_frame=drill_end_frame,
             )
 
-        if "annotate_camera_tracking_with_clearance" in self.enabled_visualizations:
-            annotate_camera_tracking_with_clearance(
-                tracker_output=tracker_output,
-                clearance_map=clearance_map,
-                frame_rate=config["frame_rate"],
-                output_directory=self.output_directory,
-                video_basename=self.video_basename,
-                inroom_ids=inroom_ids,
-                gaze_conf_threshold=self.pose_conf_threshold,
-                show_clearing_id=True,
-                video_path=config["video_path"],
-            )
+            if "annotate_clearance_video" in self.enabled_visualizations:
+                annotate_clearance_video(
+                    tracker_output=tracker_output,
+                    clearance_map=clearance_map,
+                    frame_rate=config["frame_rate"],
+                    output_directory=self.output_directory,
+                    video_basename=self.video_basename,
+                    inroom_ids=inroom_ids,
+                    video_path=config["video_path"],
+                    start_frame=drill_start_frame,
+                    end_frame=drill_end_frame,
+                )
+                _attach_audio("annotate_clearance_video")
 
-        save_threat_clearance_cache(clearance_map, self.output_directory, self.video_basename)
-        context.threat_clearance = clearance_map
+            if "annotate_camera_tracking_with_clearance" in self.enabled_visualizations:
+                annotate_camera_tracking_with_clearance(
+                    tracker_output=tracker_output,
+                    clearance_map=clearance_map,
+                    frame_rate=config["frame_rate"],
+                    output_directory=self.output_directory,
+                    video_basename=self.video_basename,
+                    inroom_ids=inroom_ids,
+                    gaze_conf_threshold=self.pose_conf_threshold,
+                    show_clearing_id=True,
+                    video_path=config["video_path"],
+                    start_frame=drill_start_frame,
+                    end_frame=drill_end_frame,
+                )
+                _attach_audio("annotate_camera_tracking_with_clearance")
+
+            save_threat_clearance_cache(clearance_map, self.output_directory, self.video_basename)
+            context.threat_clearance = clearance_map
 
         metric_scores = []
+        # Stash select metric instances so build_analysis_session can pull
+        # per-metric extras (excursion summaries, etc.) without us having to
+        # plumb every metric class through the function signature.
+        move_along_wall_metric = None
         for m in metrics:
-            m.process(context)
+            # Wall-adherence is measured across the full pre-drill + drill
+            # span (frame 1 → drill_end_frame), not just the in-drill window.
+            # Mutate the context's drill_start_frame only for this metric and
+            # restore it after so other metrics still see the detected start.
+            if getattr(m, "metricName", "") == "STAY_ALONG_WALL":
+                saved_drill_start = context.drill_start_frame
+                context.drill_start_frame = 1
+                try:
+                    m.process(context)
+                finally:
+                    context.drill_start_frame = saved_drill_start
+            else:
+                m.process(context)
             score = m.getFinalScore()
-
-            assessment = "below"
-            if isinstance(score, (int, float)):
-                if score > 0.9:
-                    assessment = "above"
-                elif score > 0.5:
-                    assessment = "at"
 
             metric_entry = {
                 "metric_name": m.metricName,
                 "score": score,
-                "assessment": assessment,
                 "timestamp": config["start_time"],
             }
             metric_scores.append(metric_entry)
 
+            if getattr(m, "metricName", "") == "STAY_ALONG_WALL":
+                move_along_wall_metric = m
+
         save_metrics_cache(metric_scores, self.output_directory, self.video_basename)
+
+        # When drill-window detection is enabled the transcription has
+        # already run synchronously after the pose loop, so there is no
+        # background thread to join here. The legacy parallel-thread path
+        # (drill_window_enabled=False) joins earlier — right after the pose
+        # loop, before drill-window decisions are made — so the sidecar is on
+        # disk before downstream consumers run.
+
+        position_cache_path = os.path.join(
+            self.output_directory,
+            f"{self.video_basename}_PositionCache.txt",
+        )
+        gaze_cache_path = os.path.join(
+            self.output_directory,
+            f"{self.video_basename}_GazeCache.txt",
+        )
+        empty_map_path = os.path.join(self.output_directory, "EmptyMap.png")
+        metrics_cache_path = os.path.join(
+            self.output_directory,
+            f"{self.video_basename}_MetricsCache.txt",
+        )
+        analysis_json_path = os.path.join(
+            self.output_directory,
+            f"{self.video_basename}_Analysis.json",
+        )
+
+        try:
+            move_summary = None
+            if move_along_wall_metric is not None:
+                move_summary = {
+                    "score": float(move_along_wall_metric.getFinalScore()),
+                    "per_entrant": list(
+                        getattr(move_along_wall_metric, "_per_entrant_summary", []) or []
+                    ),
+                }
+            analysis_session = build_analysis_session(
+                tracks_by_id=tracks_by_id,
+                inroom_ids=inroom_ids,
+                frame_rate=config["frame_rate"],
+                config=config,
+                video_basename=self.video_basename,
+                video_path=config.get("video_path"),
+                total_frames=processed_frames,
+                duration_sec=(processed_frames / config["frame_rate"]) if config.get("frame_rate") else None,
+                start_time=config.get("start_time"),
+                map_img=config.get("Map Image"),
+                output_directory=self.output_directory,
+                tracker_output_json_path=tracker_json_path,
+                position_cache_path=position_cache_path,
+                gaze_cache_path=gaze_cache_path,
+                empty_map_path=empty_map_path,
+                drill_window=drill_window,
+                metric_flags=list(getattr(context, "metric_flags", []) or []),
+                move_along_wall=move_summary,
+            )
+            analysis_session.setdefault("artifacts", {})
+            analysis_session["artifacts"]["metrics_cache"] = {
+                "path": metrics_cache_path,
+                "label": "Metrics Cache",
+                "type": "text",
+                "exists": os.path.exists(metrics_cache_path),
+            }
+
+            with open(analysis_json_path, "w") as f:
+                json.dump(analysis_session, f, indent=4)
+            logging.debug(f"Saved analysis session JSON to: {analysis_json_path}")
+        except Exception:
+            logging.error("Failed to build or save analysis session JSON.", exc_info=True)
+
         return metric_scores
 
     def get_assessment(self, timestamp, metric_name):
@@ -680,123 +1295,176 @@ class ProcessingEngine:
             logging.debug(f"Metric query for time {timestamp} received but no metrics match.")
         return json.dumps(desired_metrics, indent=4)
 
-    def compare_expert(self, metric_name, session_folder, expert_folder, vmeta_path=None):
-        """Compare a trainee (session_folder) against an expert (expert_folder) for a metric."""
-        logging.debug("")
-        logging.debug(f"Starting Expert Comparison for metric {metric_name}.")
+    def compare_expert(self, metric_name, current_run, other_run, *, output_dir):
+        """Compare two runs on a single metric. Returns a JSON-encoded simplified payload.
 
-        if not session_folder or not os.path.isdir(session_folder):
-            logging.debug("Error: Supplied session folder is missing or not a directory: %s", session_folder)
+        ``current_run`` and ``other_run`` must both be per-run directories that
+        contain a ``RunInfo.json`` manifest (see ``src.utils.run_info``).
+        Comparison artifacts (side-by-side images) are written to
+        ``output_dir`` — never into the run folders themselves. Callers own
+        the temp directory and its lifecycle.
+
+        Return shape::
+
+            {
+              "metric_id": "ENTRANCE_VECTORS",
+              "label": "Entrance Vectors",
+              "current": {"score": ..., "role": ..., "run_id": ...},
+              "other":   {"score": ..., "role": ..., "run_id": ...},
+              "visualizations": [
+                {"image_path": ..., "label": ..., "caption": ...},
+                ...
+              ],
+              "explanation": "...one-sentence summary..."
+            }
+
+        The relative grading (above / at / near / below) is computed in the
+        viewer from the two scores. We don't persist or transmit a
+        context-independent assessment because the meaningful thresholds vary
+        room-to-room.
+        """
+        logging.debug(f"Starting comparison for metric {metric_name}.")
+
+        def _err(message: str, *, label: Optional[str] = None) -> str:
             return json.dumps(
                 {
-                    "Name": metric_name,
-                    "Type": "SideBySide",
-                    "ImgLocation": os.path.join(session_folder or "", "error_image.jpg"),
-                    "Text": "There was an error while processing this comparison. The supplied session folder is invalid.",
+                    "metric_id": metric_name,
+                    "label": label or _COMPARE_METRIC_LABELS.get(metric_name, metric_name),
+                    "current": {"score": None, "role": None, "run_id": None},
+                    "other": {"score": None, "role": None, "run_id": None},
+                    "visualizations": [],
+                    "explanation": message,
                 },
                 indent=4,
             )
 
-        if not expert_folder or not os.path.isdir(expert_folder):
-            logging.debug("Error: Supplied expert folder is missing or not a directory: %s", expert_folder)
-            return json.dumps(
-                {
-                    "Name": metric_name,
-                    "Type": "SideBySide",
-                    "ImgLocation": os.path.join(session_folder, "error_image.jpg"),
-                    "Text": "There was an error while processing this comparison. The supplied expert folder is invalid.",
-                },
-                indent=4,
-            )
+        current_info = load_run_info(current_run) if current_run else None
+        if current_info is None:
+            return _err("Current run folder is missing or has no RunInfo.json manifest.")
+        other_info = load_run_info(other_run) if other_run else None
+        if other_info is None:
+            return _err("Comparison run folder is missing or has no RunInfo.json manifest.")
+
+        if not output_dir:
+            return _err("No output_dir supplied for comparison artifacts.")
+        os.makedirs(output_dir, exist_ok=True)
 
         config = None
-        if vmeta_path:
+        vmeta_path = current_info.get("vmeta_path")
+        if vmeta_path and os.path.isfile(vmeta_path):
             try:
-                config_path, _, _ = load_vmeta(vmeta_path)
+                config_path, _, _, _, _ = load_vmeta(vmeta_path)
                 config = load_config(config_path)
             except Exception:
-                logging.error("Error: Unable to load config from vmeta_path: %s", vmeta_path, exc_info=True)
+                logging.error("Unable to load config from vmeta_path: %s", vmeta_path, exc_info=True)
                 config = None
 
-        map_path_session = os.path.join(session_folder, "EmptyMap.jpg")
-        map_path_expert = os.path.join(expert_folder, "EmptyMap.jpg")
-        map_path = map_path_session if os.path.exists(map_path_session) else (
-            map_path_expert if os.path.exists(map_path_expert) else None
-        )
-        map_image = cv2.imread(map_path) if map_path is not None else None
-
-        def _call_metric(metric_cls):
-            if not hasattr(metric_cls, "expertCompare"):
-                raise AttributeError(f"{metric_cls} has no expertCompare")
-
-            metric_obj = None
+        if config is not None:
+            md = load_run_metadata(current_run) or load_run_metadata(other_run)
+            md_fps = (md or {}).get("fps")
             try:
-                metric_obj = metric_cls(config or {})
-            except TypeError:
-                metric_obj = None
+                md_fps_f = float(md_fps) if md_fps is not None else None
+            except (TypeError, ValueError):
+                md_fps_f = None
+            if md_fps_f and md_fps_f > 0:
+                config["frame_rate"] = md_fps_f
 
-            target = metric_obj if metric_obj is not None else metric_cls
+        # Prefer the lossless PNG, but accept the legacy JPG name as a
+        # fallback so older run folders still work without re-processing.
+        map_path = None
+        for candidate in (
+            os.path.join(current_run, "EmptyMap.png"),
+            os.path.join(other_run, "EmptyMap.png"),
+            os.path.join(current_run, "EmptyMap.jpg"),
+            os.path.join(other_run, "EmptyMap.jpg"),
+        ):
+            if os.path.exists(candidate):
+                map_path = candidate
+                break
+        map_image = cv2.imread(map_path) if map_path else None
 
-            try:
-                return target.expertCompare(
-                    session_folder=session_folder,
-                    expert_folder=expert_folder,
-                    map_image=map_image,
-                    config=config,
-                )
-            except TypeError:
-                try:
-                    return target.expertCompare(
-                        session_folder=session_folder,
-                        expert_folder=expert_folder,
-                        map_image=map_image,
-                    )
-                except TypeError:
-                    try:
-                        return target.expertCompare(session_folder, expert_folder, map_image, config)
-                    except TypeError:
-                        return target.expertCompare(session_folder, expert_folder, map_image)
+        current_scores = _read_metrics_csv(current_run)
+        other_scores = _read_metrics_csv(other_run)
+        current_score = current_scores.get(metric_name)
+        other_score = other_scores.get(metric_name)
+
+        metric_label = _COMPARE_METRIC_LABELS.get(metric_name, metric_name)
+
+        metric_map = {
+            "ENTRANCE_HESITATION": EntranceHesitation_Metric,
+            "ENTRANCE_VECTORS": EntranceVectors_Metric,
+            "STAY_ALONG_WALL": MoveAlongWall_Metric,
+            "IDENTIFY_AND_HOLD_DESIGNATED_AREA": POD_Metric,
+            "TOTAL_TIME_OF_ENTRY": TotalEntryTime_Metric,
+            "IDENTIFY_AND_CAPTURE_POD": IdentifyAndCapturePods_Metric,
+            "POD_CAPTURE_TIME": CapturePodTime_Metric,
+            "THREAT_CLEARANCE": ThreatClearance_Metric,
+            "TEAMMATE_COVERAGE": TeammateCoverage_Metric,
+            "THREAT_COVERAGE": ThreatCoverage_Metric,
+            "FLOOR_COVERAGE": RoomCoverage_Metric,
+            "TOTAL_FLOOR_COVERAGE_TIME": TotalRoomCoverageTime_Metric,
+        }
+        metric_cls = metric_map.get(metric_name)
+        if metric_cls is None:
+            return _err(f"Metric {metric_name} is not implemented for reference comparison.", label=metric_label)
 
         try:
-            metric_map = {
-                "ENTRANCE_HESITATION": EntranceHesitation_Metric,
-                "ENTRANCE_VECTORS": EntranceVectors_Metric,
-                "STAY_ALONG_WALL": MoveAlongWall_Metric,
-                "IDENTIFY_AND_HOLD_DESIGNATED_AREA": POD_Metric,
-                "TOTAL_TIME_OF_ENTRY": TotalEntryTime_Metric,
-                "IDENTIFY_AND_CAPTURE_POD": IdentifyAndCapturePods_Metric,
-                "POD_CAPTURE_TIME": CapturePodTime_Metric,
-                "THREAT_CLEARANCE": ThreatClearance_Metric,
-                "TEAMMATE_COVERAGE": TeammateCoverage_Metric,
-                "THREAT_COVERAGE": ThreatCoverage_Metric,
-                "FLOOR_COVERAGE": RoomCoverage_Metric,
-                "TOTAL_FLOOR_COVERAGE_TIME": TotalRoomCoverageTime_Metric,
-            }
+            metric_obj = metric_cls(config or {})
+        except TypeError:
+            metric_obj = None
+        target = metric_obj if metric_obj is not None else metric_cls
 
-            metric_cls = metric_map.get(metric_name)
-            if metric_cls is None:
-                logging.debug("Metric %s not implemented in compare_expert mapping.", metric_name)
-                out = {
-                    "Name": metric_name,
-                    "Type": "SideBySide",
-                    "ImgLocation": os.path.join(session_folder, "error_image.jpg"),
-                    "Text": "There was an error while processing this comparison. Most likely, this metric is not yet implemented.",
-                }
-            else:
-                logging.debug("Started computing %s", metric_name)
-                out = _call_metric(metric_cls)
-
+        try:
+            legacy = target.expertCompare(
+                session_folder=current_run,
+                expert_folder=other_run,
+                map_image=map_image,
+            )
+        except TypeError:
+            try:
+                legacy = target.expertCompare(current_run, other_run, map_image, config)
+            except TypeError:
+                try:
+                    legacy = target.expertCompare(current_run, other_run, map_image)
+                except Exception:
+                    logging.error("Error while running reference comparison for %s", metric_name, exc_info=True)
+                    return _err("Comparison failed unexpectedly. Check the engine logs.", label=metric_label)
         except Exception:
-            logging.error("Error while running expert comparison for %s", metric_name, exc_info=True)
-            out = {
-                "Name": metric_name,
-                "Type": "SideBySide",
-                "ImgLocation": os.path.join(session_folder, "error_image.jpg"),
-                "Text": "There was an error while processing this comparison. Most likely, this metric is not yet implemented.",
-            }
+            logging.error("Error while running reference comparison for %s", metric_name, exc_info=True)
+            return _err("Comparison failed unexpectedly. Check the engine logs.", label=metric_label)
 
-        logging.debug(f"Completed analysis of metric {metric_name}.")
-        return json.dumps(out, indent=4)
+        visualizations = _harvest_visualizations(legacy, metric_name, current_run, output_dir)
+
+        explanation = ""
+        if metric_obj is not None:
+            try:
+                explanation = metric_obj.explainComparison(current_score, other_score)
+            except Exception:
+                explanation = ""
+        if not explanation:
+            explanation = AbstractMetric.explainComparison(  # type: ignore[call-arg]
+                metric_obj if metric_obj is not None else AbstractMetric({}),
+                current_score,
+                other_score,
+            )
+
+        payload = {
+            "metric_id": metric_name,
+            "label": metric_label,
+            "current": {
+                "score": current_score,
+                "role": current_info.get("role"),
+                "run_id": current_info.get("run_id"),
+            },
+            "other": {
+                "score": other_score,
+                "role": other_info.get("role"),
+                "run_id": other_info.get("run_id"),
+            },
+            "visualizations": visualizations,
+            "explanation": explanation,
+        }
+        return json.dumps(payload, indent=4)
 
     def make_path(self, raw_path):
         paths = []

@@ -304,7 +304,6 @@ class KalmanBoxTracker:
 
         self.prev_top_center: Optional[np.ndarray] = None
         self.missing_keypoints_frames = 0
-        self.previous_bbox: Optional[np.ndarray] = None
 
         self.joint_histories = {
             "lhip": deque([], maxlen=8),
@@ -313,7 +312,6 @@ class KalmanBoxTracker:
             "rknee": deque([], maxlen=8),
             "bbox": deque([], maxlen=8),
         }
-        self.bbox_top_center_history = deque(maxlen=5)
 
     @staticmethod
     def filter_keypoints(
@@ -544,7 +542,6 @@ class KalmanBoxTracker:
         keypoints: Optional[np.ndarray] = None,
         keypoint_indices: Optional[Tuple[int, int]] = None,
         smoothing_factor: float = 0.5,
-        bbox_top_center_history_len: int = 5,
         reappearance_threshold: int = 5,
         dynamic_smoothing_min: float = 0.1,
         dynamic_smoothing_max: float = 0.3,
@@ -553,12 +550,6 @@ class KalmanBoxTracker:
         """
         Update map position using bbox-based or foot/ankle-based logic.
         """
-        if self.bbox_top_center_history.maxlen != bbox_top_center_history_len:
-            self.bbox_top_center_history = deque(
-                self.bbox_top_center_history,
-                maxlen=bbox_top_center_history_len,
-            )
-
         new_map_position = None
 
         if keypoint_indices is None:
@@ -574,7 +565,17 @@ class KalmanBoxTracker:
                 dtype=float,
             )
             self.joint_histories["bbox"].append((frame_idx, current_top_center))
-            self.bbox_top_center_history.append(current_top_center)
+
+            bbox_x1 = float(xywh[0]) - float(xywh[2]) / 2.0
+            bbox_y1 = float(xywh[1]) - float(xywh[3]) / 2.0
+            bbox_x2 = float(xywh[0]) + float(xywh[2]) / 2.0
+            bbox_y2 = float(xywh[1]) + float(xywh[3]) / 2.0
+
+            def _kp_inside_bbox(kp) -> bool:
+                kx, ky = float(kp[0]), float(kp[1])
+                if not (np.isfinite(kx) and np.isfinite(ky)):
+                    return False
+                return bbox_x1 <= kx <= bbox_x2 and bbox_y1 <= ky <= bbox_y2
 
             ankle_point = None
 
@@ -585,8 +586,14 @@ class KalmanBoxTracker:
                 def collect_valid_points(indices: List[int]):
                     valid_points = []
                     for idx in indices:
-                        if idx < len(keypoints) and keypoints[idx][2] > self.keypoint_confidence_threshold:
-                            valid_points.append(keypoints[idx][:2])
+                        if idx < 0 or idx >= len(keypoints):
+                            continue
+                        kp = keypoints[idx]
+                        if kp[2] <= self.keypoint_confidence_threshold:
+                            continue
+                        if not _kp_inside_bbox(kp):
+                            continue
+                        valid_points.append(kp[:2])
                     return valid_points
 
                 left_foot_points = collect_valid_points(left_foot_indices)
@@ -599,8 +606,14 @@ class KalmanBoxTracker:
                     "rknee": 14,
                 }
                 for joint_name, joint_index in hip_and_knee_indices.items():
-                    if joint_index < len(keypoints) and keypoints[joint_index][2] > self.keypoint_confidence_threshold:
-                        self.joint_histories[joint_name].append((frame_idx, keypoints[joint_index][:2]))
+                    if joint_index < 0 or joint_index >= len(keypoints):
+                        continue
+                    kp = keypoints[joint_index]
+                    if kp[2] <= self.keypoint_confidence_threshold:
+                        continue
+                    if not _kp_inside_bbox(kp):
+                        continue
+                    self.joint_histories[joint_name].append((frame_idx, kp[:2]))
 
                 if left_foot_points or right_foot_points:
                     left_mean = np.mean(left_foot_points, axis=0) if left_foot_points else None
@@ -610,21 +623,30 @@ class KalmanBoxTracker:
                         ankle_point = (left_mean + right_mean) / 2.0
                     else:
                         ankle_point = left_mean if left_mean is not None else right_mean
-                else:
+                elif keypoint_indices is not None:
                     keypoint_index_1, keypoint_index_2 = keypoint_indices
-                    kp1 = keypoints[keypoint_index_1] if keypoint_index_1 < len(keypoints) else None
-                    kp2 = keypoints[keypoint_index_2] if keypoint_index_2 < len(keypoints) else None
+                    in_range_1 = 0 <= keypoint_index_1 < len(keypoints)
+                    in_range_2 = 0 <= keypoint_index_2 < len(keypoints)
+                    kp1 = keypoints[keypoint_index_1] if in_range_1 else None
+                    kp2 = keypoints[keypoint_index_2] if in_range_2 else None
 
                     valid_ankle_candidates = []
                     for kp in (kp1, kp2):
-                        if kp is not None and kp[2] > self.keypoint_confidence_threshold:
-                            valid_ankle_candidates.append(kp[:2])
+                        if kp is None or kp[2] <= self.keypoint_confidence_threshold:
+                            continue
+                        if not _kp_inside_bbox(kp):
+                            continue
+                        valid_ankle_candidates.append(kp[:2])
 
                     if valid_ankle_candidates:
                         ankle_point = np.mean(valid_ankle_candidates, axis=0)
 
             if ankle_point is not None:
                 ankle_point = np.asarray(ankle_point, dtype=float)
+                if ankle_point.size < 2 or not np.isfinite(ankle_point[:2]).all():
+                    ankle_point = None
+
+            if ankle_point is not None:
 
                 if self.missing_keypoints_frames >= reappearance_threshold:
                     if self.keypoint_kalman_filter is None:
@@ -671,9 +693,11 @@ class KalmanBoxTracker:
 
             self.prev_top_center = current_top_center
 
-        self.previous_bbox = xywh
-
-        if new_map_position is not None and self.current_map_pos is not None:
+        if (
+            new_map_position is not None
+            and self.current_map_pos is not None
+            and dynamic_smoothing_thresh > 0
+        ):
             current_map_position = np.asarray(self.current_map_pos, dtype=float)
             next_map_position = np.asarray(new_map_position, dtype=float)
             position_delta = np.linalg.norm(current_map_position - next_map_position)
@@ -1270,11 +1294,85 @@ class OCSort(BaseTracker):
         for track_index in unmatched_track_indices:
             self.active_tracks[track_index].update(None, None, None)
 
-    def _make_map_point_from_detection(self, detection_xyxy: np.ndarray) -> Optional[geo.Point]:
+    def _compute_birth_pixel_anchor(
+        self,
+        detection_xyxy: np.ndarray,
+        keypoints: Optional[np.ndarray],
+        keypoint_confidence_threshold: float,
+        keypoint_indices: Optional[Tuple[int, int]],
+    ) -> Optional[np.ndarray]:
+        """Pick the best pixel anchor for birth-time map projection.
+
+        Priority: confident feet -> ankles -> knees, each filtered to keypoints
+        that fall inside the detection bbox (defends against pose models that
+        hallucinate the full skeleton outside small/partial bboxes). Falls back
+        to bbox bottom-center when no usable keypoints are present.
+        """
+        x1 = float(detection_xyxy[0])
+        y1 = float(detection_xyxy[1])
+        x2 = float(detection_xyxy[2])
+        y2 = float(detection_xyxy[3])
+        bbox_bottom_center = np.array([(x1 + x2) / 2.0, y2], dtype=float)
+
+        if keypoints is None:
+            return bbox_bottom_center
+        kps = np.asarray(keypoints)
+        if kps.ndim != 2 or kps.shape[1] < 3 or kps.shape[0] == 0:
+            return bbox_bottom_center
+
+        def collect_inside_bbox(indices):
+            valid = []
+            for idx in indices:
+                if idx < 0 or idx >= kps.shape[0]:
+                    continue
+                kp = kps[idx]
+                if float(kp[2]) < keypoint_confidence_threshold:
+                    continue
+                kx, ky = float(kp[0]), float(kp[1])
+                if not (np.isfinite(kx) and np.isfinite(ky)):
+                    continue
+                if x1 <= kx <= x2 and y1 <= ky <= y2:
+                    valid.append(np.array([kx, ky], dtype=float))
+            return valid
+
+        # Halpe-26: feet (toes + heels)
+        feet = collect_inside_bbox([20, 22, 24, 21, 23, 25])
+        if feet:
+            return np.mean(feet, axis=0)
+
+        # Configured ankle pair (default Halpe-26 ankles 15/16)
+        ankle_idx = tuple(keypoint_indices) if keypoint_indices is not None else (15, 16)
+        ankles = collect_inside_bbox(list(ankle_idx))
+        if ankles:
+            return np.mean(ankles, axis=0)
+
+        # Knees — fallback for partial-body / broken-leg manikins
+        knees = collect_inside_bbox([13, 14])
+        if knees:
+            return np.mean(knees, axis=0)
+
+        return bbox_bottom_center
+
+    def _make_map_point_from_detection(
+        self,
+        detection_xyxy: np.ndarray,
+        keypoints: Optional[np.ndarray] = None,
+        keypoint_confidence_threshold: float = 0.5,
+        keypoint_indices: Optional[Tuple[int, int]] = None,
+    ) -> Optional[geo.Point]:
         if self.pixel_mapper is None:
             return None
 
-        map_xy = self.pixel_mapper.detection_to_map(xyxy2xywh(detection_xyxy))
+        pixel_anchor = self._compute_birth_pixel_anchor(
+            detection_xyxy,
+            keypoints,
+            keypoint_confidence_threshold,
+            keypoint_indices,
+        )
+        if pixel_anchor is None:
+            return None
+
+        map_xy = self.pixel_mapper.pixel_to_map(pixel_anchor)
         map_xy = np.asarray(map_xy, dtype=float).reshape(-1)
 
         if map_xy.size >= 2 and np.isfinite(map_xy[:2]).all():
@@ -1315,6 +1413,7 @@ class OCSort(BaseTracker):
         detections: np.ndarray,
         primary_keypoints: Optional[np.ndarray],
         keypoint_confidence_threshold: float,
+        keypoint_indices: Optional[Tuple[int, int]] = None,
     ):
         if unmatched_detection_indices.shape[0] == 0:
             return
@@ -1327,7 +1426,12 @@ class OCSort(BaseTracker):
             )
             detection_confidence = float(detections[detection_index, 4])
 
-            map_point = self._make_map_point_from_detection(detections[detection_index, 0:4])
+            map_point = self._make_map_point_from_detection(
+                detections[detection_index, 0:4],
+                keypoints=detection_keypoints,
+                keypoint_confidence_threshold=keypoint_confidence_threshold,
+                keypoint_indices=keypoint_indices,
+            )
             birth_location = self._classify_birth_location(map_point)
 
             if not self._should_create_new_track(birth_location, detection_confidence):
@@ -1440,11 +1544,15 @@ class OCSort(BaseTracker):
                 continue
 
             if self.pixel_mapper is not None and track.current_map_pos is None:
-                xywh = xyxy2xywh(track.get_state()[0])
-                fallback_map = self.pixel_mapper.detection_to_map(xywh)
-                fallback_map = np.asarray(fallback_map, dtype=float).reshape(-1)
-                if fallback_map.size >= 2 and np.isfinite(fallback_map[:2]).all():
-                    track.current_map_pos = fallback_map[:2]
+                fallback_point = self._make_map_point_from_detection(
+                    track.get_state()[0],
+                    keypoints=track.filtered_keypoints,
+                    keypoint_confidence_threshold=track.keypoint_confidence_threshold,
+                )
+                if fallback_point is not None:
+                    track.current_map_pos = np.array(
+                        [fallback_point.x, fallback_point.y], dtype=float
+                    )
 
             if track.current_map_pos is None:
                 continue
@@ -1558,6 +1666,7 @@ class OCSort(BaseTracker):
             primary_detections,
             primary_keypoints,
             keypoint_confidence_threshold,
+            keypoint_indices,
         )
 
         outputs = self._update_tracks_and_collect_outputs(keypoint_indices)

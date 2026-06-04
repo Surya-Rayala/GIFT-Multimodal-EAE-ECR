@@ -1,6 +1,4 @@
-from functools import cmp_to_key
 import os
-import glob
 import math
 from typing import Optional, List, Dict, Tuple, Any
 
@@ -9,16 +7,60 @@ import numpy as np
 import pandas as pd
 
 from .metric import AbstractMetric
-from .utils import len_comparator, arg_first_comparator
+from ._shared import (
+    DoorAxes,
+    classify_entry_side,
+    door_for_entry,
+    first_entry_frame,
+    fit_entry_velocity,
+    load_door_axes,
+    load_entry_polygon_points,
+    pick_latest,
+    select_entry_tracks,
+    team_size,
+)
+
+
+# ---------------------------------------------------------------------------
+# Developer constant for the entrance-vectors direction estimator.
+# Not exposed in per-map JSON. The metric no longer applies a magnitude
+# floor or a projection cutoff: every entrant with non-zero motion gets
+# committed to whichever path axis (p̂_A or p̂_B) their motion is more
+# aligned with. Gates were removed because a single UNKNOWN entrant
+# silently inverted the alternation interpretation for the whole rest of
+# the team.
+# ---------------------------------------------------------------------------
+ENTRY_VECTOR_WINDOW_SEC = 2.0          # window over which direction is fit
 
 
 class EntranceVectors_Metric(AbstractMetric):
     def __init__(self, config) -> None:
         super().__init__(config)
         self.metricName = "ENTRANCE_VECTORS"
-        self.num_tracks = len(config.get("POD", []))
+        self.num_tracks = team_size(config)
         self.map = config.get("Map Image", None)
         self.tracks: Dict[int, List[Any]] = {}
+
+        # Door axes are derived from the room boundary + the entry polygons
+        # file. Both are already standard per-map config; no new keys.
+        self._doors: List[DoorAxes] = self._build_doors(config)
+
+    @staticmethod
+    def _build_doors(config) -> List[DoorAxes]:
+        boundary = config.get("Boundary") if isinstance(config, dict) else None
+        if boundary is None:
+            return []
+        if hasattr(boundary, "exterior"):
+            try:
+                boundary_pts = list(boundary.exterior.coords)
+            except Exception:
+                boundary_pts = []
+        else:
+            boundary_pts = list(boundary)
+        door_polys = load_entry_polygon_points(config.get("entry_polys_path"))
+        if not boundary_pts or not door_polys:
+            return []
+        return load_door_axes(boundary_pts, door_polys)
 
     def process(self, ctx):
         inroom_ids = set(getattr(ctx, "inroom_ids", []) or [])
@@ -30,44 +72,42 @@ class EntranceVectors_Metric(AbstractMetric):
 
     def getFinalScore(self) -> float:
         frame_rate = float(self.config.get("frame_rate", 30.0) or 30.0)
-        k_sec = float(self.config.get("entrance_vector_window_sec", 2.0))
-        k_frames = max(1, int(round(k_sec * frame_rate)))
 
-        tracks = list(self.tracks.values())
-        tracks.sort(key=cmp_to_key(len_comparator), reverse=True)
-        tracks = tracks[:self.num_tracks]
-        tracks.sort(key=cmp_to_key(arg_first_comparator))
-
-        if len(tracks) < 2:
+        selected = select_entry_tracks(self.tracks, num_tracks=self.num_tracks)
+        if len(selected) < 2:
             return -1
 
-        entrance_vectors: List[int] = []
-        centroid = np.mean(np.array(self.config["POD"], dtype=float), axis=0)
-
-        for trk in tracks:
-            first_non_none = next((i for i, v in enumerate(trk) if v is not None), None)
-            if first_non_none is None:
+        # Per-entrant: classify side using the door the entrant actually used,
+        # the LSQ velocity over the entry window, and projection onto the
+        # door's two reference path axes (p̂_A, p̂_B).
+        signs_by_door: Dict[int, List[int]] = {}
+        for _, trk in selected:
+            info = EntranceVectors_Metric._entrance_info(
+                trk,
+                doors=self._doors,
+                frame_rate=frame_rate,
+                window_sec=ENTRY_VECTOR_WINDOW_SEC,
+            )
+            sign = int(info.get("sign", 0))
+            if sign == 0:
                 continue
+            door_id = int(info.get("door_index", -1))
+            signs_by_door.setdefault(door_id, []).append(sign)
 
-            non_none_points = [v for v in trk[first_non_none:] if v is not None]
-            if len(non_none_points) < k_frames:
-                continue
+        # Alternation is only meaningful among entrants who used the same door.
+        # In single-door maps (the current case), there's exactly one bucket;
+        # in multi-door scenarios we sum alternations and pairs across doors.
+        alts = 0
+        pairs = 0
+        for signs in signs_by_door.values():
+            for i in range(1, len(signs)):
+                pairs += 1
+                if signs[i] != signs[i - 1]:
+                    alts += 1
 
-            selected_points = non_none_points[:k_frames]
-            entry_pt = np.array(selected_points[0], dtype=float)
-            movement_vec = np.array(selected_points[-1], dtype=float) - entry_pt
-            v_centre = centroid - entry_pt
-
-            z_cross = float(np.cross(v_centre, movement_vec))
-            direction_sign = 1 if z_cross >= 0 else -1
-            entrance_vectors.append(direction_sign)
-
-        score = 0
-        for i in range(1, len(entrance_vectors)):
-            if np.sign(entrance_vectors[i]) != np.sign(entrance_vectors[i - 1]):
-                score += 1
-
-        return round(score / max(1, len(entrance_vectors) - 1), 2)
+        if pairs == 0:
+            return -1
+        return round(alts / pairs, 2)
 
     @staticmethod
     def _first_valid_index(trk: List[Any]) -> Optional[int]:
@@ -77,82 +117,80 @@ class EntranceVectors_Metric(AbstractMetric):
         return None
 
     @staticmethod
-    def _centroid_from_pod(pod) -> np.ndarray:
-        return np.mean(np.array(pod, dtype=float), axis=0)
-
-    @staticmethod
-    def _entrance_sign_cross(
+    def _entrance_info(
         trk: List[Any],
-        centroid: np.ndarray,
         *,
+        doors: List[DoorAxes],
         frame_rate: float,
-        k_sec: float = 2.0,
-        min_move_norm: float = 1e-6,
+        window_sec: float,
     ) -> Dict[str, Any]:
-        first = EntranceVectors_Metric._first_valid_index(trk)
-        frame_rate = float(frame_rate or 30.0)
-        k_frames = max(1, int(round(float(k_sec) * frame_rate)))
+        """Compute the per-entrant entry record using door axes + LSQ velocity.
 
-        if first is None:
-            return {
-                "start_frame": None,
-                "start_xy": None,
-                "end_xy": None,
-                "dx": None,
-                "dy": None,
-                "z_cross": None,
-                "sign": 0,
-                "side": "UNKNOWN",
-            }
+        The output schema is preserved (start_frame, start_xy, end_xy, dx, dy,
+        sign, side) so downstream code (graphics, analysis JSON) can consume
+        it unchanged. ``z_cross`` is no longer part of the model and is
+        omitted.
+        """
+        empty: Dict[str, Any] = {
+            "start_frame": None,
+            "start_xy": None,
+            "end_xy": None,
+            "dx": None,
+            "dy": None,
+            "sign": 0,
+            "side": "UNKNOWN",
+            "door_index": -1,
+        }
+        if trk is None:
+            return empty
 
-        non_none_points = [v for v in trk[first:] if v is not None]
-        if len(non_none_points) < k_frames:
-            return {
-                "start_frame": int(first) + 1,
-                "start_xy": non_none_points[0] if len(non_none_points) > 0 else None,
-                "end_xy": None,
-                "dx": None,
-                "dy": None,
-                "z_cross": None,
-                "sign": 0,
-                "side": "UNKNOWN",
-            }
+        start_idx = first_entry_frame(trk, doors)
+        if start_idx is None:
+            return empty
 
-        selected_points = non_none_points[:k_frames]
-        entry_pt = np.array(selected_points[0], dtype=float)
-        end_pt = np.array(selected_points[-1], dtype=float)
-        movement_vec = end_pt - entry_pt
-        v_centre = np.array(centroid, dtype=float) - entry_pt
+        entry_pt = trk[start_idx]
+        if entry_pt is None:
+            for k in range(start_idx, len(trk)):
+                if trk[k] is not None:
+                    start_idx = k
+                    entry_pt = trk[k]
+                    break
+        if entry_pt is None:
+            return empty
 
-        mv_norm = float(np.linalg.norm(movement_vec))
-        vc_norm = float(np.linalg.norm(v_centre))
-        if mv_norm < min_move_norm or vc_norm < min_move_norm:
+        door = door_for_entry(entry_pt, doors)
+        door_index = -1
+        if door is not None:
+            try:
+                door_index = doors.index(door)
+            except ValueError:
+                door_index = -1
+
+        v = fit_entry_velocity(trk, start_idx, frame_rate, window_sec)
+        if v is None:
+            end_xy = None
+            dx = dy = None
             sign = 0
             side = "UNKNOWN"
-            z_cross = 0.0
         else:
-            z_cross = float(np.cross(v_centre, movement_vec))
-            sign = 1 if z_cross >= 0 else -1
-            side = "POS" if sign == 1 else "NEG"
+            m_vec = v * float(window_sec)
+            sign, side, _, _ = classify_entry_side(m_vec, door)
+            dx, dy = float(m_vec[0]), float(m_vec[1])
+            end_xy = (float(entry_pt[0]) + dx, float(entry_pt[1]) + dy)
 
         return {
-            "start_frame": int(first) + 1,
+            "start_frame": int(start_idx) + 1,
             "start_xy": (float(entry_pt[0]), float(entry_pt[1])),
-            "end_xy": (float(end_pt[0]), float(end_pt[1])),
-            "dx": float(movement_vec[0]),
-            "dy": float(movement_vec[1]),
-            "z_cross": float(z_cross),
+            "end_xy": end_xy,
+            "dx": dx,
+            "dy": dy,
             "sign": int(sign),
             "side": side,
+            "door_index": int(door_index),
         }
 
     def expertCompare(self, session_folder: str, expert_folder: str, map_image=None, pod=None):
-        def _pick_latest(folder: str, pattern: str) -> Optional[str]:
-            matches = glob.glob(os.path.join(folder, pattern))
-            if not matches:
-                return None
-            matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return matches[0]
+        _pick_latest = pick_latest
 
         def _load_position_cache(folder: str) -> List[Dict[str, Any]]:
             cache_path = _pick_latest(folder, "*_PositionCache.txt")
@@ -207,18 +245,17 @@ class EntranceVectors_Metric(AbstractMetric):
 
             return [{"id": tid, "traj": traj} for tid, traj in tracks.items()]
 
-        def _entrance_info(
+        def _per_track_info(
             track: Dict[str, Any],
-            centroid: np.ndarray,
             *,
             frame_rate: float,
-            k_sec: float,
+            window_sec: float,
         ) -> Dict[str, Any]:
-            info = EntranceVectors_Metric._entrance_sign_cross(
+            info = EntranceVectors_Metric._entrance_info(
                 track["traj"],
-                centroid,
+                doors=self._doors,
                 frame_rate=frame_rate,
-                k_sec=k_sec,
+                window_sec=window_sec,
             )
             info["track_id"] = int(track["id"])
             return info
@@ -229,8 +266,8 @@ class EntranceVectors_Metric(AbstractMetric):
                 map_image = cv2.imread(map_image) if os.path.exists(map_image) else None
 
         os.makedirs(session_folder, exist_ok=True)
-        expert_img_path = os.path.join(session_folder, "ENTRANCE_VECTORS_Expert.jpg")
-        trainee_img_path = os.path.join(session_folder, "ENTRANCE_VECTORS_Trainee.jpg")
+        expert_img_path = os.path.join(session_folder, "ENTRANCE_VECTORS_Reference.png")
+        trainee_img_path = os.path.join(session_folder, "ENTRANCE_VECTORS_Trainee.png")
         txt_path = os.path.join(session_folder, "ENTRANCE_VECTORS_Comparison.txt")
 
         if map_image is None:
@@ -240,21 +277,14 @@ class EntranceVectors_Metric(AbstractMetric):
             return {
                 "Name": "ENTRANCE_VECTORS",
                 "Type": "SideBySide",
-                "ExpertImageLocation": expert_img_path,
+                "ReferenceImageLocation": expert_img_path,
                 "TraineeImageLocation": trainee_img_path,
                 "TxtLocation": txt_path,
                 "Text": err_text,
             }
 
-        pod_poly = pod if pod is not None else self.config.get("POD")
-        if pod_poly is not None:
-            centroid = EntranceVectors_Metric._centroid_from_pod(pod_poly)
-        else:
-            h, w = map_image.shape[:2]
-            centroid = np.array([w / 2.0, h / 2.0], dtype=float)
-
         frame_rate = float(self.config.get("frame_rate", 30.0) or 30.0)
-        k_sec = float(self.config.get("entrance_vector_window_sec", 2.0))
+        window_sec = ENTRY_VECTOR_WINDOW_SEC
 
         try:
             expert_tracks = _load_position_cache(expert_folder)
@@ -266,23 +296,19 @@ class EntranceVectors_Metric(AbstractMetric):
             return {
                 "Name": "ENTRANCE_VECTORS",
                 "Type": "SideBySide",
-                "ExpertImageLocation": expert_img_path,
+                "ReferenceImageLocation": expert_img_path,
                 "TraineeImageLocation": trainee_img_path,
                 "TxtLocation": txt_path,
                 "Text": err_text,
             }
 
-        def _start_idx(track: Dict[str, Any]) -> int:
-            idx = EntranceVectors_Metric._first_valid_index(track["traj"])
-            return int(idx) if idx is not None else 10**12
-
-        def _valid_len(track: Dict[str, Any]) -> int:
-            return sum(1 for v in track["traj"] if v is not None)
-
         def _select_for_scoring(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-            if self.num_tracks and self.num_tracks > 0:
-                tracks = sorted(tracks, key=_valid_len, reverse=True)[: self.num_tracks]
-            return sorted(tracks, key=_start_idx)
+            by_tid = {int(t["id"]): t for t in tracks}
+            ordered = select_entry_tracks(
+                {tid: rec["traj"] for tid, rec in by_tid.items()},
+                num_tracks=self.num_tracks,
+            )
+            return [by_tid[tid] for tid, _ in ordered]
 
         expert_tracks = _select_for_scoring(expert_tracks)
         trainee_tracks = _select_for_scoring(trainee_tracks)
@@ -294,18 +320,18 @@ class EntranceVectors_Metric(AbstractMetric):
             return {
                 "Name": "ENTRANCE_VECTORS",
                 "Type": "SideBySide",
-                "ExpertImageLocation": expert_img_path,
+                "ReferenceImageLocation": expert_img_path,
                 "TraineeImageLocation": trainee_img_path,
                 "TxtLocation": txt_path,
                 "Text": err_text,
             }
 
         expert_infos = [
-            _entrance_info(t, centroid, frame_rate=frame_rate, k_sec=k_sec)
+            _per_track_info(t, frame_rate=frame_rate, window_sec=window_sec)
             for t in expert_tracks
         ]
         trainee_infos = [
-            _entrance_info(t, centroid, frame_rate=frame_rate, k_sec=k_sec)
+            _per_track_info(t, frame_rate=frame_rate, window_sec=window_sec)
             for t in trainee_tracks
         ]
 
@@ -393,13 +419,13 @@ class EntranceVectors_Metric(AbstractMetric):
             )
 
         alt_summary = (
-            f"Alternation score: trainee {trainee_alt_score * 100:.1f}% vs expert {expert_alt_score * 100:.1f}%."
+            f"Alternation score: trainee {trainee_alt_score * 100:.1f}% vs reference {expert_alt_score * 100:.1f}%."
         )
 
         if valid > 0:
             sign_match_pct = (match / valid) * 100.0
             summary_line = (
-                f"The trainee matches the expert about {sign_match_pct:.1f}% of the time on entrance side. "
+                f"The trainee matches the reference about {sign_match_pct:.1f}% of the time on entrance side. "
                 f"{alt_summary}"
             )
         else:
@@ -413,21 +439,21 @@ class EntranceVectors_Metric(AbstractMetric):
             parts = [p.strip() for p in line.split(",")]
             while len(parts) < 6:
                 parts.append("N/A")
-            entry, trainee_id, expert_id, match_str, pair_diff_str, pair_cmp = parts[:6]
+            entry, trainee_id, reference_id, match_str, pair_diff_str, pair_cmp = parts[:6]
             rows.append(
                 {
                     "Entry": entry,
                     "Trainee ID": trainee_id,
-                    "Expert ID": expert_id,
+                    "Reference ID": reference_id,
                     "Match": match_str,
-                    "PairScoreΔ (T−E)": pair_diff_str,
-                    "Trainee vs Expert": pair_cmp,
+                    "PairScoreΔ (T−R)": pair_diff_str,
+                    "Trainee vs Reference": pair_cmp,
                 }
             )
 
         df_table = pd.DataFrame(rows)
 
-        details_header = "Entry, Trainee ID, Expert ID, Match, PairScoreΔ (T−E), Trainee vs Expert\n"
+        details_header = "Entry, Trainee ID, Reference ID, Match, PairScoreΔ (T−R), Trainee vs Reference\n"
         details_csv = details_header + "\n".join(per_entry_lines)
         text = summary_line + "\n\n" + details_csv
 
@@ -464,7 +490,7 @@ class EntranceVectors_Metric(AbstractMetric):
         return {
             "Name": "ENTRANCE_VECTORS",
             "Type": "SideBySide",
-            "ExpertImageLocation": expert_img_path,
+            "ReferenceImageLocation": expert_img_path,
             "TraineeImageLocation": trainee_img_path,
             "TxtLocation": txt_path,
             "Text": text,
@@ -482,33 +508,30 @@ class EntranceVectors_Metric(AbstractMetric):
             (128, 0, 128), (0, 128, 128),
         ]
 
-        def _put_text(img, text, org, font, scale, color, thickness, *, shadow=True):
-            x, y = int(org[0]), int(org[1])
-            if shadow:
-                cv2.putText(img, text, (x + 1, y + 1), font, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
-            cv2.putText(img, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
+        # Text rendered via the shared TrueType helper so the legend reads
+        # as crisp typed text instead of OpenCV's wavy stroke fonts.
+        from .utils import draw_text, text_size
 
         def _draw_legend(img, infos, title="Legend"):
             h0, w0 = img.shape[:2]
-            font = cv2.FONT_HERSHEY_SIMPLEX
             diag = math.hypot(w0, h0)
-            font_scale = max(0.55, min(0.9, diag / 1400.0))
-            thickness = max(1, int(round(diag / 900.0)))
+            # Scale text size with the canvas — small maps get smaller text.
+            title_size = max(15, min(22, int(round(diag / 90.0))))
+            body_size = max(13, min(18, int(round(diag / 110.0))))
 
-            line_h = int(round(26 * font_scale))
-            swatch = int(round(16 * font_scale))
-            gap = int(round(10 * font_scale))
-            pad = int(round(12 * font_scale))
+            line_h = int(round(title_size * 1.55))
+            swatch = int(round(body_size * 1.05))
+            gap = int(round(body_size * 0.65))
+            pad = int(round(body_size * 0.9))
 
-            lines = [title] + [f"Entrant #{i}" for i in range(1, len(infos) + 1)]
-
-            max_text_w = 0
-            for t in lines:
-                (tw, _), _ = cv2.getTextSize(t, font, font_scale, thickness)
-                max_text_w = max(max_text_w, tw)
+            # Width: widest of the title (in title size) and the body lines.
+            max_text_w = text_size(title, size_px=title_size)[0]
+            for i in range(1, len(infos) + 1):
+                w, _ = text_size(f"Entrant #{i}", size_px=body_size)
+                max_text_w = max(max_text_w, w)
 
             panel_w = pad * 2 + swatch + gap + max_text_w
-            panel_h = pad * 2 + line_h * len(lines)
+            panel_h = pad * 2 + line_h * (1 + len(infos))
 
             extra_right = panel_w + pad * 2
             extra_bottom = max(0, panel_h + pad * 2 - h0)
@@ -524,13 +547,18 @@ class EntranceVectors_Metric(AbstractMetric):
             overlay = img.copy()
             panel_bg = (28, 28, 28)
             border = (220, 220, 220)
+            border_thick = max(1, int(round(diag / 900.0)))
             cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), panel_bg, -1, cv2.LINE_AA)
             cv2.addWeighted(overlay, 0.82, img, 0.18, 0, dst=img)
-            cv2.rectangle(img, (x0, y0), (x0 + panel_w, y0 + panel_h), border, max(1, thickness), cv2.LINE_AA)
+            cv2.rectangle(img, (x0, y0), (x0 + panel_w, y0 + panel_h), border, border_thick, cv2.LINE_AA)
 
-            title_y = y0 + pad + int(round(18 * font_scale))
-            _put_text(img, title, (x0 + pad, title_y), font, font_scale, (255, 255, 255), thickness)
+            # Title row (TrueType, larger size).
+            draw_text(
+                img, title, (x0 + pad, y0 + pad),
+                size_px=title_size, fill_bgr=(255, 255, 255),
+            )
 
+            # Per-entrant rows: colour swatch + label.
             y = y0 + pad + line_h
             for entry_num, info in enumerate(infos, start=1):
                 tid = info.get("track_id")
@@ -538,15 +566,18 @@ class EntranceVectors_Metric(AbstractMetric):
                 color = predefined_colors[tid % len(predefined_colors)]
 
                 sx1 = x0 + pad
-                sy1 = y + int(round(4 * font_scale))
+                sy1 = y + int(round(body_size * 0.25))
                 sx2 = sx1 + swatch
                 sy2 = sy1 + swatch
 
                 cv2.rectangle(img, (sx1, sy1), (sx2, sy2), color, -1, cv2.LINE_AA)
-                cv2.rectangle(img, (sx1, sy1), (sx2, sy2), (255, 255, 255), max(1, thickness), cv2.LINE_AA)
+                cv2.rectangle(img, (sx1, sy1), (sx2, sy2), (255, 255, 255), border_thick, cv2.LINE_AA)
 
-                label = f"Entrant #{entry_num}"
-                _put_text(img, label, (sx2 + gap, y + int(round(18 * font_scale))), font, font_scale, (255, 255, 255), thickness)
+                draw_text(
+                    img, f"Entrant #{entry_num}",
+                    (sx2 + gap, y),
+                    size_px=body_size, fill_bgr=(255, 255, 255),
+                )
                 y += line_h
 
             return img
@@ -597,8 +628,8 @@ class EntranceVectors_Metric(AbstractMetric):
             color = predefined_colors[tid % len(predefined_colors)]
             _draw_arrow(trainee_view, info.get("start_xy"), info.get("end_xy"), color, idx=entry_num, total=total_t)
 
-        expert_view = _draw_legend(expert_view, expert_infos, title="Expert")
+        expert_view = _draw_legend(expert_view, expert_infos, title="Reference")
         trainee_view = _draw_legend(trainee_view, trainee_infos, title="Trainee")
 
-        cv2.imwrite(os.path.join(output_folder, "ENTRANCE_VECTORS_Trainee.jpg"), trainee_view)
-        cv2.imwrite(os.path.join(output_folder, "ENTRANCE_VECTORS_Expert.jpg"), expert_view)
+        cv2.imwrite(os.path.join(output_folder, "ENTRANCE_VECTORS_Trainee.png"), trainee_view)
+        cv2.imwrite(os.path.join(output_folder, "ENTRANCE_VECTORS_Reference.png"), expert_view)

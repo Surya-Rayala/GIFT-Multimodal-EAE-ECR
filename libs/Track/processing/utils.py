@@ -88,12 +88,13 @@ def load_entry_polygons(entry_polys_path):
     
     entry_polys = []
     for line in lines:
-        if line[0] == "#":
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
             continue
-        values = [int(v) for v in line.split(",")]
+        values = [int(v) for v in stripped.split(",")]
         points = [(values[i], values[i+1]) for i in range(0, len(values), 2)]
         entry_polys.append(geo.Polygon(points))
-    
+
     return entry_polys
 
 def extract_and_save_frame(video_path, output_image_path, frame_number):

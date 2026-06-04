@@ -1,6 +1,4 @@
-from functools import cmp_to_key
 import os
-import glob
 from typing import Optional, List, Dict, Tuple, Any
 
 import numpy as np
@@ -8,14 +6,15 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from .metric import AbstractMetric
-from .utils import len_comparator, arg_first_comparator, arg_first_non_null
+from ._shared import load_inroom_ids, pick_latest, select_entry_tracks, team_size
+from .utils import arg_first_non_null
 
 
 class EntranceHesitation_Metric(AbstractMetric):
     def __init__(self, config) -> None:
         super().__init__(config)
         self.metricName = "ENTRANCE_HESITATION"
-        self.num_tracks = len(config.get("POD", []))
+        self.num_tracks = team_size(config)
         self.tracks: Dict[int, List[Any]] = {}
         self.frame_rate = float(config.get("frame_rate", 30.0) or 30.0)
         self.hesitation_threshold = float(config.get("HESITATION_THRESHOLD", 1.0))
@@ -32,14 +31,10 @@ class EntranceHesitation_Metric(AbstractMetric):
         }
 
     def getFinalScore(self) -> float:
-        tracks = list(self.tracks.values())
-        tracks.sort(key=cmp_to_key(len_comparator), reverse=True)
-        tracks = tracks[:self.num_tracks]
-        tracks.sort(key=cmp_to_key(arg_first_comparator))
-        frame_starts = [arg_first_non_null(trk) for trk in tracks]
-
-        if len(tracks) < 2:
+        selected = select_entry_tracks(self.tracks, num_tracks=self.num_tracks)
+        if len(selected) < 2:
             return -1
+        frame_starts = [arg_first_non_null(traj) for _, traj in selected]
 
         time_scores = []
         for i, start in enumerate(frame_starts[1:]):
@@ -59,38 +54,12 @@ class EntranceHesitation_Metric(AbstractMetric):
 
     def expertCompare(self, session_folder: str, expert_folder: str, map_image=None):
         os.makedirs(session_folder, exist_ok=True)
-        img_path = os.path.join(session_folder, "ENTRANCE_HESITATION_Comparison.jpg")
+        img_path = os.path.join(session_folder, "ENTRANCE_HESITATION_Comparison.png")
         txt_path = os.path.join(session_folder, "ENTRANCE_HESITATION_Comparison.txt")
         frame_rate = float(self.config.get("frame_rate", 30.0) or 30.0)
 
-        def _pick_latest(folder: str, pattern: str) -> Optional[str]:
-            matches = glob.glob(os.path.join(folder, pattern))
-            if not matches:
-                return None
-            matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return matches[0]
-
-        def _load_inroom_ids(folder: str) -> set:
-            tracker_path = _pick_latest(folder, "*_TrackerOutput.json")
-            if tracker_path is None:
-                return set()
-
-            try:
-                import json
-                with open(tracker_path, "r") as f:
-                    tracker_output = json.load(f)
-            except Exception:
-                return set()
-
-            inroom_ids = set()
-            for frame_entry in tracker_output:
-                for obj in frame_entry.get("objects", []):
-                    tid = obj.get("id")
-                    if tid is None:
-                        continue
-                    if obj.get("identity_role") == "inroom" or obj.get("is_inroom", False):
-                        inroom_ids.add(int(tid))
-            return inroom_ids
+        _pick_latest = pick_latest
+        _load_inroom_ids = load_inroom_ids
 
         def _load_position_cache(folder: str) -> Dict[int, List[Any]]:
             cache_path = _pick_latest(folder, "*_PositionCache.txt")
@@ -165,11 +134,7 @@ class EntranceHesitation_Metric(AbstractMetric):
             }
 
         def _select_for_scoring(tracks_by_id: Dict[int, List[Any]]) -> Tuple[List[int], List[int]]:
-            items = [(int(tid), trk) for tid, trk in (tracks_by_id or {}).items()]
-            items.sort(key=cmp_to_key(lambda a, b: len_comparator(a[1], b[1])), reverse=True)
-            items = items[: self.num_tracks]
-            items.sort(key=cmp_to_key(lambda a, b: arg_first_comparator(a[1], b[1])))
-
+            items = select_entry_tracks(tracks_by_id, num_tracks=self.num_tracks)
             ids_ordered = [tid for tid, _ in items]
             starts_ordered = [arg_first_non_null(trk) for _, trk in items]
             return ids_ordered, starts_ordered
@@ -274,7 +239,7 @@ class EntranceHesitation_Metric(AbstractMetric):
         elif avg_time_diff > 0:
             time_part = f"On timing, the trainee was about {abs(avg_time_diff):.2f}s slower between entries on average."
         else:
-            time_part = "On timing, the trainee was about the same as the expert between entries on average."
+            time_part = "On timing, the trainee was about the same as the reference between entries on average."
 
         thr = float(self.hesitation_threshold)
         thr2 = float(self.hesitation_threshold_second)
@@ -287,18 +252,18 @@ class EntranceHesitation_Metric(AbstractMetric):
             score_part = "I couldn't compute an average hesitation score difference. " + expected_part
         elif final_score_diff > 0:
             score_part = (
-                f"On the hesitation score side, the trainee came in about {abs(final_score_diff):.3f} higher than the expert. "
+                f"On the hesitation score side, the trainee came in about {abs(final_score_diff):.3f} higher than the reference. "
                 + expected_part
             )
         elif final_score_diff < 0:
             score_part = (
-                f"On the hesitation score side, the trainee came in about {abs(final_score_diff):.3f} lower than the expert. "
+                f"On the hesitation score side, the trainee came in about {abs(final_score_diff):.3f} lower than the reference. "
                 + expected_part
             )
         else:
-            score_part = "On the hesitation score side, the trainee matched the expert. " + expected_part
+            score_part = "On the hesitation score side, the trainee matched the reference. " + expected_part
 
-        header = "Entry, Expert ID, Trainee ID, Expected gap (thr), Time Δ (T−E) from prev entry, Score Δ (T−E), Trainee vs Expert"
+        header = "Entry, Reference ID, Trainee ID, Expected gap (thr), Time Δ (T−R) from prev entry, Score Δ (T−R), Trainee vs Reference"
         detail_lines = [header] + [f"{r[0]}, {r[1]}, {r[2]}, {r[3]}, {r[4]}, {r[5]}, {r[6]}" for r in rows]
         details_csv = "\n".join(detail_lines)
 
@@ -431,7 +396,7 @@ class EntranceHesitation_Metric(AbstractMetric):
         from matplotlib.lines import Line2D
 
         legend_handles = [
-            Line2D([0], [0], marker="o", linestyle="", label="Expert",
+            Line2D([0], [0], marker="o", linestyle="", label="Reference",
                    markerfacecolor="palevioletred", markeredgecolor="darkmagenta", markersize=10),
             Line2D([0], [0], marker="o", linestyle="", label="Trainee",
                    markerfacecolor="lightskyblue", markeredgecolor="blue", markersize=10),
@@ -454,7 +419,7 @@ class EntranceHesitation_Metric(AbstractMetric):
             lane = expert_lanes[i] if i < len(expert_lanes) else 0
             y = base_expert_y + lane_step * lane
             ax.annotate(
-                f"E#{i + 1}",
+                f"R#{i + 1}",
                 xy=(x, 0),
                 xytext=(x, y),
                 textcoords="data",
@@ -493,5 +458,9 @@ class EntranceHesitation_Metric(AbstractMetric):
         ax.set_xticks([])
         ax.set_yticks([])
 
-        plt.savefig(os.path.join(output_folder, "ENTRANCE_HESITATION_Comparison.jpg"))
+        plt.savefig(
+            os.path.join(output_folder, "ENTRANCE_HESITATION_Comparison.png"),
+            dpi=200,
+            bbox_inches="tight",
+        )
         plt.close(fig)

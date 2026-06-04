@@ -262,33 +262,6 @@ class KalmanFilterXYSR(object):
         # save history of observations
         self.history_obs.append(z)
 
-    def update_steadystate(self, z, H=None):
-        """ Update Kalman filter using the Kalman gain and state covariance
-        matrix as computed for the steady state. Only x is updated, and the
-        new value is stored in self.x. P is left unchanged. Must be called
-        after a prior call to compute_steady_state().
-        """
-        if z is None:
-            self.history_obs.append(z)
-            return
-
-        if H is None:
-            H = self.H
-
-        H = np.asarray(H)
-        # error (residual) between measurement and prediction
-        self.y = z - dot(H, self.x)
-
-        # x = x + Ky
-        self.x = self.x + dot(self.K_steady_state, self.y)
-
-        # save measurement and posterior state
-        self.z = deepcopy(z)
-        self.x_post = self.x.copy()
-
-        # save history of observations
-        self.history_obs.append(z)
-
     def log_likelihood(self, z=None):
         """ log-likelihood of the measurement z. Computed from the
         system uncertainty S.
@@ -306,20 +279,6 @@ class KalmanFilterXYSR(object):
         if z is None:
             z = self.z
         return exp(self.log_likelihood(z))
-
-    @property
-    def log_likelihood(self):
-        """ log-likelihood of the last measurement.
-        """
-
-        return self._log_likelihood
-
-    @property
-    def likelihood(self):
-        """ likelihood of the last measurement.
-        """
-
-        return self._likelihood
 
     def batch_filter(self, zs, us=None, Bs=None, Fs=None, Qs=None, Hs=None, Rs=None):
         """ Batch processes a sequence of measurements.
@@ -391,16 +350,3 @@ class KalmanFilterXYSR(object):
             covariances[i, :, :] = self.P
 
         return (means, covariances)
-
-    def batch_filter(self, zs, Rs=None):
-        """
-        Batch process a sequence of measurements. This method is suitable
-        for cases where the measurement noise varies with each measurement.
-        """
-        means, covariances = [], []
-        for z, R in zip(zs, Rs):
-            self.predict()
-            self.update(z, R=R)
-            means.append(self.x.copy())
-            covariances.append(self.P.copy())
-        return np.array(means), np.array(covariances)

@@ -1,4 +1,3 @@
-import glob
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -7,40 +6,43 @@ import numpy as np
 import pandas as pd
 
 from .metric import AbstractMetric
+from ._shared import (
+    exponential_time_penalty,
+    load_inroom_ids,
+    pick_latest,
+    select_entry_tracks,
+    team_size,
+)
 from .utils import arg_first_non_null
+from ..utils.run_metadata import resolve_fps_from_metadata
+
+# Each side of the comparison gets a distinct color, applied consistently to
+# both the markers and the connecting line so the chart is readable at a glance.
+_TRAINEE_COLOR = "#fb923c"   # tab orange (this run)
+_REFERENCE_COLOR = "#3b82f6" # tab blue (the reference run)
 
 
 class TotalEntryTime_Metric(AbstractMetric):
     def __init__(self, config) -> None:
         super().__init__(config)
         self.metricName = "TOTAL_TIME_OF_ENTRY"
-        self.num_tracks = len(config.get("POD", []))
+        self.num_tracks = team_size(config)
         self.entry_starts: List[int] = []
         self.frame_rate = float(config.get("frame_rate", 30.0) or 30.0)
-        self.entry_time_threshold_sec = float(config.get("entry_time_threshold_sec", 2.0))
+        self.hesitation_threshold = float(config.get("HESITATION_THRESHOLD", 1.0))
+        self.hesitation_threshold_second = float(
+            config.get("HESITATION_THRESHOLD_SECOND", self.hesitation_threshold * 2.0)
+        )
 
     def process(self, ctx):
-        inroom_ids = set(getattr(ctx, "inroom_ids", []) or [])
-
-        tracks = {
-            int(tid): traj
-            for tid, traj in ctx.tracks_by_id.items()
-            if int(tid) not in inroom_ids
-        }
-
-        longest = sorted(
-            tracks.values(),
-            key=lambda traj: sum(1 for pt in traj if pt is not None),
-            reverse=True,
-        )[: self.num_tracks]
-
-        sorted_tracks = sorted(
-            longest,
-            key=lambda traj: arg_first_non_null(traj) if arg_first_non_null(traj) is not None else 10**9,
+        selected = select_entry_tracks(
+            getattr(ctx, "tracks_by_id", {}) or {},
+            inroom_ids=getattr(ctx, "inroom_ids", []) or [],
+            num_tracks=self.num_tracks,
         )
         self.entry_starts = [
             int(arg_first_non_null(traj))
-            for traj in sorted_tracks
+            for _, traj in selected
             if arg_first_non_null(traj) is not None
         ]
 
@@ -50,51 +52,30 @@ class TotalEntryTime_Metric(AbstractMetric):
 
         delta_frames = int(self.entry_starts[-1]) - int(self.entry_starts[0])
         delta_secs = float(delta_frames) / self.frame_rate
+        allowed_secs = self._allowed_total_entry_duration(len(self.entry_starts))
 
-        if delta_secs <= self.entry_time_threshold_sec:
+        if delta_secs <= allowed_secs:
             return 1.0
 
-        overrun = delta_secs - self.entry_time_threshold_sec
-        return round(self._exp_penalty(overrun, self.entry_time_threshold_sec), 2)
+        overrun = delta_secs - allowed_secs
+        return round(self._exp_penalty(overrun, allowed_secs), 2)
+
+    def _allowed_pair_gap_seconds(self, pair_number: int) -> float:
+        return self.hesitation_threshold_second if int(pair_number) == 2 else self.hesitation_threshold
+
+    def _allowed_total_entry_duration(self, entry_count: int) -> float:
+        if int(entry_count) < 2:
+            return 0.0
+        return float(sum(self._allowed_pair_gap_seconds(i) for i in range(1, int(entry_count))))
 
     @staticmethod
     def _exp_penalty(overrun: float, limit: float) -> float:
-        if limit <= 0:
-            return 0.0
-        if overrun >= limit:
-            return 0.0
-        return float(np.exp(-overrun / (limit - overrun)))
+        return exponential_time_penalty(overrun, limit)
 
     @staticmethod
     def expertCompare(session_folder: str, expert_folder: str, map_image=None, config=None):
-        def _pick_latest(folder: str, pattern: str) -> Optional[str]:
-            matches = glob.glob(os.path.join(folder, pattern))
-            if not matches:
-                return None
-            matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return matches[0]
-
-        def _load_inroom_ids(folder: str) -> set:
-            tracker_path = _pick_latest(folder, "*_TrackerOutput.json")
-            if tracker_path is None:
-                return set()
-
-            try:
-                import json
-                with open(tracker_path, "r") as f:
-                    tracker_output = json.load(f)
-            except Exception:
-                return set()
-
-            inroom_ids = set()
-            for frame_entry in tracker_output:
-                for obj in frame_entry.get("objects", []):
-                    tid = obj.get("id")
-                    if tid is None:
-                        continue
-                    if obj.get("identity_role") == "inroom" or obj.get("is_inroom", False):
-                        inroom_ids.add(int(tid))
-            return inroom_ids
+        _pick_latest = pick_latest
+        _load_inroom_ids = load_inroom_ids
 
         def _load_position_cache(folder: str) -> pd.DataFrame:
             path = _pick_latest(folder, "*_PositionCache.txt")
@@ -157,32 +138,56 @@ class TotalEntryTime_Metric(AbstractMetric):
                 })
             return rows
 
-        def _score(delta_secs: Optional[float], threshold: float) -> Optional[float]:
+        def _allowed_pair_gap_seconds(pair_number: int, base_threshold: float, second_threshold: float) -> float:
+            return second_threshold if int(pair_number) == 2 else base_threshold
+
+        def _allowed_total_entry_duration(entry_count: int, base_threshold: float, second_threshold: float) -> float:
+            if int(entry_count) < 2:
+                return 0.0
+            return float(
+                sum(
+                    _allowed_pair_gap_seconds(i, base_threshold, second_threshold)
+                    for i in range(1, int(entry_count))
+                )
+            )
+
+        def _score(delta_secs: Optional[float], limit: float) -> Optional[float]:
             if delta_secs is None:
                 return None
-            if delta_secs <= threshold:
+            if delta_secs <= limit:
                 return 1.0
-            overrun = delta_secs - threshold
-            if overrun >= threshold:
+            overrun = delta_secs - limit
+            if overrun >= limit:
                 return 0.0
-            return round(TotalEntryTime_Metric._exp_penalty(overrun, threshold), 2)
+            return round(TotalEntryTime_Metric._exp_penalty(overrun, limit), 2)
 
         os.makedirs(session_folder, exist_ok=True)
-        img_path = os.path.join(session_folder, "TOTAL_TIME_OF_ENTRY_Comparison.jpg")
+        img_path = os.path.join(session_folder, "TOTAL_TIME_OF_ENTRY_Comparison.png")
         txt_path = os.path.join(session_folder, "TOTAL_TIME_OF_ENTRY_Comparison.txt")
 
-        fps = 30.0
-        threshold = 2.0
+        fallback_fps = 30.0
+        base_threshold = 1.0
+        second_threshold = 2.0
         n_tracks_cfg: Optional[int] = None
 
         if isinstance(config, dict):
-            fps = float(config.get("frame_rate", fps) or fps)
-            threshold = float(config.get("entry_time_threshold_sec", threshold) or threshold)
-            if config.get("POD") is not None:
-                try:
-                    n_tracks_cfg = int(len(config.get("POD")))
-                except Exception:
+            fallback_fps = float(config.get("frame_rate", fallback_fps) or fallback_fps)
+            base_threshold = float(config.get("HESITATION_THRESHOLD", base_threshold) or base_threshold)
+            second_threshold = float(
+                config.get("HESITATION_THRESHOLD_SECOND", base_threshold * 2.0) or (base_threshold * 2.0)
+            )
+            try:
+                n_tracks_cfg = team_size(config)
+                if n_tracks_cfg <= 0:
                     n_tracks_cfg = None
+            except Exception:
+                n_tracks_cfg = None
+
+        # Each run's own video fps lives in its RunMetadata sidecar. We read
+        # them separately so the trainee + reference may have been recorded at
+        # different frame rates without distorting the x-axis conversion.
+        trainee_fps = resolve_fps_from_metadata(session_folder, fallback=fallback_fps) or fallback_fps
+        reference_fps = resolve_fps_from_metadata(expert_folder, fallback=fallback_fps) or fallback_fps
 
         pos_expert = _load_position_cache(expert_folder)
         pos_trainee = _load_position_cache(session_folder)
@@ -221,81 +226,106 @@ class TotalEntryTime_Metric(AbstractMetric):
         expert_frames = [row["start_frame"] for row in expert_entries]
         trainee_frames = [row["start_frame"] for row in trainee_entries]
 
-        def _span_seconds(frames: List[int]) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[float]]:
+        def _span_seconds(frames: List[int], side_fps: float) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[float]]:
             if len(frames) < 2:
                 return None, None, None, None
             first_frame = int(frames[0])
             last_frame = int(frames[-1])
             delta_frames = last_frame - first_frame
-            delta_secs = float(delta_frames / fps) if fps > 0 else None
+            delta_secs = float(delta_frames / side_fps) if side_fps > 0 else None
             return first_frame, last_frame, delta_frames, delta_secs
 
-        _, _, _, expert_delta_secs = _span_seconds(expert_frames)
-        _, _, _, trainee_delta_secs = _span_seconds(trainee_frames)
+        _, _, _, reference_delta_secs = _span_seconds(expert_frames, reference_fps)
+        _, _, _, trainee_delta_secs = _span_seconds(trainee_frames, trainee_fps)
+        reference_limit_secs = _allowed_total_entry_duration(len(expert_frames), base_threshold, second_threshold)
+        trainee_limit_secs = _allowed_total_entry_duration(len(trainee_frames), base_threshold, second_threshold)
+        plot_limit_secs = _allowed_total_entry_duration(n_tracks, base_threshold, second_threshold) if n_tracks > 0 else 0.0
 
-        expert_score = _score(expert_delta_secs, threshold)
-        trainee_score = _score(trainee_delta_secs, threshold)
+        reference_score = _score(reference_delta_secs, reference_limit_secs)
+        trainee_score = _score(trainee_delta_secs, trainee_limit_secs)
 
         delta_time = None
-        if expert_delta_secs is not None and trainee_delta_secs is not None:
-            delta_time = float(trainee_delta_secs - expert_delta_secs)
+        if reference_delta_secs is not None and trainee_delta_secs is not None:
+            delta_time = float(trainee_delta_secs - reference_delta_secs)
 
         try:
             fig, ax = plt.subplots(figsize=(11.5, 3.6), constrained_layout=True)
 
-            def _to_rel_seconds(frames: List[int]) -> List[float]:
+            def _to_rel_seconds(frames: List[int], side_fps: float) -> List[float]:
                 if not frames:
                     return []
                 first = frames[0]
-                return [float((frame - first) / fps) for frame in frames]
+                return [float((frame - first) / side_fps) for frame in frames]
 
-            expert_t = _to_rel_seconds(expert_frames)
-            trainee_t = _to_rel_seconds(trainee_frames)
+            reference_t = _to_rel_seconds(expert_frames, reference_fps)
+            trainee_t = _to_rel_seconds(trainee_frames, trainee_fps)
 
-            if expert_t:
-                ax.scatter(expert_t, [1.0] * len(expert_t), label="Expert")
-                ax.hlines(1.0, min(expert_t), max(expert_t), linewidth=2)
-                ax.text(max(expert_t) + 0.05, 1.0, f"{(expert_delta_secs or 0.0):.2f}s", va="center")
+            if reference_t:
+                ax.scatter(reference_t, [1.0] * len(reference_t),
+                           color=_REFERENCE_COLOR, s=80, zorder=3, label="Reference")
+                ax.hlines(1.0, min(reference_t), max(reference_t),
+                          colors=_REFERENCE_COLOR, linewidth=2.5, zorder=2)
+                ax.text(max(reference_t) + 0.05, 1.0,
+                        f"{(reference_delta_secs or 0.0):.2f}s", va="center")
 
             if trainee_t:
-                ax.scatter(trainee_t, [0.0] * len(trainee_t), label="Trainee")
-                ax.hlines(0.0, min(trainee_t), max(trainee_t), linewidth=2)
-                ax.text(max(trainee_t) + 0.05, 0.0, f"{(trainee_delta_secs or 0.0):.2f}s", va="center")
+                ax.scatter(trainee_t, [0.0] * len(trainee_t),
+                           color=_TRAINEE_COLOR, s=80, zorder=3, label="Trainee")
+                ax.hlines(0.0, min(trainee_t), max(trainee_t),
+                          colors=_TRAINEE_COLOR, linewidth=2.5, zorder=2)
+                ax.text(max(trainee_t) + 0.05, 0.0,
+                        f"{(trainee_delta_secs or 0.0):.2f}s", va="center")
 
-            ax.axvline(threshold, linestyle="--", linewidth=1.5, label=f"{threshold:.2f}s threshold")
+            if plot_limit_secs > 0:
+                ax.axvline(
+                    plot_limit_secs,
+                    linestyle="--",
+                    color="#ef4444",
+                    linewidth=1.8,
+                    label=f"{plot_limit_secs:.2f}s allowed span",
+                )
             ax.set_yticks([0.0, 1.0])
-            ax.set_yticklabels(["Trainee", "Expert"])
+            ax.set_yticklabels(["Trainee", "Reference"])
             ax.set_xlabel("Seconds since first team entry")
-            ax.set_title("Total time of entry: Expert vs Trainee")
+            ax.set_title("Total time of entry: Trainee vs Reference")
             ax.grid(True, axis="x", linestyle="--", alpha=0.4)
             ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, framealpha=0.9)
-            fig.subplots_adjust(right=0.78)
 
-            plt.savefig(img_path, dpi=150)
+            plt.savefig(img_path, dpi=200, bbox_inches="tight")
             plt.close(fig)
         except Exception:
             pass
 
-        expert_span_str = "N/A" if expert_delta_secs is None else f"{expert_delta_secs:.2f}s"
+        reference_span_str = "N/A" if reference_delta_secs is None else f"{reference_delta_secs:.2f}s"
         trainee_span_str = "N/A" if trainee_delta_secs is None else f"{trainee_delta_secs:.2f}s"
-        expert_score_str = "N/A" if expert_score is None else f"{expert_score:.2f}"
+        reference_score_str = "N/A" if reference_score is None else f"{reference_score:.2f}"
         trainee_score_str = "N/A" if trainee_score is None else f"{trainee_score:.2f}"
 
         if delta_time is None:
             time_part = "I couldn't compare total entry time because one side did not have enough valid entrants."
         elif abs(delta_time) <= 0.05:
-            time_part = "Overall entry timing looks about the same as the expert."
+            time_part = "Overall entry timing looks about the same as the reference."
         elif delta_time < 0:
-            time_part = f"Overall, the trainee team got everyone in about {abs(delta_time):.2f}s faster than the expert."
+            time_part = f"Overall, the trainee team got everyone in about {abs(delta_time):.2f}s faster than the reference."
         else:
-            time_part = f"Overall, the trainee team was about {abs(delta_time):.2f}s slower than the expert to get everyone in."
+            time_part = f"Overall, the trainee team was about {abs(delta_time):.2f}s slower than the reference to get everyone in."
 
         scores_part = (
             f"Spans and scores → Trainee: {trainee_span_str} (score {trainee_score_str}), "
-            f"Expert: {expert_span_str} (score {expert_score_str})."
+            f"Reference: {reference_span_str} (score {reference_score_str})."
         )
 
-        thresholds_part = f"Threshold: full score when team entry span is at or below {threshold:.2f}s."
+        if reference_limit_secs == trainee_limit_secs:
+            thresholds_part = (
+                f"Allowed team entry span: {reference_limit_secs:.2f}s based on {len(trainee_frames)} entrants, "
+                f"using {base_threshold:.2f}s per gap and {second_threshold:.2f}s for entrants 2->3."
+            )
+        else:
+            thresholds_part = (
+                f"Allowed team entry span -> Trainee: {trainee_limit_secs:.2f}s ({len(trainee_frames)} entrants), "
+                f"Reference: {reference_limit_secs:.2f}s ({len(expert_frames)} entrants). "
+                f"Uses {base_threshold:.2f}s per gap and {second_threshold:.2f}s for entrants 2->3."
+            )
 
         text = time_part + "\n" + scores_part + "\n" + thresholds_part
 

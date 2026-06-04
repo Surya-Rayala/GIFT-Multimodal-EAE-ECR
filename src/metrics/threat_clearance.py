@@ -1,4 +1,3 @@
-import glob
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -7,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from .metric import AbstractMetric
+from ._shared import pick_latest
 from src.helper_functions import compute_threat_clearance
 
 
@@ -61,12 +61,7 @@ class ThreatClearance_Metric(AbstractMetric):
         _map_image=None,
         config: Optional[dict] = None,
     ):
-        def _pick_latest(folder: str, pattern: str) -> Optional[str]:
-            matches = glob.glob(os.path.join(folder, pattern))
-            if not matches:
-                return None
-            matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return matches[0]
+        _pick_latest = pick_latest
 
         def _inroom_id_start_from_config(cfg: Optional[dict]) -> int:
             if cfg and isinstance(cfg, dict):

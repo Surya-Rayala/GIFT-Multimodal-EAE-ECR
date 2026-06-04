@@ -1,14 +1,16 @@
 # GIFT Multimodal EAE
 
-GIFT Multimodal EAE is a Python-based integration engine for processing session videos using metadata provided in a `.vmeta.xml` file.
+Python integration engine for processing session videos using metadata in a `.vmeta.xml` file. Person detection (RTMDet-m) + pose estimation (RTMPose-x, Halpe-26) run from the in-repo [`libs/giftpose/`](libs/giftpose/) library — pure PyTorch / numpy / opencv, no OpenMMLab dependencies at runtime.
 
 ## Contents
 
 - [Requirements](#requirements)
 - [Installation](#installation)
-- [Scaled Point Mapper tool](#scaled-point-mapper-tool-place-points-using-real-world-distances)
-- [Mapper tool](#mapper-tool)
-- [Config Builder tool](#config-builder-tool)
+- [Desktop tools — the setup pipeline](#desktop-tools--the-setup-pipeline)
+  - [1. Scaled Point Viewer](#1-scaled-point-viewer)
+  - [2. Mapper tool](#2-mapper-tool)
+  - [3. Config Builder tool](#3-config-builder-tool)
+  - [5. Analysis Viewer](#5-analysis-viewer)
 - [Usage](#usage)
 - [Vmeta format](#vmetaxml-format)
 - [Config file](#config-file-spaceenvironment-metadata)
@@ -17,296 +19,221 @@ GIFT Multimodal EAE is a Python-based integration engine for processing session 
 
 ## Requirements
 
-- **Conda (recent version)** — Anaconda, Miniconda, **or** Miniforge
-  - Use a **newer Conda** to avoid long hangs at `Solving environment`.
-  - Recommended baseline: **conda >= 24.x**.
-
-> All required environment details are specified in `environment.yml`. If you need additional packages, add them to `environment.yml` so the environment remains reproducible.
+- **Conda (recent version)** — Anaconda, Miniconda, or Miniforge (recommended ≥ 24.x).
 
 ## Installation
-
-### Step 0 — Install Conda
-
-Install either **Anaconda** or **Miniconda**:
-
-- Anaconda: https://www.anaconda.com/products/individual
-- Miniconda: https://docs.conda.io/en/latest/miniconda.html
-- Miniforge (recommended): https://github.com/conda-forge/miniforge
-
----
-
-### Step 1 — Clone the repository
 
 ```bash
 git clone https://github.com/Surya-Rayala/GIFT-Multimodal-EAE-ECR.git
 cd GIFT-Multimodal-EAE-ECR
-```
-
----
-
-### Step 2 — Create the Conda environment
-
-Create the environment from `environment.yml`:
-
-```bash
 conda env create -f environment.yml
+conda activate gift-meae
 ```
 
-> If environment creation hangs for a long time at **Solving environment**, cancel it (Ctrl+C), enable the faster solver, then re-run **Step 2**:
->
+> If `Solving environment` hangs:
 > ```bash
 > conda install -n base conda-libmamba-solver -y
 > conda config --set solver libmamba
 > ```
 
+Drop your fine-tuned `models/pose.pth` and `models/detect-best-mAP.pth` (or any other names you point at via the vmeta config) into `models/`. Mmengine optimizer / EMA / metadata blobs are stripped in-memory at load time — no preprocessing step is required.
 
----
+### Hugging Face token
 
-### Step 3 — Activate the environment
+The transcription pipeline pulls WhisperX (`large-v3`) and wav2vec2 alignment weights from Hugging Face on first run, so a token is required.
+
+Generate one at <https://huggingface.co/settings/tokens> (read scope is enough), then store it once with the CLI:
 
 ```bash
 conda activate gift-meae
+hf auth login
+# paste the hf_xxxxxxxxxxxxxxxxxxxxxxxx token when prompted
 ```
 
-#### Install video dependencies (required)
-
-Install FFmpeg and related libraries via conda **after** activating the environment:
+This writes `~/.cache/huggingface/token`; every subsequent run picks it up automatically. Verify:
 
 ```bash
-conda install -c conda-forge ffmpeg opencv
+python -c "from huggingface_hub import HfApi; print(HfApi().whoami())"
 ```
 
-On **macOS**, the project typically works without this step.
+Prints your Hugging Face username + email when the token is valid.
 
----
+### CUDA users
 
-
-### CUDA + PyTorch (GPU machines only)
-
-If you are using a **CUDA-enabled** machine, this project targets **CUDA 12+** (recommended: **12.1**).
-
-This step is **only needed on CUDA-enabled devices**.
-
-**Uninstall any existing PyTorch packages** in this environment:
+PyTorch picks the right CUDA build at install. For the optional ONNX-CUDA backend, swap `onnxruntime` for `onnxruntime-gpu`:
 
 ```bash
-pip uninstall -y torch torchvision torchaudio
+pip install --force-reinstall onnxruntime-gpu
 ```
 
-Next, install compatible **PyTorch (CUDA 12.1)** using Pip:
+For the TensorRT backend (`*.engine`), install `tensorrt` via pip per NVIDIA's pip-install guide for your CUDA version: <https://docs.nvidia.com/deeplearning/tensorrt/latest/installing-tensorrt/install-pip.html>.
+
+### Optional — accelerated runtime artifacts
+
+The engine runs straight off `*.pth`. To upgrade to a faster backend, export once:
 
 ```bash
-pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu121
+# ONNX 
+python -m libs.giftpose.export.onnx_export
+
+# TorchScript 
+python -m libs.giftpose.export.torchscript_export --device cpu  --verify
+python -m libs.giftpose.export.torchscript_export --device mps  --verify
+python -m libs.giftpose.export.torchscript_export --device cuda --verify   # NVIDIA
+
+# TensorRT (NVIDIA only, additional speedup) — auto-exports ONNX from .pth if the .onnx artifacts aren't already present.
+python -m libs.giftpose.export.trt_build
 ```
 
-Right after installing PyTorch, **verify CUDA is visible** before installing any OpenMMLab packages:
+The runtime auto-selects per device:
+
+| device | order |
+|---|---|
+| cuda | TensorRT (`*.engine`) → ONNX-CUDA-EP → TorchScript → PyTorch |
+| cpu  | ONNX-CPU-EP → TorchScript → PyTorch |
+| mps  | TorchScript-MPS → PyTorch (ONNX/CoreML skipped — graph fragments) |
+
+Confirm which backend was picked:
 
 ```bash
-python -c "import torch; print('torch', torch.__version__); print('cuda available:', torch.cuda.is_available()); print('mps available:', hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()); print('device count (cuda):', torch.cuda.device_count() if torch.cuda.is_available() else 0)"
+python -c "from libs.giftpose.runtime.autoselect import select_backend; print(type(select_backend('models/detect-best-mAP.pth', 'models/pose.pth', device='mps')).__name__)"
 ```
 
-⚠️ **Caution:** Make sure `cuda available: True` (and ideally `device count (cuda) > 0`) **at this step** before running any `mim install ...` commands. OpenMMLab wheels (especially `mmcv`) are selected based on your installed PyTorch/CUDA setup. If CUDA is not detected here, `mim` may fall back to incompatible wheels or attempt a source build.
+## Desktop tools — the setup pipeline
 
-Once PyTorch is verified, continue with the `mim` installs below.
+Authoring a scenario is a short pipeline. Run the tools in this order; each one
+feeds the next:
 
----
+1. **Scaled Point Viewer** — `python -m src.utils.scaled_point_viewer`
+   Place real-world reference points on the room map from wall measurements.
+2. **Mapper tool** — `python -m src.utils.mapper_viewer`
+   Align the camera to the map, and mark entry zones, POD targets, and the room boundary.
+3. **Config Builder** — `python -m src.utils.config_builder_app`
+   Bundle the mapper outputs + scoring knobs into a ready-to-use `config.json`.
+4. **Run the engine** — `run_engine_local.py` (local) / `run_engine.py` (server) — see [Usage](#usage).
+5. **Analysis Viewer** — `python -m src.utils.analysis_viewer`
+   View and compare the results.
 
-### Step 4 — Install the OpenMMLab libraries (one-time setup)
+### Node.js is auto-installed
 
-With the environment active, install the OpenMMLab stack using `mim` (provided by the `openmim` package in the environment).
+The three desktop apps (Scaled Point Viewer, Mapper, Analysis Viewer) are
+Tauri + Vue apps. **You don't need to install Node.js yourself** — on first
+launch each app reuses a system Node ≥ 20 if present, otherwise downloads a
+small portable Node into `~/.cache/gift-meae/node/` and installs the frontend
+packages once. The first launch can take a minute (download + build); later
+launches start in seconds. The three apps share a single hoisted `node_modules`
+and one Rust build cache (`.build/`) so they don't each consume gigabytes.
 
-> Versions are pinned to avoid known compatibility issues.
+### What gets committed to git
+
+Only source is tracked. The generated artifacts — `node_modules/`, `dist/`,
+`src-tauri/target/`, `.build/`, and the portable-Node cache — are git-ignored and
+rebuilt on first launch. Data and weights are not shared either: `input/` ships
+empty and `output/`, `models/`, `work_dirs/`, and `tests/` are ignored. A fresh
+clone therefore stays lightweight; the desktop apps regenerate what they need.
+
+## 1. Scaled Point Viewer
+
+Standalone desktop app (Tauri + Vue 3 + FastAPI sidecar) that places **accurate
+reference points on a map** when all you know is each point's **real-world
+distance to its two nearest walls** and those **walls' real lengths**. The saved
+points are later used to set up the camera↔map homography in the Mapper.
 
 ```bash
-mim install "mmengine>=0.7.1,<1.0.0"
-mim install "mmcv>=2.0.0rc4,<2.2.0"
-mim install "mmdet>=3.1.0,<3.3.0"
+conda activate gift-meae
+python -m src.utils.scaled_point_viewer
 ```
 
----
+### How it works (in plain English)
 
-### Step 5 — Install MMPose
+You don't enter pixel coordinates — you draw the walls and type real measurements:
 
-```bash
-mim install "mmpose>=1.1.0"
+1. **Setup** — pick the map image, a save folder, a project name, and your unit (ft/m/in).
+2. **Draw Walls** — click two points to draw each wall, then type its real length.
+   The tool turns all your walls into **one consistent map scale** (pixels per
+   real unit). Using several walls — and longer ones — makes that scale accurate,
+   so a point stays correct even when one wall is short or **cut by a corridor**.
+3. **Place Points** — click a wall (Wall A), then the adjacent wall at the same
+   corner (Wall B), and type the point's distance from each. An orange preview
+   shows where it lands; **Add point** commits it. Oblique (non-90°) corners are
+   handled correctly, not just square ones.
+
+It saves three files (named with your project prefix): `<name>_scaled_points.txt`
+(map-pixel coordinates), `<name>_scaled_points.png` (the map with points drawn),
+and `<name>_scaler_project.json` (reload/edit later). It replaces the older PyQt5
+`scaled_point_mapper_app`, fixing the corridor / short-wall scaling problems.
+
+### How to take the measurements
+
+```
+                 wall A  (e.g. 20 ft long)
+        ┌───────────────────────────────────
+        │              ·  ← your point P
+        │              ╎
+ wall B │   distFromB  ╎ distFromA      distFromA = straight-line (perpendicular)
+ (16 ft)│  ┄┄┄┄┄┄┄┄┄┄┄┄·                  distance from P to wall A
+        │              ╎                 distFromB = perpendicular distance from
+        │              ╎                  P to wall B
+      corner where wall A and wall B meet
 ```
 
-#### macOS (Apple Silicon) note
+- For each point, use its **two nearest adjacent walls** — the two walls of the
+  corner it sits closest to.
+- Each distance is the **perpendicular (shortest, straight-out) distance** from the
+  point to that wall — measured at a right angle to the wall. It is **not** the
+  diagonal to the corner, and not measured along the floor at an angle.
+- **Keep units consistent.** Use the same unit (ft, m, or in) for every wall
+  length and every distance.
+- Stand inside the room; distances are positive. The two walls **don't** have to
+  meet at 90° — oblique corners work, as long as you give each wall's true length
+  and the two perpendicular distances.
 
-On **macOS**, this project is supported in **CPU mode only** by default. MPS/GPU acceleration is **not officially supported** because MMCV’s NMS op does not provide an MPS implementation and will error at runtime (e.g., `nms_impl: implementation for device mps:0 not found`). 
+## 2. Mapper tool
 
-##### Optional (advanced) — Enable MPS by patching MMCV NMS
+Cross-platform desktop app that helps you author the four per-room files the config builder needs (Tauri shell + Vue 3 frontend + FastAPI Python sidecar). Walks you through Setup → Align Camera to Map → Mark Entry Zones → Mark POD Targets → Outline the Room as a 5-step wizard, with contextual help on each step.
 
-If you still want to run with `device=mps`, you can patch the installed MMCV NMS implementation to force the NMS call onto CPU (your exact workaround). This is a **local environment hack** and may be overwritten if you reinstall MMCV.
+The four output files (named with your project prefix):
 
-1) Run the pipeline once with `device=mps`. When it crashes, read the traceback and find:
-
-- the **file path** under `site-packages/mmcv/ops/` (often `mmcv/ops/nms.py`)
-- the **exact line number** where it fails
-- the **op name** mentioned in the failing call (examples: `ext_module.nms`, `ext_module.nms_rotated`, `ext_module.nms_quadri`, `ext_module.softnms`)
-
-Example (yours will differ):
-
-```text
-File "/opt/anaconda3/envs/gift-meae/lib/python3.8/site-packages/mmcv/ops/nms.py", line 27, in forward
-    inds = ext_module.nms(
-```
-
-2) Open **Finder** → press **⌘⇧G** (Go to Folder…) → paste the folder path from the traceback (everything up to `/mmcv/ops/`).
-
-3) Open the file from the traceback (for example `nms.py`) and jump to the **exact line number** reported.
-
-4) Patch the failing `ext_module.<op>(...)` call by forcing its tensor inputs to CPU.
-
-- If it is **standard NMS** (`ext_module.nms`), you will typically see something like this at the error line:
-
-```python
-inds = ext_module.nms(
-            bboxes, scores, iou_threshold=float(iou_threshold), offset=offset)
-```
-
-Change it to the following (exactly):
-
-```python
-inds = ext_module.nms(
-            bboxes.cpu(), scores.cpu(), iou_threshold=float(iou_threshold), offset=offset)
-inds.to(bboxes.device)
-```
-
-- If the traceback shows a **different op**, apply the similar pattern.
-
-That is the only change needed to avoid the MPS NMS crash.
-
----
-
-### Optional — Verify installation
-
-```bash
-# Torch + device availability
-python -c "import torch; print('torch', torch.__version__); print('cuda available:', torch.cuda.is_available()); print('mps available:', hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()); print('device count (cuda):', torch.cuda.device_count() if torch.cuda.is_available() else 0)"
-python -c "import mmcv; print('mmcv', mmcv.__version__)"
-python -c "import mmdet; print('mmdet', mmdet.__version__)"
-python -c "import mmpose; print('mmpose', mmpose.__version__)"
-```
-
-## Scaled Point Mapper tool (place points using real-world distances)
-
-This repository also includes a small GUI tool that helps you place **accurate points on a map** when you only know their **real-world distances** to two **adjacent walls**.
+- `*_mapping.txt` — camera↔map point pairs (homography) → `point_mapping_path`
+- `*_entry_polygons.txt` — entry/door regions on the map → `entry_polys_path`
+- `*_POD_points.txt` — single points on the map → `POD`
+- `*_room_boundary.txt` — outline of the walkable/trackable area → `Boundary`
 
 ### What it’s for (in plain English)
 
-If you can measure (in the real room) how far something is from two walls that meet at a corner (for example: a table corner, a camera tripod spot, a POD location), this tool will place that point on the map image **in the correct spot**.
-
-You do this by:
-
-1) drawing the two walls on the map image, and
-2) entering the real measurements.
-
-### How to open
-
-```bash
-python -m src.utils.scaled_point_mapper_app
-```
-
-(Like the other GUI tools in this repo, it’s launched as a module; only the module name is different.)
-
-### Basic workflow
-
-1) **Load Map Image**
-   - Click **Load Map Image** and choose the same map image you use in your scenario (`MapPath`).
-
-2) **Add Walls (draw the walls on the map)**
-   - Click **Add Walls**.
-   - Click two points on the map to create one wall segment.
-   - Keep adding wall segments until you have the **two walls that meet at the corner** near your target point.
-   - Tip: existing wall endpoints show as small dots — click a dot to reuse an endpoint exactly (this keeps corners clean).
-
-3) **Add Scaled Point (place a point using measurements)**
-   - Click **Add Scaled Point**.
-   - Select the first wall (click the wall line), then click **Mark Selected Wall as A**.
-   - Select the second wall (must share the corner with A), then click **Mark Selected Wall as B**.
-   - Enter:
-     - **Wall A real length** (real-world length of wall A)
-     - **Wall B real length** (real-world length of wall B)
-     - **Distance to Wall B (along A)** (how far from the corner you travel *along wall A* before reaching the perpendicular distance to wall B)
-     - **Distance to Wall A (along B)** (how far from the corner you travel *along wall B* before reaching the perpendicular distance to wall A)
-   - Click **Add Point**.
-
-4) **Repeat for more points (optional)**
-   - Add as many points as you need. Points remain visible even if you switch back to wall mode.
-
-5) **Save Output Image (Points Only)**
-   - Click **Save Output Image (Points Only)**.
-   - This saves a copy of the map image with **only the points drawn** (no walls). This is useful as a visual reference.
-
-### Notes / tips
-
-- **Keep units consistent.** You can use feet, meters, inches, etc — just use the **same units everywhere** for wall lengths and distances.
-- **Walls must be adjacent.** Wall A and Wall B must share a corner endpoint.
-- **Walls are just helpers.** The engine/config does not consume the wall lines; they are only used to compute point placement.
-- If a computed point would land outside the map image, the tool clamps it to the image boundary.
-
-
-## Mapper tool
-
-This repository includes a small **GUI helper app** that lets you click on images to generate the data files that the config builder needs:
-
-- **Homography mapping** (camera pixels → map pixels)
-- **Entry polygons** (door/entry regions on the map)
-- **Map points** (single points on the map; can be used for PODs or other reference points)
-- **Room boundary** (the valid walkable/trackable area on the map)
-
-### What it’s for (in plain English)
-
-Think of the engine as taking people detected in the **camera video** and placing them onto a **top‑down map** of the room.
-
-This mapper app helps you “teach” the system how to translate between those two views by:
+The engine takes people detected in the **camera video** and places them onto a **top‑down map** of the room. This mapper teaches the system how to translate between those two views by:
 
 1) picking matching points in the camera view and the map (so the system knows how to line them up), and
-2) drawing the important regions on the map (where the room boundary is, where entries are, and key points like POD locations).
+2) drawing the important regions on the map (where the room boundary is, where entries are, and POD locations).
 
-### How to open
+### Run
 
 ```bash
-python -m src.utils.mapper_app
+conda activate gift-meae
+python -m src.utils.mapper_viewer
 ```
 
-(Depending on your repo layout, the module may also be named `src.utils.mapper`.)
+A native window opens. **Node.js is auto-installed** on first launch (see
+[Node.js is auto-installed](#nodejs-is-auto-installed)) and the frontend packages
+install once into the shared workspace `node_modules`; later launches start in
+seconds. The Rust shell spawns the Python sidecar internally and tears it down on
+window close — no other terminals to manage.
 
 ### Basic workflow
 
-1) **Load Map Image**
-   - Choose the static map image (the same file you reference as `MapPath` in the config).
+1) **Setup** — pick the map image, a camera reference (a video — then scrub to the frame you want — or a single frame image), the save folder, and a short project name.
 
-2) **Load Video** (or **Load Frame Image**)
-   - Choose a representative video for the scenario, or a single frame image.
+2) **Align Camera to Map** — alternate clicks: a recognizable spot in the **Camera** view, then the matching spot on the **Map**. Aim for 4+ well-spread pairs. Drag any existing point to fine-tune. **Save this step** writes `<project>_mapping.txt`.
 
-3) **Mapping tab (Homography)**
-   - Click a recognizable point in the **Camera** view (green), then click the matching point on the **Map** (red).
-   - Repeat for multiple point pairs (more is better; aim for >=5 spread across the room).
-   - Click **Save Mapping TXT** to export a `*_mapping.txt` file.
+3) **Mark Entry Zones** — on the **Map**, click vertices around each door/entry. Press **Confirm polygon** to close (don’t draw the closing edge yourself). Press **New polygon** for additional zones. **Save this step** writes `<project>_entry_polygons.txt`.
 
-4) **Entry Regions tab**
-   - Click around a door/entry area on the **Map** to create a polygon.
-   - Click **Confirm Polygon**, then **New Polygon** to add more.
-   - Click **Save Regions TXT** to export a `*_entry_polygons.txt` file.
+4) **Mark POD Targets** — on the **Map**, click to drop each POD pin. **Save this step** writes `<project>_POD_points.txt`.
 
-5) **Map Points tab**
-   - Click points on the **Map** (one click = one point).
-   - Click **Save Points TXT** to export a `*_map_points.txt` file.
+5) **Outline the Room** — on the **Map**, click vertices along the walls (CW or CCW). Press **Confirm boundary** when finished. **Save this step** writes `<project>_room_boundary.txt`.
 
-6) **Room Boundary tab**
-   - Click around the room outline on the **Map** to create the boundary polygon.
-   - Click **Confirm Boundary**, then **Save Boundary TXT** to export a `*_room_boundary.txt` file.
+You can navigate freely between steps via the progress bar at the top. The Next button is gated only on Setup (mandatory fields). Each canvas supports pan (drag), zoom (Ctrl + scroll), and point drag.
 
-### How these outputs map to the config
-
-- `*_mapping.txt` → used to build `point_mapping_path`
-- `*_entry_polygons.txt` → used to build `entry_polys_path`
-- `*_map_points.txt` → often used to populate `POD` (or other reference points)
-- `*_room_boundary.txt` → used to populate `Boundary`
-
-## Config Builder tool
+## 3. Config Builder tool
 
 This repository also includes a **GUI config builder** that helps you assemble a valid `config.json` for a scenario without hand-editing JSON.
 
@@ -381,6 +308,31 @@ The app will not enable **Save** until all required items are selected:
   - POD points + boundary + entry polygons must be in the same pixel coordinate system as the map image.
   - The point mapping file must map from **video pixels** to **map pixels** for that same map image.
 - If you move your Input Folder, re-open the builder and re-save so relative paths remain valid.
+
+
+## 5. Analysis Viewer
+
+Cross-platform desktop viewer for `{basename}_Analysis.json` (Tauri shell + Vue 3 frontend + FastAPI Python sidecar). Replaces the legacy PyQt5 viewer.
+
+A **Compare** toggle in the central pane swaps the video stage for a side-by-side comparison view: pick any other run from the same outputs folder (expert runs are flagged automatically), pick a metric, and see your score vs the reference, the saved per-metric visualizations, and a plain-English summary. Grading is relative to the chosen reference run — not an absolute threshold — because what counts as "good" varies room-to-room.
+
+> **Node.js is auto-installed** on first launch — see [Node.js is auto-installed](#nodejs-is-auto-installed). No manual Node setup is needed.
+
+### Run
+
+```bash
+conda activate gift-meae
+
+# Open the viewer (use the in-app Open... button to pick a run folder)
+python -m src.utils.analysis_viewer
+
+# Or auto-load a run folder on startup
+python -m src.utils.analysis_viewer output/trainee_Test_Video_20260521_165915/
+```
+
+Each run folder is one of the per-run directories the engine writes under `output/` (it contains a `RunInfo.json` manifest plus the Analysis.json, caches, and rendered videos). The Compare-mode dropdown lists every sibling run folder in the same outputs root.
+
+A native window opens. Node.js is auto-installed on first launch and frontend packages install once into the shared workspace `node_modules`; later launches start in seconds. The Rust shell spawns the Python sidecar internally and tears it down on window close — no other terminals to manage.
 
 
 ## Usage
@@ -504,11 +456,11 @@ A typical config looks like this (comments shown here for explanation; your actu
   "entry_polys_path": "Misc-Data/generated_entry_polys.txt",
   "MapPath": "Misc-Data/map_image.png",
 
-  "det_model": "libs/mmpose/demo/mmdetection_cfg/rtmdet_m_640-8xb32_coco-person.py",
-  "det_weights": "models/detect.pth",
+  "det_model": "rtmdet-m-person-640",
+  "det_weights": "models/detect-best-mAP.pth",
   "det_cat_ids": [0],
 
-  "pose2d_config": "libs/mmpose/configs/body_2d_keypoint/rtmpose/body8/rtmpose-x_8xb256-700e_body8-halpe26-384x288.py",
+  "pose2d_config": "rtmpose-x-halpe26-384x288",
   "pose2d_weights": "models/pose.pth",
 
   "box_conf_threshold": 0.3,
@@ -539,8 +491,8 @@ A typical config looks like this (comments shown here for explanation; your actu
 #### Path resolution
 
 - Paths such as `Misc-Data/...` are typically **relative to the Input Folder**.
-- The `det_model` / `pose2d_config` paths are typically **relative to the repository root** (they point into `libs/...`).
-- Model weights such as `models/detect.pth` and `models/pose.pth` are typically **relative to the repository root** (or wherever you keep your weights).
+- `det_model` / `pose2d_config` are **architecture tags** consumed by the in-repo runtime (`rtmdet-m-person-640` / `rtmpose-x-halpe26-384x288`). The legacy `libs/mmpose/...` config-string paths are still accepted (deprecated; resolves to the same tags).
+- Model weights such as `models/detect-best-mAP.pth` and `models/pose.pth` are typically **relative to the repository root**. Drop new fine-tuned `.pth` checkpoints in directly — the runtime strips optimizer/EMA/meta blobs in-memory at load time.
 
 If you reorganize folders, update these paths accordingly.
 
@@ -564,18 +516,17 @@ If you reorganize folders, update these paths accordingly.
 
 ##### Models and inference
 
-- `det_model`: MMDetection config used by the pose inferencer for **person detection**.
+- `det_model`: detector **architecture tag** — currently `rtmdet-m-person-640`. The legacy MMDetection config-string path also works (deprecated).
 - `det_weights`: checkpoint weights for the detector.
-- `det_cat_ids`: detector category IDs to keep (commonly `[0]` for COCO person).
+- `det_cat_ids`: detector category IDs to keep (commonly `[0]` for COCO person; the deployed person detector is single-class so this is informational).
 
-- `pose2d_config`: MMPose config for **2D pose**.
+- `pose2d_config`: pose **architecture tag** — currently `rtmpose-x-halpe26-384x288`.
 - `pose2d_weights`: checkpoint weights for the 2D pose model.
 
-- `box_conf_threshold`: minimum bounding-box confidence to accept a detection.
+- `box_conf_threshold`: minimum bounding-box confidence to accept a detection (post-NMS filter).
 - `pose_conf_threshold`: minimum keypoint confidence to accept keypoints and render gaze/triangles.
 
-- `device`: compute device for inference (e.g., `cpu`, `cuda`, `mps`).
-  - **macOS note:** MPS is not officially supported by default due to MMCV NMS limitations; see the macOS note in Installation.
+- `device`: compute device for the PyTorch backend (e.g., `cpu`, `cuda`, `mps`). The runtime upgrades to ONNX or TensorRT automatically when `models/*.onnx` / `models/*.engine` artifacts are present alongside the weights — see [Step 5 — Optional Export](#step-5--optional-export-accelerated-runtime-artifacts) for how to produce them.
 
 ##### Tracking and boundary behavior
 
@@ -687,182 +638,3 @@ python run_engine_local.py input/test.vmeta.xml --verbose
 # Force transcode and write outputs to a custom directory
 python run_engine_local.py input/test.vmeta.xml --force_transcode --output_path ./my_outputs/
 ```
-## Expert comparison (expert vs trainee)
-
-The engine includes an **expert comparison** helper that compares a trainee run against a reference **expert** run for a single metric.
-
-### What `compare_expert(...)` expects
-
-`ProcessingEngine.compare_expert(metric_name, session_folder, expert_folder, vmeta_path)` expects:
-
-- `metric_name` (string)
-  - The name/ID of the metric you want to compare (example: `IDENTIFY_AND_CAPTURE_POD`).
-
-- `session_folder` (string path)
-  - Path to a **completed output folder** from running the engine on the **trainee** team.
-
-- `expert_folder` (string path)
-  - Path to a **completed output folder** from running the engine on the **expert** (reference) team.
-
-- `vmeta_path` (string path)
-  - Path to the **same** `.vmeta.xml` you used to run both sessions.
-
-In other words: you first run the pipeline twice (once for expert, once for trainee) so you have two output directories. Then you pass those two output directories into `compare_expert`.
-
-
-### Supported expert-comparison metrics
-
-The `metric_name` argument must be one of the following supported metric IDs:
-
-- `IDENTIFY_AND_CAPTURE_POD`
-- `POD_CAPTURE_TIME`
-- `STAY_ALONG_WALL`
-- `ENTRANCE_VECTORS`
-- `ENTRANCE_HESITATION`
-- `THREAT_CLEARANCE`
-- `TEAMMATE_COVERAGE`
-- `THREAT_COVERAGE`
-- `FLOOR_COVERAGE`
-- `TOTAL_FLOOR_COVERAGE_TIME`
-
-If a metric is not in this list, `compare_expert` may return an error artifact and a message indicating the metric is not implemented.
-
-### How to test (simple step-by-step)
-
-1) **Run the engine for the expert team** and save outputs to a dedicated folder:
-
-```bash
-python run_engine_local.py /path/to/session.vmeta.xml --output_path /path/to/expert_output --verbose
-```
-
-2) **Run the engine for the trainee team** and save outputs to a different folder:
-
-```bash
-python run_engine_local.py /path/to/session.vmeta.xml --output_path /path/to/trainee_output --verbose
-```
-
-3) **Run the comparison script** and point it at those two output folders.
-
-Example `test_expert.py`:
-
-```python
-from src.processing_engine import ProcessingEngine
-
-# Output folders produced by steps (1) and (2)
-expert_folder = "/path/to/expert_output"
-session_folder = "/path/to/trainee_output"
-
-# Metric you want to compare
-metric_name = "IDENTIFY_AND_CAPTURE_POD"
-
-# The vmeta used for both runs
-vmeta_path = "/path/to/session.vmeta.xml"
-
-engine = ProcessingEngine()
-result = engine.compare_expert(metric_name, session_folder, expert_folder, vmeta_path)
-print(result)
-```
-
-Run it:
-
-```bash
-python test_expert.py
-```
-
-
-### Common gotchas
-
-- The `expert_folder` and `session_folder` must be the **engine output folders** (the same paths you passed via `--output_path`).
-- Make sure both runs are generated from the same scenario/config and the same `.vmeta.xml` so the comparison is meaningful.
-- `metric_name` must match the metric ID used by the engine.
-
-### Where expert-comparison artifacts are saved
-
-When you call `compare_expert(...)`, any generated images or tables (such as side-by-side visualizations or difference overlays) are **saved into the session (trainee) output folder**—that is, under the `session_folder` argument you pass in.
-
-- If you pass `--output_path` when running the engine, that is the root of your `session_folder`, so all expert-comparison artifacts will live somewhere under that folder.
-
-### Returned elements (schema) from expert comparison
-
-The result returned by `compare_expert(...)` is always a **JSON-serializable dict**.  
-All expert-comparison artifacts (images and text files) are written into the **session (trainee) output folder** (`session_folder`).
-
-There are three possible return shapes depending on the metric type.
-
----
-
-#### 1) Side-by-side image metrics
-
-Used by metrics such as:
-
-- `IDENTIFY_AND_CAPTURE_POD`
-- `STAY_ALONG_WALL`
-- `ENTRANCE_VECTORS`
-
-Return schema:
-
-```json
-{
-  "Name": "<METRIC_ID>",
-  "Type": "SideBySide",
-  "ExpertImageLocation": "<session_folder>/<METRIC_ID>_Expert.jpg",
-  "TraineeImageLocation": "<session_folder>/<METRIC_ID>_Trainee.jpg",
-  "TxtLocation": "<session_folder>/<METRIC_ID>_Comparison.txt",
-  "Text": "<structured summary + CSV block>"
-}
-```
-
-Notes:
-
-- Both expert and trainee images are written into the `session_folder`.
-- `Text` contains a structured summary followed by a comma-separated table.
-
----
-
-#### 2) Single-image metrics
-
-Used by metrics such as:
-
-- `ENTRANCE_HESITATION`
-- `TOTAL_TIME_OF_ENTRY`
-- `TOTAL_FLOOR_COVERAGE_TIME`
-
-Return schema:
-
-```json
-{
-  "Name": "<METRIC_ID>",
-  "Type": "Single",
-  "ImgLocation": "<session_folder>/<METRIC_ID>_Comparison.jpg",
-  "TxtLocation": "<session_folder>/<METRIC_ID>_Comparison.txt",
-  "Text": "<structured summary (and optional CSV block)>"
-}
-```
-
-Notes:
-
-- Only one comparison image is generated.
-- `Text` may contain only summary lines (e.g., total-time metrics) or a summary followed by a CSV table (e.g., entrance hesitation).
-
----
-
-### Structure of the `Text` field
-
-For metrics that include detailed comparisons, the returned `Text` string follows this structure:
-
-```
-<High-level summary sentence(s)>
-
-<CSV header line>
-<CSV row 1>
-<CSV row 2>
-...
-```
-
-Important:
-
-- The returned `Text` always uses **comma-separated rows** for machine readability.
-- The saved `.txt` file contains a formatted (aligned) table version of the same data.
-- Callers should not assume a fixed number of lines; instead, parse by splitting on newlines.
-
-Callers should treat unknown keys in the returned dict as metric-specific and avoid hard-coding assumptions beyond the documented schema above.

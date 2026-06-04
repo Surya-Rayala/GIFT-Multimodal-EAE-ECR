@@ -1,12 +1,47 @@
 import csv
 import math
 import os
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 
 import cv2
 import numpy as np
 from shapely.errors import GEOSException
 from shapely.geometry import GeometryCollection, LineString, MultiPolygon, Point, Polygon
+
+# ``src.metrics._shared`` is imported lazily inside ``assign_pods_by_entry`` to
+# avoid an import cycle: ``src.metrics.__init__`` pulls in ``threat_clearance``,
+# which itself imports from this module. Type-only references are gated behind
+# ``TYPE_CHECKING`` so static analyzers still resolve them.
+if TYPE_CHECKING:
+    from src.metrics._shared import DoorAxes  # noqa: F401
+
+
+# ----------------------------------------------------------------------
+# Drill-window helpers
+# ----------------------------------------------------------------------
+
+
+def _in_window(frame_idx: int, start_frame: Optional[int], end_frame: Optional[int]) -> bool:
+    """Return True when ``frame_idx`` is within the inclusive drill window.
+
+    Either bound may be ``None`` to disable that side of the clamp. When both
+    are ``None`` the call is a no-op and every frame is in-window.
+    """
+    if start_frame is not None and frame_idx < start_frame:
+        return False
+    if end_frame is not None and frame_idx > end_frame:
+        return False
+    return True
+
+
+def _windowed_frame_range(
+    max_frame: int, start_frame: Optional[int], end_frame: Optional[int]
+) -> range:
+    """Return a clamped 1-indexed inclusive range over ``[start, end] ∩ [1, max_frame]``."""
+    s = max(1, int(start_frame)) if start_frame is not None else 1
+    e = min(int(max_frame), int(end_frame)) if end_frame is not None else int(max_frame)
+    return range(s, e + 1) if e >= s else range(0)
+
 
 # ----------------------------------------------------------------------
 # Frame source helpers: stream frames from a video file.
@@ -350,6 +385,8 @@ def annotate_camera_video(
     gaze_conf_threshold: float = 0.3,
     *,
     video_path: Optional[str] = None,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
 ):
     skeleton = [
         (15, 13), (13, 11), (11, 19),
@@ -363,6 +400,11 @@ def annotate_camera_video(
         (15, 24), (16, 21), (16, 23),
         (16, 25),
     ]
+
+    if start_frame is not None or end_frame is not None:
+        tracker_output = [
+            f for f in tracker_output if _in_window(int(f.get("frame", 0)), start_frame, end_frame)
+        ]
 
     inroom_ids = _normalize_inroom_ids(inroom_ids)
     predefined_colors, track_colors = _build_track_color_cache()
@@ -428,7 +470,14 @@ def annotate_camera_with_gaze_triangle(
     show_inroom_gaze: bool = True,
     *,
     video_path: Optional[str] = None,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
 ):
+    if start_frame is not None or end_frame is not None:
+        tracker_output = [
+            f for f in tracker_output if _in_window(int(f.get("frame", 0)), start_frame, end_frame)
+        ]
+
     inroom_ids = _normalize_inroom_ids(inroom_ids)
     predefined_colors, track_colors = _build_track_color_cache()
 
@@ -493,7 +542,14 @@ def annotate_clearance_video(
     inroom_ids: List[int] = None,
     *,
     video_path: Optional[str] = None,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
 ):
+    if start_frame is not None or end_frame is not None:
+        tracker_output = [
+            f for f in tracker_output if _in_window(int(f.get("frame", 0)), start_frame, end_frame)
+        ]
+
     inroom_ids = _normalize_inroom_ids(inroom_ids)
     predefined_colors, track_colors = _build_track_color_cache()
 
@@ -559,6 +615,9 @@ def annotate_map_video(
     video_basename: str,
     inroom_ids: List[int] = None,
     total_frames: Optional[int] = None,
+    *,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
 ):
     inroom_ids = _normalize_inroom_ids(inroom_ids)
     predefined_colors, track_colors = _build_track_color_cache()
@@ -575,7 +634,7 @@ def annotate_map_video(
     permanent_vis = map_image.copy()
     last_pos: Dict[int, Tuple[float, float]] = {}
 
-    for frame_num in range(1, max_frame + 1):
+    for frame_num in _windowed_frame_range(max_frame, start_frame, end_frame):
         temp_vis = permanent_vis.copy()
         for tid, mx, my in points_per_frame.get(frame_num, []):
             color = _get_track_color(tid, inroom_ids, track_colors, predefined_colors)
@@ -604,6 +663,8 @@ def annotate_map_pod_video(
     video_basename: str,
     total_frames: Optional[int] = None,
     inroom_ids: Optional[List[int]] = None,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
 ):
     inroom_ids = _normalize_inroom_ids(inroom_ids)
     predefined_colors, track_colors = _build_track_color_cache()
@@ -642,7 +703,7 @@ def annotate_map_pod_video(
     h, w = map_image.shape[:2]
     writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"avc1"), frame_rate, (w, h))
 
-    for frame_idx in range(1, max_frame + 1):
+    for frame_idx in _windowed_frame_range(max_frame, start_frame, end_frame):
         vis = map_image.copy()
         frame_polys = dynamic_work_areas.get(frame_idx, {})
 
@@ -680,6 +741,8 @@ def annotate_map_pod_with_paths_video(
     total_frames: Optional[int] = None,
     inroom_ids: Optional[List[int]] = None,
     fill_alpha: float = 0.35,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
 ):
     inroom_ids = _normalize_inroom_ids(inroom_ids)
     predefined_colors, track_colors = _build_track_color_cache()
@@ -721,7 +784,7 @@ def annotate_map_pod_with_paths_video(
     permanent_trails = map_image.copy()
     last_pos: Dict[int, Tuple[float, float]] = {}
 
-    for frame_idx in range(1, max_frame + 1):
+    for frame_idx in _windowed_frame_range(max_frame, start_frame, end_frame):
         vis = permanent_trails.copy()
         frame_polys = dynamic_work_areas.get(frame_idx, {})
 
@@ -857,9 +920,9 @@ def save_metrics_cache(
     cache_path = os.path.join(output_directory, f"{video_basename}_Metrics.csv")
     with open(cache_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["metric_name", "score", "assessment"])
+        writer.writerow(["metric_name", "score"])
         for entry in metrics:
-            writer.writerow([entry["metric_name"], entry["score"], entry["assessment"]])
+            writer.writerow([entry["metric_name"], entry["score"]])
 
 
 # ----------------------------------------------------------------------
@@ -922,7 +985,14 @@ def compute_threat_clearance(
     intersection_frames: int = 30,
     wrist_frames: int = 7,
     gaze_frames: int = 15,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
 ) -> Dict[int, Tuple[Optional[int], Optional[int], Optional[int]]]:
+    if start_frame is not None or end_frame is not None:
+        tracker_output = [
+            f for f in tracker_output if _in_window(int(f.get("frame", 0)), start_frame, end_frame)
+        ]
+
     inroom_ids = _normalize_inroom_ids(inroom_ids)
     if not inroom_ids:
         return {}
@@ -1035,6 +1105,9 @@ def annotate_map_with_gaze(
     enable_boundary: bool = True,
     total_frames: Optional[int] = None,
     accumulated_clear: bool = False,
+    *,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
 ):
     inroom_ids = _normalize_inroom_ids(inroom_ids)
 
@@ -1070,7 +1143,7 @@ def annotate_map_with_gaze(
         cv2.fillPoly(room_mask, [room_poly_xy], 1)
         covered_mask = np.zeros((map_h, map_w), dtype=np.uint8)
 
-        for frame_idx in range(1, max_frame + 1):
+        for frame_idx in _windowed_frame_range(max_frame, start_frame, end_frame):
             for trk_id, (ox_px, oy_px, dx, dy) in gaze_by_frame.get(frame_idx, []):
                 if trk_id in inroom_ids:
                     continue
@@ -1166,7 +1239,7 @@ def annotate_map_with_gaze(
         writer.release()
         return
 
-    for frame_idx in range(1, max_frame + 1):
+    for frame_idx in _windowed_frame_range(max_frame, start_frame, end_frame):
         base_map = map_image.copy()
         for trk_id, (ox_px, oy_px, dx, dy) in gaze_by_frame.get(frame_idx, []):
             if trk_id in inroom_ids and not show_inroom_gaze:
@@ -1230,6 +1303,8 @@ def annotate_camera_tracking_with_clearance(
     show_clearing_id: bool = True,
     *,
     video_path: Optional[str] = None,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
 ):
     skeleton = [
         (15, 13), (13, 11), (11, 19),
@@ -1243,6 +1318,11 @@ def annotate_camera_tracking_with_clearance(
         (15, 24), (16, 21), (16, 23),
         (16, 25),
     ]
+
+    if start_frame is not None or end_frame is not None:
+        tracker_output = [
+            f for f in tracker_output if _in_window(int(f.get("frame", 0)), start_frame, end_frame)
+        ]
 
     inroom_ids = _normalize_inroom_ids(inroom_ids)
     predefined_colors, track_colors = _build_track_color_cache()
@@ -1321,6 +1401,9 @@ def compute_room_coverage(
     total_frames: Optional[int] = None,
     inroom_ids: List[int] = None,
     half_angle_deg: float = 30.0,
+    *,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
 ) -> Dict[str, object]:
     inroom_ids = _normalize_inroom_ids(inroom_ids)
 
@@ -1360,7 +1443,7 @@ def compute_room_coverage(
     coverage_per_frame: List[Tuple[int, float]] = []
     time_to_full: Optional[float] = None
 
-    for frame_idx in range(1, max_frame + 1):
+    for frame_idx in _windowed_frame_range(max_frame, start_frame, end_frame):
         for trk_id, (ox_px, oy_px, dx, dy) in gaze_by_frame.get(frame_idx, []):
             if trk_id in inroom_ids:
                 continue
@@ -1431,8 +1514,33 @@ def assign_pods_by_entry(
     boundary: Optional[Polygon] = None,
     pod_groups: Optional[List[str]] = None,
     frame_rate: float = 30.0,
-    entry_direction_k_sec: float = 2.0,
+    door_axes: "Optional[Sequence[DoorAxes]]" = None,
 ) -> Dict[int, Optional[int]]:
+    """Assign each entrant to a POD using door-axis-derived entry direction.
+
+    Direction estimator: least-squares 2D velocity over the entry window
+    (shared with ``EntranceVectors_Metric`` — single source of truth).
+
+    Side classification: projection of the entrant's displacement onto the
+    door's two reference path axes ``(p̂_A, p̂_B)``; whichever projection is
+    larger wins. Works uniformly for straight and corner doors.
+
+    The function falls back gracefully when door axes are unavailable
+    (e.g. legacy callers without entry polygons): in that case the previous
+    boundary-projection behavior is used purely as a last-resort heuristic.
+    """
+    # Lazy imports to dodge the helper_functions ↔ src.metrics package cycle:
+    # importing ``src.metrics.*`` at module-load time would re-enter this
+    # module before its top-level definitions are bound.
+    from src.metrics._shared import (
+        classify_entry_side,
+        door_for_entry,
+        first_entry_frame,
+        fit_entry_velocity,
+        select_entry_tracks,
+    )
+    from src.metrics.entrance_vectors import ENTRY_VECTOR_WINDOW_SEC
+
     if boundary is None:
         raise ValueError("`boundary` Polygon is required.")
 
@@ -1440,36 +1548,47 @@ def assign_pods_by_entry(
         pods = pods.tolist()
 
     inroom_ids = _normalize_inroom_ids(inroom_ids)
-    friend_tracks = {tid: traj for tid, traj in tracks_by_id.items() if tid not in inroom_ids}
-    if not friend_tracks or not pods:
+    if not tracks_by_id or not pods:
         return {}
 
-    def first_frame(item):
-        trk = item[1]
-        try:
-            return _first_valid_index(trk)
-        except ValueError:
-            return float("inf")
+    # The assigner caps by available POD count rather than team_size — fewer
+    # PODs than entrants → only the first N entrants get assignments.
+    items = select_entry_tracks(
+        tracks_by_id,
+        inroom_ids=inroom_ids,
+        num_tracks=len(pods),
+    )
+    if not items:
+        return {}
 
-    items = sorted(friend_tracks.items(), key=lambda kv: sum(p is not None for p in kv[1]), reverse=True)[: len(pods)]
-    items.sort(key=first_frame)
+    doors_seq: list = list(door_axes) if door_axes else []
 
     first_tid, first_trk = items[0]
-    idx0 = _first_valid_index(first_trk)
-    entry_xy = first_trk[idx0]
-    entry_pt = Point(entry_xy)
+    start_idx = first_entry_frame(first_trk, doors_seq)
+    if start_idx is None:
+        start_idx = _first_valid_index(first_trk)
+    entry_xy = first_trk[start_idx] if start_idx is not None else None
+    if entry_xy is None:
+        # Degenerate input — return empty assignment rather than asserting.
+        return {tid: None for tid, _ in items}
 
-    boundary_line = LineString(boundary.exterior.coords)
-    door_pt = boundary_line.interpolate(boundary_line.project(entry_pt))
+    door = door_for_entry(entry_xy, doors_seq) if doors_seq else None
 
-    k_frames = max(1, int(round(entry_direction_k_sec * frame_rate)))
-    pts_future = [pt for pt in first_trk[idx0 + 1 : idx0 + 1 + k_frames] if pt is not None]
-    mean_dir = None
-    if pts_future:
-        mean_vec = np.mean(np.array(pts_future, dtype=float), axis=0) - np.array(entry_xy, dtype=float)
-        n = float(np.linalg.norm(mean_vec))
-        if n > 1e-6:
-            mean_dir = (mean_vec / n).astype(float)
+    # Reference point for POD-side geometry: door polygon centroid when we
+    # have door axes; otherwise the boundary-projection point (legacy fallback).
+    if door is not None:
+        door_pt = Point(door.centroid)
+    else:
+        boundary_line = LineString(boundary.exterior.coords)
+        door_pt = boundary_line.interpolate(boundary_line.project(Point(entry_xy)))
+
+    # LSQ velocity → window-equivalent displacement vector.
+    v = fit_entry_velocity(first_trk, start_idx, frame_rate, ENTRY_VECTOR_WINDOW_SEC)
+    if v is not None:
+        m_vec = v * float(ENTRY_VECTOR_WINDOW_SEC)
+    else:
+        m_vec = None
+    sign, _, _, _ = classify_entry_side(m_vec, door)
 
     def _valid_groups(pg: Optional[List[str]]) -> Optional[List[str]]:
         if pg is None or not isinstance(pg, list) or len(pg) != len(pods):
@@ -1484,6 +1603,9 @@ def assign_pods_by_entry(
 
     pg = _valid_groups(pod_groups)
 
+    # ------------------------------------------------------------------
+    # Path A — explicit pod_groups (A/B) supplied
+    # ------------------------------------------------------------------
     if pg is not None:
         pods_A = [i for i, g in enumerate(pg) if g == "A"]
         pods_B = [i for i, g in enumerate(pg) if g == "B"]
@@ -1500,13 +1622,19 @@ def assign_pods_by_entry(
             assignment: Dict[int, Optional[int]] = {}
             for (tid, _), pod_idx in zip(items, ordered):
                 assignment[tid] = pod_idx
-            for tid, _ in items[len(ordered) :]:
+            for tid, _ in items[len(ordered):]:
                 assignment[tid] = None
             return assignment
 
+        # Group alignment: which group's centroid-from-door direction better
+        # matches the first entrant's movement direction.
         def _group_alignment(group_indices: List[int]) -> float:
-            if mean_dir is None:
+            if m_vec is None:
                 return 0.0
+            mn = float(np.linalg.norm(m_vec))
+            if mn <= 1e-9:
+                return 0.0
+            m_hat = np.asarray(m_vec, dtype=float) / mn
             best = -1e9
             ox, oy = float(door_pt.x), float(door_pt.y)
             for pi in group_indices:
@@ -1516,7 +1644,7 @@ def assign_pods_by_entry(
                 if n <= 1e-6:
                     continue
                 v /= n
-                best = max(best, float(np.dot(v, mean_dir)))
+                best = max(best, float(np.dot(v, m_hat)))
             return best
 
         score_A = _group_alignment(pods_A)
@@ -1557,31 +1685,96 @@ def assign_pods_by_entry(
 
         return assignment
 
-    centre_pt = Point(boundary.centroid.coords[0])
-    if mean_dir is not None:
-        v_centre = np.array([centre_pt.x, centre_pt.y], dtype=float) - np.array(entry_xy, dtype=float)
-        z_cross = float(np.cross(v_centre, mean_dir))
-        movement_sign = -1 if z_cross < 0 else +1
+    # ------------------------------------------------------------------
+    # Path B — no pod_groups: split PODs by which path axis they fall on,
+    # then alternate starting from the first entrant's classified side.
+    # ------------------------------------------------------------------
+    if door is not None:
+        # Project each POD onto (p̂_A, p̂_B) from the door centroid; whichever
+        # axis it aligns with more becomes its side.
+        p_a = np.asarray(door.p_a, dtype=float)
+        p_b = np.asarray(door.p_b, dtype=float)
+        ox, oy = float(door.centroid[0]), float(door.centroid[1])
+
+        def _pod_side(idx: int) -> int:
+            px, py = pods[idx]
+            v = np.array([float(px) - ox, float(py) - oy], dtype=float)
+            n = float(np.linalg.norm(v))
+            if n <= 1e-9:
+                return +1
+            v_hat = v / n
+            pa = float(np.dot(v_hat, p_a))
+            pb = float(np.dot(v_hat, p_b))
+            return +1 if pa >= pb else -1
+
+        def _pod_dist(idx: int) -> float:
+            px, py = pods[idx]
+            return float(Point(px, py).distance(door_pt))
+
+        pod_meta = []
+        for idx in range(len(pods)):
+            pod_meta.append({"idx": idx, "side": _pod_side(idx), "dist": _pod_dist(idx)})
+
+        # Within each side, prefer the deeper PODs first (mirrors prior
+        # "perim sort" intent in a coordinate-free way).
+        pods_pos = sorted(
+            (d for d in pod_meta if d["side"] == +1),
+            key=lambda d: d["dist"],
+            reverse=True,
+        )
+        pods_neg = sorted(
+            (d for d in pod_meta if d["side"] == -1),
+            key=lambda d: d["dist"],
+            reverse=True,
+        )
+
+        # First entrant's classified side. UNKNOWN → default to +1 so we
+        # still produce a deterministic assignment.
+        movement_sign = sign if sign != 0 else +1
     else:
-        movement_sign = -1
+        # Legacy fallback — keep the old boundary-cross-product split when no
+        # door axes are available. This branch is never hit in normal runs
+        # because `processing_engine.py` now passes `door_axes` through.
+        boundary_line = LineString(boundary.exterior.coords)
+        centre_pt = Point(boundary.centroid.coords[0])
+        if m_vec is not None:
+            v_centre = (
+                np.array([centre_pt.x, centre_pt.y], dtype=float)
+                - np.array(entry_xy, dtype=float)
+            )
+            z_cross = float(np.cross(v_centre, np.asarray(m_vec, dtype=float)))
+            movement_sign = -1 if z_cross < 0 else +1
+        else:
+            movement_sign = -1
 
-    divider_v = np.array([centre_pt.x, centre_pt.y], dtype=float) - np.array([door_pt.x, door_pt.y], dtype=float)
+        divider_v = (
+            np.array([centre_pt.x, centre_pt.y], dtype=float)
+            - np.array([door_pt.x, door_pt.y], dtype=float)
+        )
 
-    def _side(pt: Point) -> int:
-        v = np.array([pt.x, pt.y], dtype=float) - np.array([door_pt.x, door_pt.y], dtype=float)
-        return 1 if float(np.cross(divider_v, v)) >= 0 else -1
+        def _side(pt: Point) -> int:
+            v = np.array([pt.x, pt.y], dtype=float) - np.array([door_pt.x, door_pt.y], dtype=float)
+            return 1 if float(np.cross(divider_v, v)) >= 0 else -1
 
-    door_s = boundary_line.project(door_pt)
-    pod_meta = []
-    for idx, pod in enumerate(pods):
-        proj_pt = boundary_line.interpolate(boundary_line.project(Point(pod)))
-        side = _side(proj_pt)
-        pod_s = boundary_line.project(proj_pt)
-        perim = ((pod_s - door_s) if side == -1 else (door_s - pod_s)) % boundary_line.length
-        pod_meta.append({"idx": idx, "side": side, "perim": perim})
+        door_s = boundary_line.project(door_pt)
+        pod_meta = []
+        for idx, pod in enumerate(pods):
+            proj_pt = boundary_line.interpolate(boundary_line.project(Point(pod)))
+            side = _side(proj_pt)
+            pod_s = boundary_line.project(proj_pt)
+            perim = ((pod_s - door_s) if side == -1 else (door_s - pod_s)) % boundary_line.length
+            pod_meta.append({"idx": idx, "side": side, "perim": perim})
 
-    pods_pos = sorted((d for d in pod_meta if d["side"] == +1), key=lambda d: d["perim"], reverse=True)
-    pods_neg = sorted((d for d in pod_meta if d["side"] == -1), key=lambda d: d["perim"], reverse=True)
+        pods_pos = sorted(
+            (d for d in pod_meta if d["side"] == +1),
+            key=lambda d: d["perim"],
+            reverse=True,
+        )
+        pods_neg = sorted(
+            (d for d in pod_meta if d["side"] == -1),
+            key=lambda d: d["perim"],
+            reverse=True,
+        )
 
     assignment: Dict[int, Optional[int]] = {}
     idx_pos = idx_neg = 0
@@ -1826,11 +2019,21 @@ def run_pod_analysis(
     save_cache: bool = False,
     output_directory: str = "",
     video_basename: str = "",
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
+    door_axes: "Optional[Sequence[DoorAxes]]" = None,
 ) -> Tuple[
     Dict[int, Optional[int]],
     Dict[int, Dict[int, Polygon]],
     Dict[int, Dict[str, Optional[float]]],
 ]:
+    # ``start_frame`` / ``end_frame`` are accepted for forward-compatibility
+    # with the drill-window pipeline. Today the inner POD analysis still
+    # consumes the full sequence — the consuming POD metrics window their
+    # own outputs via ``MetricContext.drill_*`` so trim semantics are
+    # preserved at the metric layer.
+    del start_frame, end_frame  # currently unused; see comment above.
+
     inroom_ids = _normalize_inroom_ids(inroom_ids)
 
     assignment = assign_pods_by_entry(
@@ -1840,7 +2043,7 @@ def run_pod_analysis(
         boundary=boundary,
         pod_groups=pod_groups,
         frame_rate=frame_rate,
-        entry_direction_k_sec=2.0,
+        door_axes=door_axes,
     )
 
     initial_work_areas = compute_pod_working_areas(

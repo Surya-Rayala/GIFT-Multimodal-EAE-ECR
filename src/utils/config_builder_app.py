@@ -50,16 +50,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "entry_polys_path": "",
     "MapPath": "",
 
-    # models (advanced defaults)
-    "det_model": "libs/mmpose/demo/mmdetection_cfg/rtmdet_m_640-8xb32_coco-person.py",
-    "det_weights": "models/detect.pth",
+    # models (advanced defaults). Tags resolve to in-repo giftpose builders;
+    # the legacy ``libs/mmpose/...`` config-string paths are also accepted.
+    "det_model": "rtmdet-m-person-640",
+    "det_weights": "models/detect-best-mAP.pth",
     "det_cat_ids": [0],
-    "pose2d_config": "libs/mmpose/configs/body_2d_keypoint/rtmpose/body8/rtmpose-x_8xb256-700e_body8-halpe26-384x288.py",
+    "pose2d_config": "rtmpose-x-halpe26-384x288",
     "pose2d_weights": "models/pose.pth",
 
     # thresholds (advanced defaults)
     "box_conf_threshold": 0.3,
     "pose_conf_threshold": 0.3,
+    "flip_test": False,
+    "compile_for_inference": False,
 
     # tracker / runtime (advanced defaults)
     "keypoint_indices": [15, 16],
@@ -72,6 +75,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "visual_angle_degrees": 20.0,
     "min_threat_interaction_time_sec": 1.0,
     "entry_time_threshold_sec": 2.0,
+    "team_size": 4,
     "HESITATION_THRESHOLD": 1.0,
     "HESITATION_THRESHOLD_SECOND": 2.0,
 
@@ -81,15 +85,24 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "pod_time_limits": [5.0],
     "pod_groups": ["A"],
 
-    # coverage / wall (main defaults)
+    # coverage (main defaults)
     "coverage_time_threshold": 3.0,
-    "stay_along_wall_pWall": 0.2,
 
     # gaze keypoints (advanced defaults)
     "gaze_keypoint_map": {"NOSE": 0, "LEYE": 1, "REYE": 2, "LEAR": 3, "REAR": 4},
 
     # optional comparison override
     "frame_rate": 30.0,
+
+    # audio + transcription (advanced defaults)
+    "preserve_audio": True,
+    "enable_transcription": True,
+    "transcription_device": "cpu",
+    "enable_denoise": False,
+    "denoise_device": "cpu",
+    # drill window auto-detection (advanced defaults)
+    "drill_window_enabled": True,
+    "drill_window_required_words": "room,clear",
 }
 
 COMMENTS: Dict[str, str] = {
@@ -107,6 +120,8 @@ COMMENTS: Dict[str, str] = {
 
     "box_conf_threshold": "Minimum bbox confidence to accept a detection.",
     "pose_conf_threshold": "Minimum keypoint confidence to accept pose keypoints and render gaze/triangles.",
+    "flip_test": "When true, the pose model also runs on a horizontally-flipped copy of each crop and averages the two outputs (~0.5-1 px better keypoint accuracy on hard / occluded cases). Doubles the per-frame pose batch and roughly doubles pose forward time. Default false for speed; enable if accuracy matters more than fps.",
+    "compile_for_inference": "When true, runs a one-time graph optimizer at backend construction (PyTorch: torch.compile; TorchScript: torch.jit.optimize_for_inference). Adds 30-120s of startup cost in exchange for faster steady-state inference. No effect on ONNX / TensorRT backends — those graphs are already optimized at session/engine build time. Default false; enable for long-running sessions where startup cost is amortized.",
     "keypoint_indices": "Which keypoints the tracker uses for keypoint-based positioning logic.",
     "device": "Compute device for inference (e.g., 'cpu', 'cuda', 'mps').",
 
@@ -117,6 +132,7 @@ COMMENTS: Dict[str, str] = {
     "visual_angle_degrees": "Full field-of-view angle (degrees) used for gaze triangles, map gaze/coverage, and threat-clearance.",
     "min_threat_interaction_time_sec": "Minimum interaction time (seconds) required to count a threat as cleared.",
     "entry_time_threshold_sec": "Max allowed team entry span (seconds) for full score in TOTAL_TIME_OF_ENTRY.",
+    "team_size": "Number of friendly entrants the team-entry metrics evaluate (entrance hesitation, total entry time, entrance vectors). Independent of POD count: a room may have N PODs but a team of M people. When omitted, falls back to the number of POD points for backward compatibility with older saved configs.",
     "HESITATION_THRESHOLD": "No-penalty hesitation gap (seconds) used for all consecutive entrant pairs except the second pair. Doctrine allows some delay between entrants 2 and 3 in case of any adverse action in the room.",
     "HESITATION_THRESHOLD_SECOND": "Special no-penalty hesitation gap (seconds) used only for the gap between entrants 2→3. This second threshold is intentionally more permissive because doctrine allows some delay there in case of any adverse action in the room.",
 
@@ -126,10 +142,18 @@ COMMENTS: Dict[str, str] = {
     "pod_groups": "Per-POD grouping label (A/B). Group PODs that belong to the same side/segment of the room to allow assignment to people moving either left or right from the entry",
 
     "coverage_time_threshold": "Seconds of sustained coverage needed for full score in TOTAL_FLOOR_COVERAGE_TIME.",
-    "stay_along_wall_pWall": "Sensitivity/threshold for STAY_ALONG_WALL metric (higher usually means stricter wall adherence).",
 
     "gaze_keypoint_map": "Keypoint indices (Halpe26) used to compute gaze direction (nose/eyes/ears).",
     "frame_rate": "(Optional) Override FPS used in comparisons; normally set automatically from video during processing.",
+
+    # audio + transcription
+    "preserve_audio": "When true, camera-view annotated videos keep the original audio track (muxed via ffmpeg). Map-view videos remain silent. Harmless if the source has no audio.",
+    "enable_transcription": "When true, WhisperX runs on the source audio and saves a _Transcription.json sidecar with word-level timestamps. Default on. Whisper model and language detection are fixed at developer defaults (large-v3 + auto-detect) — only the device is user-tunable. The first run downloads several GB of model weights (~3 GB large-v3 + ~360 MB wav2vec2 per language); subsequent runs reuse the HuggingFace cache.",
+    "transcription_device": "Compute device for WhisperX ASR + alignment. cpu or cuda only — faster-whisper (CTranslate2) has no MPS backend; if mps is set (e.g. shared with the pose pipeline) the transcription pass auto-falls-back to cpu with a warning.",
+    "enable_denoise": "When true, runs Facebook Denoiser (dns64 model) on the source audio before WhisperX as an optional speech-enhancement pass. Improves ASR accuracy on noisy field audio. Only the transcription consumes the denoised audio — saved annotated videos always keep the original audio track. The denoised audio is preserved as {basename}_denoised.wav for verification. First use downloads ~128 MB checkpoint to ~/.cache/torch/hub/checkpoints/.",
+    "denoise_device": "Compute device for FB Denoiser. cpu or cuda only — Demucs's internal conv1d exceeds the MPS 65536-output-channel kernel limit; if mps is set the denoiser auto-falls-back to cpu with a warning. Independent of transcription_device. Ignored when enable_denoise is false.",
+    "drill_window_enabled": "When true, enables auto-detection of drill start (first tracker entry crossing) and drill end (latest transcript segment containing every word in drill_window_required_words). All metrics, artifact videos, and audio are trimmed to the detected window. Defer + slice transcription so WhisperX only processes the post-entry audio. Default true.",
+    "drill_window_required_words": "Comma-separated list of words that must all appear in a transcript segment for it to qualify as the drill-end callout. Order doesn't matter, fillers between are fine, and matching is lowercase + punctuation-stripped. Default 'room,clear'.",
 
     # UI-only
     "project_root": "Project root folder used to save config.json and make selected paths relative when possible.",
@@ -287,24 +311,43 @@ class ConfigModel:
         return out
 
     def set_path(self, key: str, file_path: str) -> None:
-        """Store relative-to-root if possible."""
-        if self.project_root:
-            try:
-                rel = os.path.relpath(file_path, self.project_root)
-                if not rel.startswith(".."):
-                    self.data[key] = rel.replace("\\", "/")
-                    return
-            except Exception:
-                pass
-        self.data[key] = file_path
+        """Store a path in portable form using its anchor (see :data:`PATH_ANCHORS`).
+
+        Config-anchored paths are stored relative to the chosen project root
+        (the directory where the JSON will be saved). Project-anchored paths
+        are stored relative to the repository root computed at import time.
+        Anything that can't be made relative (different drive, no anchor set)
+        is stored as the absolute form with forward-slash separators.
+        """
+        from .paths import PATH_ANCHORS, PROJECT_ROOT, relativize_path
+
+        if not isinstance(file_path, str) or not file_path:
+            self.data[key] = ""
+            return
+
+        anchor = PATH_ANCHORS.get(key, "config")
+        if anchor == "project":
+            base = PROJECT_ROOT
+        else:
+            base = self.project_root or PROJECT_ROOT
+
+        if not base:
+            self.data[key] = file_path.replace(os.sep, "/")
+            return
+        self.data[key] = relativize_path(file_path, base_dir=base)
 
     def resolve_path(self, key: str) -> str:
+        """Inverse of :meth:`set_path`: returns an absolute path for display
+        and on-disk lookups."""
+        from .paths import PATH_ANCHORS, PROJECT_ROOT, resolve_config_path
+
         v = self.data.get(key, "")
         if not isinstance(v, str) or not v:
             return ""
-        if self.project_root and not os.path.isabs(v):
-            return os.path.join(self.project_root, v)
-        return v
+
+        anchor = PATH_ANCHORS.get(key, "config")
+        config_dir = self.project_root or PROJECT_ROOT
+        return resolve_config_path(v, config_dir=config_dir, anchor=anchor)
 
 
 # ----------------------------
@@ -330,7 +373,6 @@ class MapPreview(QGraphicsView):
 
         self._pix_item: Optional[QGraphicsPixmapItem] = None
         self._boundary_item: Optional[QGraphicsPolygonItem] = None
-        self._wall_band_item: Optional[QGraphicsPathItem] = None
         self._pod_items: List[QGraphicsEllipseItem] = []
         self._pod_labels: List[QGraphicsTextItem] = []
         self._radius_items: List[QGraphicsEllipseItem] = []
@@ -380,7 +422,6 @@ class MapPreview(QGraphicsView):
         self._radius_items.clear()
         self._pix_item = None
         self._boundary_item = None
-        self._wall_band_item = None
 
         # Map
         map_path = self.model.resolve_path("MapPath")
@@ -414,16 +455,9 @@ class MapPreview(QGraphicsView):
             self._boundary_item.setBrush(QBrush(Qt.NoBrush))
             self._boundary_item.setZValue(10)
             self.scene.addItem(self._boundary_item)
-
-            # Wall band: outer - inner(buffered inward). Works for concave boundaries.
-            pWall = float(self.model.data.get("stay_along_wall_pWall", 0.2))
-            band_path = self._compute_wall_band_path(boundary, pWall)
-            if band_path is not None:
-                self._wall_band_item = QGraphicsPathItem(band_path)
-                self._wall_band_item.setPen(QPen(QColor(0, 0, 0, 0)))
-                self._wall_band_item.setBrush(QBrush(QColor(0, 200, 255, 55)))
-                self._wall_band_item.setZValue(9)
-                self.scene.addItem(self._wall_band_item)
+            # Note: STAY_ALONG_WALL no longer uses a global band drawn here.
+            # The runtime band is per-person (shoulder-to-elbow length scaled
+            # to map units), so a static preview overlay would be misleading.
 
         # POD points + labels + radius circles
         pods = self.model.data.get("POD", [])
@@ -504,115 +538,6 @@ class MapPreview(QGraphicsView):
         self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
         if getattr(self, "_user_zoom", 1.0) != 1.0:
             self.scale(self._user_zoom, self._user_zoom)
-
-    def _compute_wall_band_path(self, boundary_pts: List[List[int]], pWall: float) -> Optional[QPainterPath]:
-        pts = [(float(x), float(y)) for x, y in boundary_pts]
-        if len(pts) < 3:
-            return None
-
-        outer = Polygon(pts)
-        if outer.is_empty or not outer.is_valid:
-            outer = outer.buffer(0)
-        if outer.is_empty:
-            return None
-
-        minx, miny, maxx, maxy = outer.bounds
-        w = maxx - minx
-        h = maxy - miny
-        if w <= 1 or h <= 1:
-            return None
-
-        # Map pWall in [0,1] to a wall-band thickness that is dynamic per boundary.
-        # pWall=0  -> a small (but non-zero) band near the wall
-        # pWall=1  -> the entire interior (i.e., inner buffer collapses/empties)
-        pWall = max(0.0, min(1.0, float(pWall)))
-
-        # Minimum inset keeps the band visible even at pWall=0.
-        min_inset = 0.02 * min(w, h)
-
-        # Compute a dynamic maximum inset such that outer.buffer(-max_inset) becomes empty.
-        # This depends on the specific polygon geometry (concavity, narrow corridors, etc.).
-        def _max_inset_until_empty(poly: Polygon) -> float:
-            # Start with a reasonable upper bound and grow if needed.
-            hi = 0.5 * min(w, h)
-            if hi <= 0:
-                return 0.0
-
-            # Grow upper bound until the negative buffer becomes empty (or we hit a safety cap).
-            safety_cap = 10.0 * min(w, h)
-            test = poly.buffer(-hi)
-            while (not test.is_empty) and (hi < safety_cap):
-                hi *= 1.5
-                test = poly.buffer(-hi)
-
-            if not test.is_empty:
-                # Could not find an empty buffer within cap; fall back.
-                return hi
-
-            lo = 0.0
-            # Binary search for the smallest distance at which it becomes empty.
-            for _ in range(30):
-                mid = 0.5 * (lo + hi)
-                if poly.buffer(-mid).is_empty:
-                    hi = mid
-                else:
-                    lo = mid
-            return hi
-
-        max_inset = _max_inset_until_empty(outer)
-        if max_inset <= 0:
-            return None
-
-        # Ensure max_inset >= min_inset
-        max_inset = max(max_inset, min_inset)
-
-        inset = min_inset + pWall * (max_inset - min_inset)
-
-        inner = outer.buffer(-inset)
-        if inner.is_empty:
-            # If we inset past the polygon's inradius, the band becomes the whole polygon.
-            inner_poly = None
-        else:
-            if isinstance(inner, MultiPolygon):
-                inner_poly = max(list(inner.geoms), key=lambda g: g.area)
-            else:
-                inner_poly = inner
-
-        band = outer if inner_poly is None else outer.difference(inner_poly)
-        if band.is_empty:
-            return None
-
-        def add_poly(poly: Polygon, path: QPainterPath):
-            ext = list(poly.exterior.coords)
-            if len(ext) >= 3:
-                path.moveTo(ext[0][0], ext[0][1])
-                for x, y in ext[1:]:
-                    path.lineTo(x, y)
-                path.closeSubpath()
-
-            for ring in poly.interiors:
-                coords = list(ring.coords)
-                if len(coords) >= 3:
-                    hole = QPainterPath()
-                    hole.moveTo(coords[0][0], coords[0][1])
-                    for x, y in coords[1:]:
-                        hole.lineTo(x, y)
-                    hole.closeSubpath()
-                    path.addPath(hole)
-
-        path = QPainterPath()
-        if isinstance(band, MultiPolygon):
-            for g in band.geoms:
-                if isinstance(g, Polygon):
-                    add_poly(g, path)
-        elif isinstance(band, Polygon):
-            add_poly(band, path)
-        else:
-            return None
-
-        path.setFillRule(Qt.OddEvenFill)
-        return path
-
 
 # --- Draggable POD item ---
 
@@ -819,7 +744,24 @@ class ConfigBuilderWindow(QMainWindow):
             return
 
         try:
+            from .paths import PATH_ANCHORS, PROJECT_ROOT, relativize_path
+
+            save_dir = os.path.dirname(os.path.abspath(fp))
             out = self.model.to_json_dict(include_comments=True)
+
+            # Two-step: resolve every path key to absolute (uses the model's
+            # current anchor knowledge), then re-relativize against the actual
+            # save location. This guarantees portability regardless of where
+            # the user pointed `project_root` while editing.
+            for key, anchor in PATH_ANCHORS.items():
+                if key not in out:
+                    continue
+                abs_p = self.model.resolve_path(key)
+                if not abs_p:
+                    continue
+                base = save_dir if anchor == "config" else PROJECT_ROOT
+                out[key] = relativize_path(abs_p, base_dir=base)
+
             with open(fp, "w", encoding="utf-8") as f:
                 json.dump(out, f, indent=2)
             QMessageBox.information(self, "Saved", f"Saved config to:\n{fp}")
@@ -975,6 +917,19 @@ class ConfigBuilderWindow(QMainWindow):
         knobs_layout.addWidget(QLabel("seconds"), row, 2)
         row += 1
 
+        self.spin_team_size = QSpinBox()
+        self.spin_team_size.setRange(1, 32)
+        self.spin_team_size.setSingleStep(1)
+        self.spin_team_size.valueChanged.connect(
+            lambda v: self._on_value_changed("team_size", int(v))
+        )
+        self.spin_team_size.editingFinished.connect(lambda: self.show_description("team_size"))
+        self.spin_team_size.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        knobs_layout.addWidget(self._mk_label_btn("Team size", "team_size"), row, 0)
+        knobs_layout.addWidget(self.spin_team_size, row, 1)
+        knobs_layout.addWidget(QLabel("entrants"), row, 2)
+        row += 1
+
         self.spin_hesitation = self._mk_dspin("HESITATION_THRESHOLD", 0.0, 30.0, 0.1, "sec")
         knobs_layout.addWidget(self._mk_label_btn("Hesitation threshold", "HESITATION_THRESHOLD"), row, 0)
         knobs_layout.addWidget(self.spin_hesitation, row, 1)
@@ -1006,12 +961,8 @@ class ConfigBuilderWindow(QMainWindow):
         knobs_layout.addWidget(QLabel("seconds"), row, 2)
         row += 1
 
-        self.spin_pwall = self._mk_dspin("stay_along_wall_pWall", 0.0, 1.0, 0.01, "")
-        self.spin_pwall.valueChanged.connect(lambda _: self.preview.refresh())
-        knobs_layout.addWidget(self._mk_label_btn("Stay-along-wall", "stay_along_wall_pWall"), row, 0)
-        knobs_layout.addWidget(self.spin_pwall, row, 1)
-        knobs_layout.addWidget(QLabel("0..1"), row, 2)
-        row += 1
+        # STAY_ALONG_WALL no longer exposes a knob: the band is per-person,
+        # derived from each entrant's own shoulder-to-elbow length at runtime.
 
         limits_box = QGroupBox("Per-POD Time Limits (seconds)")
         limits_v = QVBoxLayout(limits_box)
@@ -1114,7 +1065,7 @@ class ConfigBuilderWindow(QMainWindow):
 
     def _on_value_changed(self, key: str, value: Any):
         self.model.data[key] = value
-        if key in ("pod_working_radius", "stay_along_wall_pWall"):
+        if key == "pod_working_radius":
             self.preview.refresh()
 
     def pick_pod_points(self, file_path: str):
@@ -1267,12 +1218,15 @@ class ConfigBuilderWindow(QMainWindow):
         self.spin_visual_angle.setValue(float(self.model.data.get("visual_angle_degrees", 20.0)))
         self.spin_threat_time.setValue(float(self.model.data.get("min_threat_interaction_time_sec", 1.0)))
         self.spin_entry_time.setValue(float(self.model.data.get("entry_time_threshold_sec", 2.0)))
+        # team_size falls back to len(POD) on the fly so legacy configs (which
+        # never wrote the key) still populate something sensible.
+        ts_default = len(self.model.data.get("POD", []) or []) or 4
+        self.spin_team_size.setValue(int(self.model.data.get("team_size", ts_default) or ts_default))
         self.spin_hesitation.setValue(float(self.model.data.get("HESITATION_THRESHOLD", 1.0)))
         self.spin_hesitation_second.setValue(float(self.model.data.get("HESITATION_THRESHOLD_SECOND", 2.0)))
         self.spin_pod_radius.setValue(float(self.model.data.get("pod_working_radius", 40.0)))
         self.spin_pod_capture.setValue(float(self.model.data.get("pod_capture_threshold_sec", 0.1)))
         self.spin_coverage_time.setValue(float(self.model.data.get("coverage_time_threshold", 3.0)))
-        self.spin_pwall.setValue(float(self.model.data.get("stay_along_wall_pWall", 0.2)))
 
         self.refresh_paths()
         self._rebuild_pod_time_limits()
@@ -1309,6 +1263,22 @@ class ConfigBuilderWindow(QMainWindow):
         self.adv_widgets["pose_conf_threshold"] = self._adv_dspin_row("pose_conf_threshold", 0.0, 1.0, 0.01)
         self.adv_widgets["keypoint_indices"] = self._adv_text_row("keypoint_indices", placeholder="e.g., 15,16")
 
+        chk_flip = QCheckBox("Enable")
+        chk_flip.stateChanged.connect(
+            lambda s: self._set_adv_value("flip_test", bool(s == Qt.Checked))
+        )
+        chk_flip.clicked.connect(lambda: self.show_description("flip_test"))
+        self.adv_widgets["flip_test"] = chk_flip
+        self._add_adv_row("flip_test", chk_flip)
+
+        chk_compile = QCheckBox("Enable")
+        chk_compile.stateChanged.connect(
+            lambda s: self._set_adv_value("compile_for_inference", bool(s == Qt.Checked))
+        )
+        chk_compile.clicked.connect(lambda: self.show_description("compile_for_inference"))
+        self.adv_widgets["compile_for_inference"] = chk_compile
+        self._add_adv_row("compile_for_inference", chk_compile)
+
         dev = QComboBox()
         dev.addItems(["cpu", "cuda", "mps"])
         dev.currentTextChanged.connect(lambda t: self._set_adv_value("device", t))
@@ -1327,6 +1297,68 @@ class ConfigBuilderWindow(QMainWindow):
         self.adv_widgets["enemy_ids"] = self._adv_text_row("enemy_ids", placeholder="e.g., 99 or 99,100")
         self.adv_widgets["gaze_keypoint_map"] = self._adv_gaze_map_row()
         self.adv_widgets["frame_rate"] = self._adv_dspin_row("frame_rate", 1.0, 240.0, 1.0)
+
+        # --- Audio & Transcription (Phase 3 / 5 additions) ---
+        chk_audio = QCheckBox("Preserve audio in camera-view videos")
+        chk_audio.stateChanged.connect(
+            lambda s: self._set_adv_value("preserve_audio", bool(s == Qt.Checked))
+        )
+        chk_audio.clicked.connect(lambda: self.show_description("preserve_audio"))
+        self.adv_widgets["preserve_audio"] = chk_audio
+        self._add_adv_row("preserve_audio", chk_audio)
+
+        chk_txn = QCheckBox("Run WhisperX transcription after processing")
+        chk_txn.stateChanged.connect(
+            lambda s: self._set_adv_value("enable_transcription", bool(s == Qt.Checked))
+        )
+        chk_txn.clicked.connect(lambda: self.show_description("enable_transcription"))
+        self.adv_widgets["enable_transcription"] = chk_txn
+        self._add_adv_row("enable_transcription", chk_txn)
+
+        txn_device = QComboBox()
+        txn_device.addItems(["cpu", "cuda"])
+        txn_device.currentTextChanged.connect(
+            lambda t: self._set_adv_value("transcription_device", t)
+        )
+        txn_device.activated.connect(lambda _: self.show_description("transcription_device"))
+        self.adv_widgets["transcription_device"] = txn_device
+        self._add_adv_row("transcription_device", txn_device)
+
+        chk_denoise = QCheckBox("Run FB Denoiser before transcription (dns64)")
+        chk_denoise.stateChanged.connect(
+            lambda s: self._set_adv_value("enable_denoise", bool(s == Qt.Checked))
+        )
+        chk_denoise.clicked.connect(lambda: self.show_description("enable_denoise"))
+        self.adv_widgets["enable_denoise"] = chk_denoise
+        self._add_adv_row("enable_denoise", chk_denoise)
+
+        denoise_device = QComboBox()
+        denoise_device.addItems(["cpu", "cuda"])
+        denoise_device.currentTextChanged.connect(
+            lambda t: self._set_adv_value("denoise_device", t)
+        )
+        denoise_device.activated.connect(lambda _: self.show_description("denoise_device"))
+        self.adv_widgets["denoise_device"] = denoise_device
+        self._add_adv_row("denoise_device", denoise_device)
+
+        chk_drill = QCheckBox("Auto-detect drill window (start = first entry, end = clearance callout)")
+        chk_drill.stateChanged.connect(
+            lambda s: self._set_adv_value("drill_window_enabled", bool(s == Qt.Checked))
+        )
+        chk_drill.clicked.connect(lambda: self.show_description("drill_window_enabled"))
+        self.adv_widgets["drill_window_enabled"] = chk_drill
+        self._add_adv_row("drill_window_enabled", chk_drill)
+
+        drill_words = QLineEdit()
+        drill_words.setPlaceholderText("comma-separated; default room,clear")
+        drill_words.editingFinished.connect(
+            lambda: self._set_adv_value(
+                "drill_window_required_words", drill_words.text().strip() or "room,clear"
+            )
+        )
+        drill_words.textChanged.connect(lambda _: self.show_description("drill_window_required_words"))
+        self.adv_widgets["drill_window_required_words"] = drill_words
+        self._add_adv_row("drill_window_required_words", drill_words)
 
         desc_group = QGroupBox("Description")
         v = QVBoxLayout(desc_group)
@@ -1501,13 +1533,65 @@ class ConfigBuilderWindow(QMainWindow):
             chk.setChecked(bool(self.model.data.get("track_enemy", True)))
             chk.blockSignals(False)
 
+        for key in ("flip_test", "compile_for_inference"):
+            chk = self.adv_widgets.get(key)
+            if isinstance(chk, QCheckBox):
+                chk.blockSignals(True)
+                chk.setChecked(bool(self.model.data.get(key, DEFAULT_CONFIG[key])))
+                chk.blockSignals(False)
+
         gkm = self.model.data.get("gaze_keypoint_map", {})
         if isinstance(gkm, dict):
             for name, sp in self._gaze_spins.items():
                 sp.blockSignals(True)
                 sp.setValue(int(gkm.get(name, DEFAULT_CONFIG["gaze_keypoint_map"][name])))
                 sp.blockSignals(False)
-                
+
+        # --- Audio & Transcription ---
+        for key in ("preserve_audio", "enable_transcription", "enable_denoise"):
+            chk = self.adv_widgets.get(key)
+            if isinstance(chk, QCheckBox):
+                chk.blockSignals(True)
+                chk.setChecked(bool(self.model.data.get(key, DEFAULT_CONFIG[key])))
+                chk.blockSignals(False)
+
+        txn_device = self.adv_widgets.get("transcription_device")
+        if isinstance(txn_device, QComboBox):
+            cur = str(self.model.data.get("transcription_device", DEFAULT_CONFIG["transcription_device"]))
+            idx = txn_device.findText(cur)
+            txn_device.blockSignals(True)
+            if idx >= 0:
+                txn_device.setCurrentIndex(idx)
+            txn_device.blockSignals(False)
+
+        denoise_device = self.adv_widgets.get("denoise_device")
+        if isinstance(denoise_device, QComboBox):
+            cur = str(self.model.data.get("denoise_device", DEFAULT_CONFIG["denoise_device"]))
+            idx = denoise_device.findText(cur)
+            denoise_device.blockSignals(True)
+            if idx >= 0:
+                denoise_device.setCurrentIndex(idx)
+            denoise_device.blockSignals(False)
+
+        # --- Drill window detection ---
+        chk_drill = self.adv_widgets.get("drill_window_enabled")
+        if isinstance(chk_drill, QCheckBox):
+            chk_drill.blockSignals(True)
+            chk_drill.setChecked(bool(self.model.data.get(
+                "drill_window_enabled", DEFAULT_CONFIG["drill_window_enabled"]
+            )))
+            chk_drill.blockSignals(False)
+
+        drill_words = self.adv_widgets.get("drill_window_required_words")
+        if isinstance(drill_words, QLineEdit):
+            cur = str(self.model.data.get(
+                "drill_window_required_words",
+                DEFAULT_CONFIG["drill_window_required_words"],
+            ))
+            drill_words.blockSignals(True)
+            drill_words.setText(cur)
+            drill_words.blockSignals(False)
+
     def _on_pod_moved(self, idx: int, x: float, y: float):
         # Ensure model is normalized
         self.model._normalize()

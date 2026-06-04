@@ -129,7 +129,7 @@ def linear_assignment(cost_matrix):
         from scipy.optimize import linear_sum_assignment
 
         x, y = linear_sum_assignment(cost_matrix)
-        return np.array([list(zip(x, y))])
+        return np.array(list(zip(x, y)))
 
 
 # ---------------------------------------------------------------------
@@ -290,7 +290,10 @@ def associate(
     cosine_angle_difference = np.clip(cosine_angle_difference, a_min=-1, a_max=1)
 
     angle_difference = np.arccos(cosine_angle_difference)
-    angle_difference = (np.pi / 2.0 - np.abs(angle_difference)) / np.pi
+    # Clamp to [0, 1]: heading-reversal (angle > pi/2) would otherwise yield a
+    # negative score, which would leak through as a similarity bonus rather
+    # than a penalty when combined into the cost matrix.
+    angle_difference = np.clip((np.pi / 2.0 - np.abs(angle_difference)) / np.pi, 0.0, 1.0)
 
     valid_previous_observation_mask = np.ones(previous_obs.shape[0])
     valid_previous_observation_mask[np.where(previous_obs[:, 4] < 0)] = 0
@@ -446,7 +449,10 @@ def associate_kitti(
     cosine_angle_difference = np.clip(cosine_angle_difference, a_min=-1, a_max=1)
 
     angle_difference = np.arccos(cosine_angle_difference)
-    angle_difference = (np.pi / 2.0 - np.abs(angle_difference)) / np.pi
+    # Clamp to [0, 1]: heading-reversal (angle > pi/2) would otherwise yield a
+    # negative score, which would leak through as a similarity bonus rather
+    # than a penalty when combined into the cost matrix.
+    angle_difference = np.clip((np.pi / 2.0 - np.abs(angle_difference)) / np.pi, 0.0, 1.0)
 
     valid_previous_observation_mask = np.ones(previous_obs.shape[0])
     valid_previous_observation_mask[np.where(previous_obs[:, 4] < 0)] = 0

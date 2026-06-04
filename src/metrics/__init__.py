@@ -1,3 +1,11 @@
+# Several metrics build comparison charts via matplotlib.pyplot. When the
+# metrics package is loaded inside the analysis-viewer sidecar (FastAPI in a
+# headless process) the default macOS backend tries to create a GUI canvas
+# and crashes ("NSWindow can only be created on the main thread"). Force the
+# non-interactive Agg backend before any submodule imports pyplot.
+import matplotlib as _mpl
+_mpl.use("Agg")
+
 from .context import MetricContext
 from .entrance_hesitation import EntranceHesitation_Metric
 from .entrance_vectors import EntranceVectors_Metric

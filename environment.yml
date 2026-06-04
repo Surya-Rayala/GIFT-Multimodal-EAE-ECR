@@ -1,18 +1,35 @@
-name: gift-meae
+# GIFT Multimodal EAE — runtime environment.
+#
+# Pose detection + estimation are provided by the in-repo ``libs.giftpose``
+# library; no OpenMMLab packages (mmcv / mmdet / mmengine / mmpose) are
+# required at runtime. ``libs.giftpose`` auto-selects the fastest backend on
+# each host:
+#
+#   TensorRT (NVIDIA, *.engine present)  >  ONNX Runtime (*.onnx present)
+#       >  PyTorch (universal: cuda / mps / cpu)
+#
+# Optional accelerated artifacts can be produced from the .pth checkpoints:
+#
+#   python -m libs.giftpose.export.onnx_export
+#   python -m libs.giftpose.export.torchscript_export --device cpu|mps|cuda
+#   python -m libs.giftpose.export.trt_build           # NVIDIA only
 
+name: gift-meae
 
 channels:
   - conda-forge
-  - pytorch
   - defaults
 
-
 dependencies:
-  - python=3.8
+  # ----- Core Python --------------------------------------------------------
+  - python=3.11
   - git
   - pip
+  # ``libs/Track`` imports ``pkg_resources``, which setuptools 75+ no longer
+  # ships by default. Pin <75 until libs/Track migrates to importlib.metadata.
+  - setuptools<75
 
-  # core scientific stack (conda)
+  # ----- Numerical / data ---------------------------------------------------
   - numpy
   - scipy
   - pandas
@@ -20,29 +37,87 @@ dependencies:
   - scikit-image
   - matplotlib
   - tqdm
-
-  # Video and Image Processing
-  - opencv
-
-  # GUI
-  - pyqt=5
-
-  # pytorch
-  - pytorch
-  - torchvision
-
-  # other dependencies
   - shapely
   - loguru
-  
+
+  # ----- Vision / video -----------------------------------------------------
+  - opencv
+  - ffmpeg
+  - pkg-config
+  # Explicit conda-forge channel: links av dynamically against the env's
+  # ffmpeg. PyPI's av wheel bundles its own ffmpeg dylibs which on macOS
+  # double-register AVF* ObjC classes against conda's ffmpeg.
+  - conda-forge::av
+
+  # ----- GUI (Config Builder + Mapper tools) --------------------------------
+  - pyqt=5
+
+  # ----- Analysis viewer (Tauri shell) --------------------------------------
+  # Tauri 2 requires rustc >= 1.77. Installing the Rust toolchain into the
+  # conda env (rather than via system-wide rustup) keeps everything contained:
+  # `conda activate gift-meae` brings rustc, cargo, python, and the npm-local
+  # @tauri-apps/cli all into scope at once. `conda env remove` wipes it.
+  - conda-forge::rust
+
+  # ----- Deep-learning runtime --------------------------------------------
+  # Torch trio installed from conda-forge: same channel keeps C++ ABI matched
+  # (avoids ``operator torchvision::nms does not exist``) and shares the env's
+  # ``llvm-openmp`` (avoids macOS libomp dup-init abort). Trio version is
+  # aligned with the whisperx 3.7.4 + pyannote.audio 3.4.0 pair pinned below.
+  - conda-forge::pytorch=2.8.*
+  - conda-forge::torchvision=0.23.*
+  - conda-forge::torchaudio=2.8.*
 
   - pip:
-    - platformdirs
-    - openmim
-    - imutils
-    - filterpy
-    - dtw
-    - lap
-    - gdown
-    - ftfy
-    - regex
+      # ----- Misc utilities -------------------------------------------------
+      - platformdirs
+      - imutils
+      - filterpy
+      - dtw
+      - lap
+      - gdown
+      - ftfy
+      - regex
+      - cython
+
+      # Force modern omegaconf — denoiser's transitive hydra-core can pull
+      # the legacy 1.4 series, which breaks pyannote.audio's pickled VAD load.
+      - omegaconf>=2.3
+
+      # Required by torch>=2.5's dynamo-based ``torch.onnx.export`` codepath
+      # used in libs/giftpose/export/onnx_export.py.
+      - onnxscript
+
+      # WAV I/O for src/utils/denoise.py — avoids torchaudio>=2.8's torchcodec
+      # routing (its bundled .dylibs ABI-skew with conda-forge ffmpeg).
+      - soundfile
+
+      # ----- Audio / transcription -----------------------------------------
+      # whisperx + pyannote.audio pinned in concert with torch=2.8.x above.
+      # pyannote.audio 4.0+ hard-pins ``torch==2.8.0`` exactly which blocks
+      # newer GPU support and security patches; whisperx itself excludes
+      # pyannote 4.0+, so the 3.x line is the stable target.
+      - whisperx==3.7.4
+      - pyannote.audio==3.4.0
+
+      # ----- giftpose runtime: optional accelerated backends ---------------
+      # ONNX Runtime delivers a large CPU speedup vs the PyTorch backend;
+      # CUDAExecutionProvider on NVIDIA (use ``onnxruntime-gpu``);
+      # CoreMLExecutionProvider on macOS.
+      - onnx>=1.17
+      - onnxruntime>=1.20
+      # NVIDIA only — for the TRT backend, replace ``onnxruntime`` above
+      # with ``onnxruntime-gpu`` and uncomment the line below. Install is
+      # CUDA/driver-gated so this can't be a hard dep:
+      # - tensorrt
+
+      # FB Denoiser — unpinned; the omegaconf>=2.3 pin above mitigates its
+      # legacy hydra-core transitive.
+      - denoiser
+
+      # ----- Analysis viewer (Tauri sidecar) --------------------------------
+      # FastAPI sidecar serves the AnalysisSession JSON, video Range streams,
+      # and image artifacts to the Tauri/Vue frontend at src/utils/analysis_viewer/.
+      - fastapi
+      - uvicorn[standard]
+      - aiofiles

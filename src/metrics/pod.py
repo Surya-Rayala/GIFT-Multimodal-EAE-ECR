@@ -1,4 +1,3 @@
-import glob
 import os
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -7,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from .metric import AbstractMetric
+from ._shared import load_inroom_ids, pick_latest
 
 
 class POD_Metric(AbstractMetric):
@@ -161,35 +161,8 @@ class POD_Metric(AbstractMetric):
         config: Optional[Dict[str, Any]] = None,
         **_kwargs,
     ) -> Dict[str, Any]:
-        def _pick_latest(folder: str, pattern: str) -> Optional[str]:
-            matches = glob.glob(os.path.join(folder, pattern))
-            if not matches:
-                return None
-            matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return matches[0]
-
-        def _load_inroom_ids(folder: str) -> Set[int]:
-            import json
-
-            tracker_path = _pick_latest(folder, "*_TrackerOutput.json")
-            if tracker_path is None:
-                return set()
-
-            try:
-                with open(tracker_path, "r") as f:
-                    tracker_output = json.load(f)
-            except Exception:
-                return set()
-
-            inroom_ids: Set[int] = set()
-            for frame_entry in tracker_output:
-                for obj in frame_entry.get("objects", []):
-                    tid = obj.get("id")
-                    if tid is None:
-                        continue
-                    if obj.get("identity_role") == "inroom" or obj.get("is_inroom", False):
-                        inroom_ids.add(int(tid))
-            return inroom_ids
+        _pick_latest = pick_latest
+        _load_inroom_ids = load_inroom_ids
 
         def _load_position_tracks(
             folder: str,

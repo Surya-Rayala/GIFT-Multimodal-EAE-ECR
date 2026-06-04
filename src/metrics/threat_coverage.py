@@ -1,41 +1,17 @@
-import glob
 import json
 import os
 from typing import Dict, List, Optional, Tuple
 
-import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 from . import AbstractMetric
-
-
-def _gaze_triangle(origin, direction, half_angle_deg, length=10000.0):
-    d = np.asarray(direction, dtype=np.float32)
-    n = np.linalg.norm(d)
-    if n == 0.0:
-        return np.zeros((3, 2), dtype=np.float32)
-
-    d /= n
-    ang = np.deg2rad(float(half_angle_deg))
-    cos_a, sin_a = float(np.cos(ang)), float(np.sin(ang))
-
-    rot_left = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float32)
-    rot_right = np.array([[cos_a, sin_a], [-sin_a, cos_a]], dtype=np.float32)
-
-    o = np.asarray(origin, dtype=np.float32)
-    left_vec = rot_left @ d * length
-    right_vec = rot_right @ d * length
-    return np.stack([o, o + left_vec, o + right_vec], axis=0)
-
-
-def _triangle_box_intersect(triangle, box):
-    tri = np.asarray(triangle, dtype=np.float32).reshape(-1, 1, 2)
-    x1, y1, x2, y2 = map(float, box)
-    rect = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32).reshape(-1, 1, 2)
-    inter_area, _ = cv2.intersectConvexConvex(tri, rect)
-    return inter_area > 0.0
+from ._shared import (
+    gaze_cone_triangle as _gaze_triangle,
+    pick_latest,
+    triangle_box_intersect as _triangle_box_intersect,
+)
 
 
 class ThreatCoverage_Metric(AbstractMetric):
@@ -126,12 +102,7 @@ class ThreatCoverage_Metric(AbstractMetric):
         _map_image=None,
         config: Optional[dict] = None,
     ):
-        def _pick_latest(folder: str, pattern: str) -> Optional[str]:
-            matches = glob.glob(os.path.join(folder, pattern))
-            if not matches:
-                return None
-            matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return matches[0]
+        _pick_latest = pick_latest
 
         def _load_tracker_output(folder: str) -> List[Dict]:
             path = _pick_latest(folder, "*_TrackerOutput.json")

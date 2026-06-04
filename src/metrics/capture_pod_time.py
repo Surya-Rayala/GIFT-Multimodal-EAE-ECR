@@ -1,4 +1,3 @@
-import glob
 import os
 from typing import Any, Dict, List, Optional
 
@@ -7,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from .metric import AbstractMetric
+from ._shared import exponential_time_penalty, pick_latest
 
 
 class CapturePodTime_Metric(AbstractMetric):
@@ -17,11 +17,7 @@ class CapturePodTime_Metric(AbstractMetric):
         self._scores_by_soldier: Optional[Dict[int, float]] = None
 
     def _exp_penalty(self, overrun: float, limit: float) -> float:
-        if limit <= 0:
-            return 0.0
-        if overrun >= limit:
-            return 0.0
-        return float(np.exp(-(overrun) / (limit - overrun)))
+        return exponential_time_penalty(overrun, limit)
 
     def _score_single_pod(self, capture_time: Optional[float], limit: float) -> float:
         if capture_time is None:
@@ -79,12 +75,7 @@ class CapturePodTime_Metric(AbstractMetric):
 
     @staticmethod
     def expertCompare(session_folder: str, expert_folder: str, map_image=None, config=None):
-        def _pick_latest(folder: str, pattern: str) -> Optional[str]:
-            matches = glob.glob(os.path.join(folder, pattern))
-            if not matches:
-                return None
-            matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return matches[0]
+        _pick_latest = pick_latest
 
         def _load_pod_cache(folder: str) -> pd.DataFrame:
             path = _pick_latest(folder, "*_PodCache.txt")
@@ -202,12 +193,7 @@ class CapturePodTime_Metric(AbstractMetric):
             starts = pos.groupby("id")["frame"].min().sort_values()
             return {int(tid): int(i + 1) for i, tid in enumerate(starts.index.tolist())}
 
-        def _exp_penalty(overrun: float, limit: float) -> float:
-            if limit <= 0:
-                return 0.0
-            if overrun >= limit:
-                return 0.0
-            return float(np.exp(-(overrun) / (limit - overrun)))
+        _exp_penalty = exponential_time_penalty
 
         def _score_single_pod(capture_time: Optional[float], limit: float) -> float:
             if capture_time is None or pd.isna(capture_time):

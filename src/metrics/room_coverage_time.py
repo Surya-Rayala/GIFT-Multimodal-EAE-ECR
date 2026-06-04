@@ -1,4 +1,3 @@
-import glob
 import io
 import os
 from typing import Dict, Optional, Tuple
@@ -8,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from .metric import AbstractMetric
+from ._shared import exponential_time_penalty, pick_latest
 
 
 class TotalRoomCoverageTime_Metric(AbstractMetric):
@@ -34,18 +34,11 @@ class TotalRoomCoverageTime_Metric(AbstractMetric):
         return round(self._exp_penalty(overrun, self.threshold), 2)
 
     def _exp_penalty(self, overrun: float, limit: float) -> float:
-        if overrun >= limit:
-            return 0.0
-        return float(np.exp(-(overrun) / (limit - overrun)))
+        return exponential_time_penalty(overrun, limit)
 
     @staticmethod
     def expertCompare(session_folder: str, expert_folder: str, map_image=None, config=None, **kwargs):
-        def _pick_latest(folder: str, pattern: str) -> Optional[str]:
-            matches = glob.glob(os.path.join(folder, pattern))
-            if not matches:
-                return None
-            matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return matches[0]
+        _pick_latest = pick_latest
 
         def _parse_room_coverage_cache(path: str) -> Tuple[pd.DataFrame, Dict[str, Optional[float]]]:
             with open(path, "r") as f:

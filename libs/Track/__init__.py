@@ -96,6 +96,7 @@ The `Track` package is a powerful tool for video analysis, offering a range of f
 
 __version__ = '2.0'
 
+from .mapper import PixelMapper
 from .postprocessing.gsi import gsi
 from .tracker_zoo import create_tracker, get_tracker_config
 
