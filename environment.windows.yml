@@ -1,16 +1,20 @@
 # GIFT Multimodal EAE — runtime environment (WINDOWS / win-64).
 #
-# Identical to ``environment.yml`` EXCEPT the PyTorch trio is installed from
-# pip instead of conda-forge. conda-forge's torchaudio feedstock does not
-# build for Windows — there is *no* ``torchaudio`` package for win-64 on
-# conda-forge at any version — so ``conda-forge::torchaudio=2.8.*`` fails with
-# ``PackagesNotFoundError``. The whole trio is moved to pip together (not just
-# torchaudio) so the wheels stay mutually ABI-matched; mixing a conda pytorch
-# with a pip torchaudio risks ``operator torchvision::nms does not exist``.
+# Identical to ``environment.yml`` EXCEPT ``torchaudio`` is installed from pip.
+# conda-forge's torchaudio feedstock does not build for Windows — there is *no*
+# ``torchaudio`` package for win-64 on conda-forge at any version — so
+# ``conda-forge::torchaudio=2.8.*`` fails with ``PackagesNotFoundError``.
+#
+# ``pytorch`` and ``torchvision`` DO build for win-64 on conda-forge, so they
+# stay on conda-forge here (same as mac/linux). Only the missing ``torchaudio``
+# comes from a pip wheel built for the same torch 2.8 — ABI-compatible with the
+# conda-forge pytorch 2.8 (same major.minor). Keeping torchvision on conda-forge
+# also avoids pip's torchvision wheel clobbering the conda Pillow, which yields
+# ``ImportError: DLL load failed while importing _imaging`` on Windows.
 #
 # The macOS ``libomp`` dup-init abort that forces conda-forge torch on mac does
-# NOT occur on Windows, so PyPI wheels are safe here. mac/linux keep using the
-# conda-forge trio in ``environment.yml`` — use this file on Windows only:
+# NOT occur on Windows. mac/linux keep the full conda-forge trio in
+# ``environment.yml`` — use this file on Windows only:
 #
 #   conda env create -f environment.windows.yml
 #
@@ -73,19 +77,20 @@ dependencies:
   # @tauri-apps/cli all into scope at once. `conda env remove` wipes it.
   - conda-forge::rust
 
-  # NOTE: the PyTorch trio is intentionally NOT installed via conda here —
-  # see the pip section below for why (no conda-forge torchaudio on win-64).
+  # ----- Deep-learning runtime --------------------------------------------
+  # pytorch + torchvision from conda-forge (same as mac/linux): same channel
+  # keeps the C++ ABI matched and shares the env's llvm-openmp. Only torchaudio
+  # is missing on conda-forge win-64, so it comes from pip below. Trio version
+  # aligned with the whisperx 3.7.4 + pyannote.audio 3.4.0 pair pinned below.
+  - conda-forge::pytorch=2.8.*
+  - conda-forge::torchvision=0.23.*
 
   - pip:
       # ----- Deep-learning runtime -------------------------------------------
-      # Torch trio from pip (Windows only). Installed first and as a single
-      # set so the three wheels are mutually ABI-matched. PyPI's default
-      # Windows wheels are CUDA builds; to force a specific CUDA / CPU build,
-      # see the "CUDA users" section in the README. Version is aligned with the
-      # whisperx 3.7.4 + pyannote.audio 3.4.0 pair pinned below (pyannote pins
-      # torch==2.8.0 exactly, so keep the 2.8.x line).
-      - torch==2.8.0
-      - torchvision==0.23.0
+      # torchaudio from pip — conda-forge has no win-64 build. The 2.8.0 wheel
+      # is built against torch 2.8 and is ABI-compatible with the conda-forge
+      # pytorch 2.8 above (same major.minor). Pinned to match pyannote.audio,
+      # which requires torch==2.8.0 exactly.
       - torchaudio==2.8.0
 
       # ----- Misc utilities -------------------------------------------------
