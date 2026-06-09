@@ -108,13 +108,28 @@ class TRTBackend(Backend):
                 return int(max_shape[0])
         return 32  # safe default matching trt_build.py
 
+    def _torch_dtype(self, engine, name):
+        """Map a binding's TRT dtype to torch. A weak-typed fp16 engine still
+        has fp32 I/O; a strongly-typed engine (TRT 10.12+) may carry fp16 — so
+        read the ACTUAL binding dtype instead of assuming fp32."""
+        trt = _get_trt()
+        torch = self.torch
+        dt = engine.get_tensor_dtype(name)
+        return {
+            trt.DataType.HALF: torch.float16,
+            trt.DataType.FLOAT: torch.float32,
+            trt.DataType.INT32: torch.int32,
+        }.get(dt, torch.float32)
+
     def _run_engine(self, ctx, in_tensor, out_shapes: dict[str, tuple[int, ...]]):
         """Allocate output torch buffers, set tensor addresses, execute, return outputs.
 
         Uses the TensorRT 10+ tensor-named API (``num_io_tensors`` /
         ``get_tensor_*`` / ``set_input_shape`` / ``set_tensor_address`` /
         ``execute_async_v3``). The legacy ``num_bindings`` / ``execute_async_v2``
-        path was removed in TRT 10.
+        path was removed in TRT 10. Buffers honor each binding's real dtype so
+        the same code drives both fp32-I/O and strongly-typed fp16-I/O engines;
+        outputs are returned as fp32 for the postprocess (NMS / SimCC decode).
         """
         trt = _get_trt()
         torch = self.torch
@@ -124,6 +139,9 @@ class TRTBackend(Backend):
             name = engine.get_tensor_name(i)
             mode = engine.get_tensor_mode(name)
             if mode == trt.TensorIOMode.INPUT:
+                in_dt = self._torch_dtype(engine, name)
+                if in_tensor.dtype != in_dt:
+                    in_tensor = in_tensor.to(in_dt).contiguous()
                 ctx.set_input_shape(name, tuple(in_tensor.shape))
                 ctx.set_tensor_address(name, int(in_tensor.data_ptr()))
             else:
@@ -132,12 +150,15 @@ class TRTBackend(Backend):
                 # infer the dynamic output shape (any -1 axis).
                 if -1 in shape:
                     shape = out_shapes[name]
-                buf = torch.empty(shape, device="cuda", dtype=torch.float32)
+                buf = torch.empty(
+                    shape, device="cuda", dtype=self._torch_dtype(engine, name)
+                )
                 outputs[name] = buf
                 ctx.set_tensor_address(name, int(buf.data_ptr()))
         ctx.execute_async_v3(self._stream.cuda_stream)
         self._stream.synchronize()
-        return outputs
+        # Normalize to fp32 — downstream NMS / SimCC decode expect float32.
+        return {k: v.float() for k, v in outputs.items()}
 
     def predict_detector(self, frame_bgr: np.ndarray) -> Detection:
         torch = self.torch

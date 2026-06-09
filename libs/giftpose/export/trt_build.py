@@ -32,6 +32,71 @@ def _parse_shape(spec: str) -> Tuple[str, Tuple[int, ...]]:
     return name, tuple(int(d) for d in dims.split("x"))
 
 
+def _make_builder(trt, logger):
+    """Create a ``trt.Builder``, turning the opaque pybind11 failure into an
+    actionable message.
+
+    ``createInferBuilder`` returns ``nullptr`` (surfacing as
+    ``TypeError: pybind11::init(): factory function returned nullptr``) when
+    TensorRT can't initialize on this GPU — most often because the GPU's
+    compute capability is below the installed TensorRT's floor (TRT 10 requires
+    SM >= 7.5 / Turing; Pascal ``sm_61`` and older are unsupported), or the
+    NVIDIA driver is older than the wheel's CUDA.
+    """
+    try:
+        builder = trt.Builder(logger)
+    except Exception as e:
+        hint = ""
+        try:
+            import torch
+            cap = torch.cuda.get_device_capability()
+            hint = (f" Detected GPU '{torch.cuda.get_device_name()}' "
+                    f"(compute capability sm_{cap[0]}{cap[1]}).")
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"TensorRT {getattr(trt, '__version__', '?')} could not create a Builder on "
+            f"this machine.{hint}\n"
+            f"TensorRT 10 supports only compute capability >= 7.5 (Turing or newer); "
+            f"Pascal (sm_61) and older GPUs are unsupported. This also fires when the "
+            f"NVIDIA driver is older than the installed wheel's CUDA.\n"
+            f"If your GPU is pre-Turing, skip the TRT backend and use ONNX Runtime — the "
+            f"exported .onnx is auto-selected by libs.giftpose (TRT > ONNX Runtime > "
+            f"PyTorch), so no engine is needed:\n"
+            f"    pip install --force-reinstall onnxruntime-gpu\n"
+            f"For an older GPU that must use TensorRT, install TensorRT 8.6.x (the last "
+            f"line supporting Pascal)."
+        ) from e
+    if builder is None:  # defensive: some builds return None rather than raising
+        raise RuntimeError("trt.Builder returned None — see the TensorRT log above.")
+    return builder
+
+
+def _onnx_to_fp16(onnx_path: str | Path) -> Path | None:
+    """Convert an fp32 ONNX to fp16 (``keep_io_types`` so I/O stays fp32) for
+    TensorRT *strong typing* (TRT 10.12+ dropped ``BuilderFlag.FP16``). Returns
+    the new path, or ``None`` when conversion isn't possible — the caller then
+    builds a correct fp32 engine."""
+    try:
+        import onnx
+        from onnxconverter_common import float16
+    except Exception as e:
+        print(f"[trt_build] strong-typed fp16 needs onnxconverter-common "
+              f"(`pip install onnxconverter-common`); import failed: {e}. "
+              f"Building an fp32 engine instead.")
+        return None
+    try:
+        model16 = float16.convert_float_to_float16(
+            onnx.load(str(onnx_path)), keep_io_types=True
+        )
+        out = Path(onnx_path).with_name(Path(onnx_path).stem + "_fp16.onnx")
+        onnx.save(model16, str(out))
+        return out
+    except Exception as e:  # model-specific
+        print(f"[trt_build] fp16 onnx conversion failed ({e}); building fp32 engine.")
+        return None
+
+
 def _ensure_onnx(weights_path: str, onnx_path: str, kind: str) -> None:
     """Export ONNX from .pth if the .onnx artifact is missing."""
     if Path(onnx_path).exists():
@@ -63,23 +128,54 @@ def build_engine(
     Path(engine_path).parent.mkdir(parents=True, exist_ok=True)
 
     logger = trt.Logger(trt.Logger.WARNING)
-    builder = trt.Builder(logger)
-    network = builder.create_network(
-        1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-    )
+    builder = _make_builder(trt, logger)
+
+    # Pick the FP16 route by what THIS TensorRT exposes, so fp16 perf works on
+    # every version:
+    #   * weak typing (TRT < 10.12): build from the fp32 onnx + BuilderFlag.FP16.
+    #   * strong typing (TRT 10.12+ dropped the flag): a STRONGLY_TYPED network
+    #     built from an fp16 onnx (keep_io_types -> fp32 I/O, fp16 compute).
+    # If neither is possible we build a correct fp32 engine.
+    fp16_flag = getattr(trt.BuilderFlag, "FP16", None)
+    st_flag = getattr(trt.NetworkDefinitionCreationFlag, "STRONGLY_TYPED", None)
+    eb_flag = getattr(trt.NetworkDefinitionCreationFlag, "EXPLICIT_BATCH", None)
+
+    use_strong = bool(fp16 and fp16_flag is None and st_flag is not None)
+    onnx_for_build: str | Path = onnx_path
+    if use_strong:
+        fp16_onnx = _onnx_to_fp16(onnx_path)
+        if fp16_onnx is not None:
+            onnx_for_build = fp16_onnx
+        else:
+            use_strong = False  # couldn't make an fp16 onnx -> fp32 engine
+
+    if use_strong:
+        network = builder.create_network(1 << int(st_flag))  # explicit batch implied
+    else:
+        network = builder.create_network(
+            1 << int(eb_flag) if eb_flag is not None else 0
+        )
     parser = trt.OnnxParser(network, logger)
 
-    with open(onnx_path, "rb") as f:
+    with open(onnx_for_build, "rb") as f:
         if not parser.parse(f.read()):
             errs = [parser.get_error(i) for i in range(parser.num_errors)]
-            raise RuntimeError(f"ONNX parse failed for {onnx_path}: {errs}")
+            raise RuntimeError(f"ONNX parse failed for {onnx_for_build}: {errs}")
 
     config = builder.create_builder_config()
-    config.set_memory_pool_limit(
-        trt.MemoryPoolType.WORKSPACE, workspace_mb * (1 << 20)
-    )
-    if fp16:
-        config.set_flag(trt.BuilderFlag.FP16)
+    # Workspace limit: set_memory_pool_limit is TRT 8.4+/10; older builds use
+    # the deprecated max_workspace_size attribute.
+    _workspace = workspace_mb * (1 << 20)
+    _pool = getattr(trt, "MemoryPoolType", None)
+    if hasattr(config, "set_memory_pool_limit") and _pool is not None:
+        config.set_memory_pool_limit(_pool.WORKSPACE, _workspace)
+    elif hasattr(config, "max_workspace_size"):
+        config.max_workspace_size = _workspace
+    # Weak-typing fp16 flag (TRT < 10.12). Strong-typed engines carry fp16 in
+    # the onnx itself, so no flag is set for them.
+    if (fp16 and not use_strong and fp16_flag is not None
+            and getattr(builder, "platform_has_fast_fp16", True)):
+        config.set_flag(fp16_flag)
 
     # Reuse layer-timing measurements across builds — second + subsequent
     # builds for the same GPU/TRT pair are 2-5x faster.
@@ -101,12 +197,18 @@ def build_engine(
         profile.set_shape(name_min, dims_min, dims_opt, dims_max)
         config.add_optimization_profile(profile)
 
-    print(f"building {engine_path} (fp16={fp16})")
+    eff_fp16 = use_strong or (fp16 and fp16_flag is not None)
+    print(f"building {engine_path} (precision={'fp16' if eff_fp16 else 'fp32'})")
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
-        raise RuntimeError(f"TensorRT failed to build engine for {onnx_path}")
+        raise RuntimeError(
+            f"TensorRT failed to build engine for {onnx_for_build} (returned None — "
+            f"see the TensorRT log above; usually a driver/CUDA mismatch or an "
+            f"unsupported op)."
+        )
     with open(engine_path, "wb") as f:
-        f.write(serialized)
+        # IHostMemory -> bytes is portable across TRT versions.
+        f.write(bytes(serialized))
     cache_path.write_bytes(memoryview(timing_cache.serialize()).tobytes())
     print(f"built {engine_path}")
 
