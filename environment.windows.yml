@@ -32,6 +32,10 @@ dependencies:
       # libs/Track imports pkg_resources, dropped by setuptools 75+.
       - setuptools<75
 
+      # CA bundle for HTTPS downloads (see src/utils/certs.py); transitive, but
+      # pinned so the cert-store workaround is guaranteed.
+      - certifi
+
       # ----- Numerical / data -----------------------------------------------
       - numpy
       - scipy

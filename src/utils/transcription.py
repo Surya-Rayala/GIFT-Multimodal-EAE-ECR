@@ -27,6 +27,7 @@ import os
 from typing import Any, Dict, Optional
 
 from .audio import extract_audio_to_wav, has_audio_stream
+from .certs import install_certifi_https
 from .denoise import denoise_audio_to_wav
 
 
@@ -234,6 +235,10 @@ def transcribe_video(
             "Transcription skipped: no audio stream in %s", source_video_path
         )
         return None
+
+    # Denoiser / wav2vec2 / pyannote weights download via torch.hub (urllib);
+    # route TLS through certifi so a broken OS cert store doesn't block them.
+    install_certifi_https()
 
     try:
         import whisperx  # type: ignore

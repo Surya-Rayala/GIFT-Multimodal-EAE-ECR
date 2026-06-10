@@ -80,6 +80,10 @@ dependencies:
       - regex
       - cython
 
+      # CA bundle for HTTPS downloads (see src/utils/certs.py); transitive, but
+      # pinned so the cert-store workaround is guaranteed.
+      - certifi
+
       # Force modern omegaconf — denoiser's transitive hydra-core can pull
       # the legacy 1.4 series, which breaks pyannote.audio's pickled VAD load.
       - omegaconf>=2.3

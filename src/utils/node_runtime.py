@@ -37,6 +37,8 @@ import zipfile
 from pathlib import Path
 from typing import Dict, Optional
 
+from .certs import install_certifi_https
+
 # Pinned Node LTS. Bump deliberately. The matching SHASUMS256.txt is fetched at
 # download time, so the version and its checksums always agree.
 NODE_VERSION = "20.18.1"
@@ -173,6 +175,7 @@ def _portable_bin_dir(label: str) -> Path:
         return bin_dir
 
     _log(label, f"First launch — downloading portable Node {NODE_VERSION} ({os_tag}-{arch_tag})…")
+    install_certifi_https()  # HTTPS via certifi, not the (possibly broken) OS cert store
     cache.mkdir(parents=True, exist_ok=True)
     archive = cache / asset_name
     url = f"{NODE_DIST_BASE}/v{NODE_VERSION}/{asset_name}"
