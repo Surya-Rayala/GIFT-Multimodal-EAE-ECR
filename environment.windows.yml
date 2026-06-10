@@ -1,14 +1,16 @@
 # GIFT Multimodal EAE — runtime environment (WINDOWS / win-64).
 #
-# Identical to ``environment.yml`` EXCEPT the PyTorch trio (and Pillow) are
-# installed from pip. conda-forge's torchaudio feedstock does not build for
-# Windows — there is *no* ``torchaudio`` package for win-64 on conda-forge at
-# any version — so ``conda-forge::torchaudio=2.8.*`` fails with
-# ``PackagesNotFoundError``. The whole trio is moved to pip together (not just
-# torchaudio) so the wheels stay mutually ABI-matched; mixing a conda pytorch
-# with a pip torchaudio risks ``operator torchvision::nms does not exist``.
-# Pillow is pinned in pip too, because pip's torchvision clobbers a conda Pillow
-# and leaves a broken ``_imaging`` DLL (WinError 193) — see the pip section.
+# Identical to ``environment.yml`` EXCEPT the PyTorch trio is installed from
+# pip. conda-forge's torchaudio feedstock does not build for Windows — there is
+# *no* ``torchaudio`` package for win-64 on conda-forge at any version — so
+# ``conda-forge::torchaudio=2.8.*`` fails with ``PackagesNotFoundError``. The
+# whole trio is moved to pip together (not just torchaudio) so the wheels stay
+# mutually ABI-matched; mixing a conda pytorch with a pip torchaudio risks
+# ``operator torchvision::nms does not exist``.
+# Pillow is pinned on conda-forge (NOT pip): the conda phase already installs a
+# Pillow for matplotlib/scikit-image/opencv, so letting pip's torchvision add
+# its own on top leaves a broken ``_imaging`` DLL (WinError 193). Keeping it on
+# conda-forge means pip sees the dep satisfied and skips it — one clean Pillow.
 #
 # The macOS ``libomp`` dup-init abort that forces conda-forge torch on mac does
 # NOT occur on Windows, so PyPI wheels are safe here. mac/linux keep the full
@@ -55,6 +57,15 @@ dependencies:
   - tqdm
   - shapely
   - loguru
+  # Pillow MUST come from conda-forge here, NOT pip. matplotlib / scikit-image /
+  # opencv already pull a conda Pillow; if pip's torchvision (below) is allowed
+  # to install its own Pillow on top, the overlay leaves a mismatched
+  # ``_imaging`` binary that fails with ``DLL load failed while importing
+  # _imaging: The operating system cannot run %1`` (WinError 193). Pinning it on
+  # conda-forge means the pip phase sees torchvision's Pillow dep already
+  # satisfied and skips it — one clean Pillow, no overlay. (torchvision uses
+  # Pillow only as a Python API, so conda Pillow + pip torchvision is fine.)
+  - pillow
 
   # ----- Vision / video -----------------------------------------------------
   - opencv
@@ -75,8 +86,9 @@ dependencies:
   # @tauri-apps/cli all into scope at once. `conda env remove` wipes it.
   - conda-forge::rust
 
-  # NOTE: the PyTorch trio + Pillow are installed via pip here, not conda —
-  # see the pip section below for why (no conda-forge torchaudio on win-64).
+  # NOTE: the PyTorch trio is installed via pip here, not conda — see the pip
+  # section below for why (no conda-forge torchaudio on win-64). Pillow stays on
+  # conda-forge (above) on purpose; do NOT add it to pip.
 
   - pip:
       # ----- Deep-learning runtime -------------------------------------------
@@ -90,13 +102,6 @@ dependencies:
       - torch==2.8.0
       - torchvision==0.23.0
       - torchaudio==2.8.0
-
-      # Pillow from pip too — pip's torchvision wheel depends on Pillow and
-      # will overwrite a conda-installed one, leaving a mismatched ``_imaging``
-      # binary that fails with ``DLL load failed while importing _imaging: The
-      # operating system cannot run %1`` (WinError 193). Installing Pillow from
-      # the same source (pip) as torchvision keeps the binary consistent.
-      - pillow
 
       # ----- Misc utilities -------------------------------------------------
       - platformdirs
