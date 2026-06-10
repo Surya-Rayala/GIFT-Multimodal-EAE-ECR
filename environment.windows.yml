@@ -1,20 +1,18 @@
 # GIFT Multimodal EAE — runtime environment (WINDOWS / win-64).
 #
-# Identical to ``environment.yml`` EXCEPT ``torchaudio`` is installed from pip.
-# conda-forge's torchaudio feedstock does not build for Windows — there is *no*
-# ``torchaudio`` package for win-64 on conda-forge at any version — so
-# ``conda-forge::torchaudio=2.8.*`` fails with ``PackagesNotFoundError``.
-#
-# ``pytorch`` and ``torchvision`` DO build for win-64 on conda-forge, so they
-# stay on conda-forge here (same as mac/linux). Only the missing ``torchaudio``
-# comes from a pip wheel built for the same torch 2.8 — ABI-compatible with the
-# conda-forge pytorch 2.8 (same major.minor). Keeping torchvision on conda-forge
-# also avoids pip's torchvision wheel clobbering the conda Pillow, which yields
-# ``ImportError: DLL load failed while importing _imaging`` on Windows.
+# Identical to ``environment.yml`` EXCEPT the PyTorch trio (and Pillow) are
+# installed from pip. conda-forge's torchaudio feedstock does not build for
+# Windows — there is *no* ``torchaudio`` package for win-64 on conda-forge at
+# any version — so ``conda-forge::torchaudio=2.8.*`` fails with
+# ``PackagesNotFoundError``. The whole trio is moved to pip together (not just
+# torchaudio) so the wheels stay mutually ABI-matched; mixing a conda pytorch
+# with a pip torchaudio risks ``operator torchvision::nms does not exist``.
+# Pillow is pinned in pip too, because pip's torchvision clobbers a conda Pillow
+# and leaves a broken ``_imaging`` DLL (WinError 193) — see the pip section.
 #
 # The macOS ``libomp`` dup-init abort that forces conda-forge torch on mac does
-# NOT occur on Windows. mac/linux keep the full conda-forge trio in
-# ``environment.yml`` — use this file on Windows only:
+# NOT occur on Windows, so PyPI wheels are safe here. mac/linux keep the full
+# conda-forge trio in ``environment.yml`` — use this file on Windows only:
 #
 #   conda env create -f environment.windows.yml
 #
@@ -77,21 +75,28 @@ dependencies:
   # @tauri-apps/cli all into scope at once. `conda env remove` wipes it.
   - conda-forge::rust
 
-  # ----- Deep-learning runtime --------------------------------------------
-  # pytorch + torchvision from conda-forge (same as mac/linux): same channel
-  # keeps the C++ ABI matched and shares the env's llvm-openmp. Only torchaudio
-  # is missing on conda-forge win-64, so it comes from pip below. Trio version
-  # aligned with the whisperx 3.7.4 + pyannote.audio 3.4.0 pair pinned below.
-  - conda-forge::pytorch=2.8.*
-  - conda-forge::torchvision=0.23.*
+  # NOTE: the PyTorch trio + Pillow are installed via pip here, not conda —
+  # see the pip section below for why (no conda-forge torchaudio on win-64).
 
   - pip:
       # ----- Deep-learning runtime -------------------------------------------
-      # torchaudio from pip — conda-forge has no win-64 build. The 2.8.0 wheel
-      # is built against torch 2.8 and is ABI-compatible with the conda-forge
-      # pytorch 2.8 above (same major.minor). Pinned to match pyannote.audio,
-      # which requires torch==2.8.0 exactly.
+      # Full torch trio from pip (Windows only). conda-forge has no win-64
+      # torchaudio, so all three come from pip together — one index, mutually
+      # ABI-matched wheels (mixing conda pytorch with a pip torchaudio risks
+      # ``operator torchvision::nms does not exist``). PyPI's default Windows
+      # wheels are CUDA builds; to force a specific CUDA / CPU build, see the
+      # "CUDA users" section in the README. Version aligned with the whisperx
+      # 3.7.4 + pyannote.audio 3.4.0 pair below (pyannote pins torch==2.8.0).
+      - torch==2.8.0
+      - torchvision==0.23.0
       - torchaudio==2.8.0
+
+      # Pillow from pip too — pip's torchvision wheel depends on Pillow and
+      # will overwrite a conda-installed one, leaving a mismatched ``_imaging``
+      # binary that fails with ``DLL load failed while importing _imaging: The
+      # operating system cannot run %1`` (WinError 193). Installing Pillow from
+      # the same source (pip) as torchvision keeps the binary consistent.
+      - pillow
 
       # ----- Misc utilities -------------------------------------------------
       - platformdirs
