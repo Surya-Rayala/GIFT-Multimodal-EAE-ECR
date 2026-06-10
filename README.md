@@ -99,11 +99,10 @@ pip install --force-reinstall onnxruntime-gpu
 
 For the TensorRT backend (`*.engine`), install `tensorrt` matching your CUDA version per NVIDIA's pip guide: <https://docs.nvidia.com/deeplearning/tensorrt/latest/installing-tensorrt/install-pip.html>.
 
-> **fp16 engines on TensorRT 10.12+:** newer TensorRT dropped the `FP16` builder flag in favor of *strong typing*, so `trt_build` builds the fp16 engine from an fp16 ONNX — which needs `onnxconverter-common`. Install it alongside `tensorrt`, otherwise the build logs `Building an fp32 engine instead` and produces a (working but larger/slower) fp32 engine:
+> **Precision:** prefer **fp32** engines (`trt_build --no-fp16`, see below) — fp16 trades accuracy for speed and has been observed to produce worse detections/pose on this model. If you *do* opt into fp16 on **TensorRT 10.12+**, it needs `onnxconverter-common` (newer TensorRT dropped the `FP16` builder flag for *strong typing*, so the fp16 engine is built from an fp16 ONNX); without it the build logs `Building an fp32 engine instead` and falls back to fp32 anyway:
 > ```bash
 > pip install onnxconverter-common
 > ```
-> On older TensorRT (the `FP16` flag still present) it isn't needed — fp16 builds directly.
 
 ### Optional — accelerated runtime artifacts
 
@@ -119,7 +118,9 @@ python -m libs.giftpose.export.torchscript_export --device mps  --verify
 python -m libs.giftpose.export.torchscript_export --device cuda --verify   # NVIDIA
 
 # TensorRT (NVIDIA only, additional speedup) — auto-exports ONNX from .pth if the .onnx artifacts aren't already present.
-python -m libs.giftpose.export.trt_build
+# Build fp32 engines (--no-fp16): fp16 can degrade detection/pose quality (spurious or
+# misplaced boxes). Drop --no-fp16 only if you've verified fp16 accuracy on your data.
+python -m libs.giftpose.export.trt_build --no-fp16
 ```
 
 The runtime auto-selects per device:

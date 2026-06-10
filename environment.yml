@@ -12,7 +12,7 @@
 #
 #   python -m libs.giftpose.export.onnx_export
 #   python -m libs.giftpose.export.torchscript_export --device cpu|mps|cuda
-#   python -m libs.giftpose.export.trt_build           # NVIDIA only
+#   python -m libs.giftpose.export.trt_build --no-fp16 # NVIDIA only (fp32; fp16 can hurt accuracy)
 
 name: gift-meae
 
