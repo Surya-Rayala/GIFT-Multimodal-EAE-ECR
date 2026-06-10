@@ -26,8 +26,8 @@ Python integration engine for processing session videos using metadata in a `.vm
 ```bash
 git clone https://github.com/Surya-Rayala/GIFT-Multimodal-EAE-ECR.git
 cd GIFT-Multimodal-EAE-ECR
-conda env create -f environment.yml            # macOS / Linux
-conda env create -f environment.windows.yml    # Windows (conda-forge has no torchaudio for win-64; torch trio + Pillow come from pip)
+conda env create --file environment.yml            # macOS / Linux
+conda env create --file environment.windows.yml    # Windows (Python stack from pip; conda only for python/git/ffmpeg/rust — avoids win-64 DLL clashes)
 conda activate gift-meae
 ```
 

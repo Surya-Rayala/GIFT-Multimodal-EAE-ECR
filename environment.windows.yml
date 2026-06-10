@@ -1,14 +1,18 @@
 # GIFT Multimodal EAE — runtime environment (WINDOWS / win-64).
 #
-# Same as environment.yml, but the PyTorch trio AND Pillow come from pip:
-#   * conda-forge has no win-64 torchaudio, so the whole trio is installed from
-#     pip together (keeps the wheels mutually ABI-matched).
-#   * pip Pillow resolves its own DLLs without relying on %PATH%/System32, so it
-#     survives a contaminated system PATH where conda-forge Pillow throws
-#     ``_imaging`` WinError 193.
-# mac/linux use environment.yml (full conda-forge trio). Windows:
+# On Windows the whole Python stack comes from pip; conda provides only the
+# pieces pip can't (the interpreter, git, the ffmpeg CLI, and the Rust/Tauri
+# toolchain). One source for every Python package avoids the conda/pip native
+# DLL clashes on Windows — pip's torchvision wheel ships bare-named image DLLs
+# (jpeg8/zlib/libpng16) that hijack a conda Pillow/OpenCV which link the same
+# names, breaking _imaging / cv2. pip Pillow + pip OpenCV carry their own libs,
+# so nothing collides. (mac/linux don't hit this: their pip wheels hash-rename
+# vendored libs, and they use the conda-forge stack in environment.yml anyway.)
 #
-#   conda env create -f environment.windows.yml
+# Two files because conda-forge has no win-64 torchaudio and conda env files
+# have no per-OS selectors. Windows:
+#
+#   conda env create --file environment.windows.yml
 
 name: gift-meae
 
@@ -17,51 +21,43 @@ channels:
   - defaults
 
 dependencies:
-  # ----- Core Python --------------------------------------------------------
+  # ----- conda: only what pip can't provide ---------------------------------
   - python=3.11
-  - git
   - pip
-  # libs/Track imports pkg_resources, dropped by setuptools 75+.
-  - setuptools<75
-
-  # ----- Numerical / data ---------------------------------------------------
-  - numpy
-  - scipy
-  - pandas
-  - scikit-learn
-  - scikit-image
-  - matplotlib
-  - tqdm
-  - shapely
-  - loguru
-  # Pillow comes from pip (see pip section); conda pulls one transitively here.
-
-  # ----- Vision / video -----------------------------------------------------
-  - opencv
-  - ffmpeg
-  - pkg-config
-  # conda-forge av links against the env's ffmpeg (PyPI's av bundles its own).
-  - conda-forge::av
-
-  # ----- GUI (Config Builder + Mapper tools) --------------------------------
-  - pyqt=5
-
-  # ----- Analysis viewer (Tauri shell) --------------------------------------
-  # Rust toolchain (Tauri 2 needs rustc >= 1.77) kept inside the env.
-  - conda-forge::rust
+  - git
+  - ffmpeg                # CLI binary whisperx shells out to (no pip equivalent)
+  - conda-forge::rust     # Tauri 2 toolchain, rustc >= 1.77 (no pip equivalent)
 
   - pip:
-      # ----- Deep-learning runtime -------------------------------------------
-      # Torch trio from pip (no conda-forge win-64 torchaudio). PyPI's default
-      # Windows wheels are CUDA builds; see the README "CUDA users" section to
-      # pick a specific cu### / CPU build. Pinned to match whisperx 3.7.4 +
-      # pyannote.audio 3.4.0 (pyannote requires torch==2.8.0).
+      # libs/Track imports pkg_resources, dropped by setuptools 75+.
+      - setuptools<75
+
+      # ----- Numerical / data -----------------------------------------------
+      - numpy
+      - scipy
+      - pandas
+      - scikit-learn
+      - scikit-image
+      - matplotlib
+      - tqdm
+      - shapely
+      - loguru
+      - pillow
+
+      # ----- Vision / video -------------------------------------------------
+      - opencv-python
+      - av
+
+      # ----- GUI (Config Builder + Mapper tools) ----------------------------
+      - PyQt5
+
+      # ----- Deep-learning runtime ------------------------------------------
+      # PyPI's default Windows wheels are CPU; see the README "CUDA users"
+      # section to install matching cu### wheels. Pinned to match whisperx
+      # 3.7.4 + pyannote.audio 3.4.0 (pyannote requires torch==2.8.0).
       - torch==2.8.0
       - torchvision==0.23.0
       - torchaudio==2.8.0
-
-      # Pillow from pip — robust against a broken system PATH (see header).
-      - pillow
 
       # ----- Misc utilities -------------------------------------------------
       - platformdirs
@@ -85,26 +81,20 @@ dependencies:
       - soundfile
 
       # ----- Audio / transcription -----------------------------------------
-      # whisperx + pyannote.audio pinned with torch=2.8.x; pyannote 4.0+ would
-      # hard-pin torch and whisperx excludes it, so 3.x is the stable target.
       - whisperx==3.7.4
       - pyannote.audio==3.4.0
 
       # ----- giftpose runtime: optional accelerated backends ---------------
-      # ONNX Runtime: large CPU speedup; use onnxruntime-gpu for CUDA.
       - onnx>=1.17
       - onnxruntime>=1.20
       # TRT backend (NVIDIA, Turing+ / SM >= 7.5): swap onnxruntime for
-      # onnxruntime-gpu and uncomment below. TensorRT 10.12+ also needs
-      # onnxconverter-common for the strong-typed fp16 path.
+      # onnxruntime-gpu; TensorRT 10.12+ also needs onnxconverter-common.
       # - tensorrt
       # - onnxconverter-common
 
-      # FB Denoiser (omegaconf>=2.3 above mitigates its hydra-core transitive).
       - denoiser
 
       # ----- Analysis viewer (Tauri sidecar) --------------------------------
-      # FastAPI sidecar for the Tauri/Vue frontend.
       - fastapi
       - uvicorn[standard]
       - aiofiles
