@@ -99,6 +99,12 @@ pip install --force-reinstall onnxruntime-gpu
 
 For the TensorRT backend (`*.engine`), install `tensorrt` matching your CUDA version per NVIDIA's pip guide: <https://docs.nvidia.com/deeplearning/tensorrt/latest/installing-tensorrt/install-pip.html>.
 
+> **fp16 engines on TensorRT 10.12+:** newer TensorRT dropped the `FP16` builder flag in favor of *strong typing*, so `trt_build` builds the fp16 engine from an fp16 ONNX — which needs `onnxconverter-common`. Install it alongside `tensorrt`, otherwise the build logs `Building an fp32 engine instead` and produces a (working but larger/slower) fp32 engine:
+> ```bash
+> pip install onnxconverter-common
+> ```
+> On older TensorRT (the `FP16` flag still present) it isn't needed — fp16 builds directly.
+
 ### Optional — accelerated runtime artifacts
 
 The engine runs straight off `*.pth`. To upgrade to a faster backend, export once:
