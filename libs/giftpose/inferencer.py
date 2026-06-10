@@ -104,6 +104,16 @@ class MMPoseInferencer:
             det.boxes_xyxy = det.boxes_xyxy[keep]
             det.scores = det.scores[keep]
 
+        # Drop degenerate (sub-pixel) boxes. A zero-area box yields a singular
+        # top-down warp (apply_inverse_warps_batched -> "Singular matrix") and a
+        # NaN IoU in the tracker; such detections are spurious anyway.
+        if det.boxes_xyxy.shape[0] > 0:
+            wh = det.boxes_xyxy[:, 2:] - det.boxes_xyxy[:, :2]
+            keep = (wh[:, 0] > 1.0) & (wh[:, 1] > 1.0)
+            if not keep.all():
+                det.boxes_xyxy = det.boxes_xyxy[keep]
+                det.scores = det.scores[keep]
+
         if det.boxes_xyxy.shape[0] == 0:
             return []
 

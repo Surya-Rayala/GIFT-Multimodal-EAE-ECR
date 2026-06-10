@@ -129,6 +129,13 @@ def apply_inverse_warps_batched(
     augmented = np.zeros((n, 3, 3), dtype=np.float32)
     augmented[:, :2, :] = mats
     augmented[:, 2, 2] = 1.0
+    # Defensive: a zero-area bbox produces a singular warp; np.linalg.inv would
+    # raise "Singular matrix" for the WHOLE batch. Swap any singular matrix for
+    # identity so one bad detection can't crash the frame (callers should drop
+    # degenerate boxes upstream; this is the backstop).
+    bad = ~(np.abs(np.linalg.det(augmented)) > 1e-8)
+    if bad.any():
+        augmented[bad] = np.eye(3, dtype=np.float32)
     inv = np.linalg.inv(augmented)[:, :2, :]   # (N, 2, 3) — first two rows
     A = inv[:, :, :2]                           # (N, 2, 2)
     b = inv[:, :, 2:3]                          # (N, 2, 1)
