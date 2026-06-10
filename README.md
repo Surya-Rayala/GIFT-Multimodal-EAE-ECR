@@ -71,6 +71,8 @@ The conda env's PyTorch is **not guaranteed to be a CUDA build**, so verify and 
 
    If `nvcc` isn't found, install the CUDA Toolkit from <https://developer.nvidia.com/cuda-downloads>. (Note: `nvidia-smi` shows only the *driver's* max-supported CUDA, not the installed toolkit — pick your `cu###` wheel below by `nvcc`, and it must not exceed the driver's CUDA in `nvidia-smi`.)
 
+   **Preferred: a CUDA 12.x toolkit (12.6, 12.8, or 12.9)** — torch 2.8 ships wheels exactly for these (`cu126` / `cu128` / `cu129`). If your toolkit is **newer than 12.9** (e.g. CUDA 13.x), there's no matching torch 2.8 wheel — install the **nearest lower** one, `cu129`. (It runs fine: the wheel bundles its own CUDA runtime and the driver is backward-compatible.)
+
 2. Confirm PyTorch actually sees the GPU:
 
    ```bash
@@ -81,12 +83,13 @@ The conda env's PyTorch is **not guaranteed to be a CUDA build**, so verify and 
 
 3. If it prints `False` / `None`, install the CUDA wheel **for the version this repo pins** — `torch 2.8.*` / `torchvision 0.23.*` / `torchaudio 2.8.*` (keep this version; pyannote.audio pins `torch==2.8.0`, and a mismatch breaks the torchvision ABI). Uninstall the current build, then from <https://pytorch.org/get-started/previous-versions/> grab the **v2.8.0** command whose `cu###` matches your `nvcc --version` toolkit:
 
+   Pick the `cu###` for your toolkit: **12.6 → `cu126`, 12.8 → `cu128`, 12.9 (or anything newer, e.g. 13.x) → `cu129`** (the highest torch 2.8 ships).
+
    ```bash
    pip uninstall -y torch torchvision torchaudio
-   # example (CUDA 12.6) — pick the cu### matching YOUR `nvcc --version` from the link:
-   pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
+   # swap cu129 below for cu126 / cu128 to match YOUR `nvcc --version`:
+   pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu129
    ```
-   (torch 2.8 ships `cu126` / `cu128` / `cu129` wheels — there's no CUDA 13.x build, so on a 13.x toolkit pick `cu129`.)
 
 For the optional ONNX-CUDA backend, swap `onnxruntime` for `onnxruntime-gpu`:
 
