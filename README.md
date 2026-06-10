@@ -63,11 +63,13 @@ Prints your Hugging Face username + email when the token is valid.
 
 The conda env's PyTorch is **not guaranteed to be a CUDA build**, so verify and fix it.
 
-1. Check your driver / CUDA toolkit version:
+1. Make sure the CUDA Toolkit is installed, then check its version:
 
    ```bash
-   nvidia-smi    # note the "CUDA Version" shown top-right
+   nvcc --version    # the installed CUDA Toolkit version, e.g. "release 12.6"
    ```
+
+   If `nvcc` isn't found, install the CUDA Toolkit from <https://developer.nvidia.com/cuda-downloads>. (Note: `nvidia-smi` shows only the *driver's* max-supported CUDA, not the installed toolkit — pick your `cu###` wheel below by `nvcc`, and it must not exceed the driver's CUDA in `nvidia-smi`.)
 
 2. Confirm PyTorch actually sees the GPU:
 
@@ -77,13 +79,14 @@ The conda env's PyTorch is **not guaranteed to be a CUDA build**, so verify and 
 
    If this prints `True` and a CUDA version, you're done — skip to ONNX/TensorRT below.
 
-3. If it prints `False` / `None`, install the CUDA wheel **for the version this repo pins** — `torch 2.8.*` / `torchvision 0.23.*` / `torchaudio 2.8.*` (keep this version; pyannote.audio pins `torch==2.8.0`, and a mismatch breaks the torchvision ABI). Uninstall the current build, then from <https://pytorch.org/get-started/previous-versions/> grab the **v2.8.0** command whose `cu###` matches your `nvidia-smi` CUDA version:
+3. If it prints `False` / `None`, install the CUDA wheel **for the version this repo pins** — `torch 2.8.*` / `torchvision 0.23.*` / `torchaudio 2.8.*` (keep this version; pyannote.audio pins `torch==2.8.0`, and a mismatch breaks the torchvision ABI). Uninstall the current build, then from <https://pytorch.org/get-started/previous-versions/> grab the **v2.8.0** command whose `cu###` matches your `nvcc --version` toolkit:
 
    ```bash
    pip uninstall -y torch torchvision torchaudio
-   # example (CUDA 12.6) — pick the cu### for YOUR toolkit from the link:
+   # example (CUDA 12.6) — pick the cu### matching YOUR `nvcc --version` from the link:
    pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
    ```
+   (torch 2.8 ships `cu126` / `cu128` / `cu129` wheels — there's no CUDA 13.x build, so on a 13.x toolkit pick `cu129`.)
 
 For the optional ONNX-CUDA backend, swap `onnxruntime` for `onnxruntime-gpu`:
 
