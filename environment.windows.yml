@@ -1,36 +1,14 @@
 # GIFT Multimodal EAE — runtime environment (WINDOWS / win-64).
 #
-# Identical to ``environment.yml`` EXCEPT the PyTorch trio is installed from
-# pip. conda-forge's torchaudio feedstock does not build for Windows — there is
-# *no* ``torchaudio`` package for win-64 on conda-forge at any version — so
-# ``conda-forge::torchaudio=2.8.*`` fails with ``PackagesNotFoundError``. The
-# whole trio is moved to pip together (not just torchaudio) so the wheels stay
-# mutually ABI-matched; mixing a conda pytorch with a pip torchaudio risks
-# ``operator torchvision::nms does not exist``.
-# Pillow is pinned on conda-forge (NOT pip): the conda phase already installs a
-# Pillow for matplotlib/scikit-image/opencv, so letting pip's torchvision add
-# its own on top leaves a broken ``_imaging`` DLL (WinError 193). Keeping it on
-# conda-forge means pip sees the dep satisfied and skips it — one clean Pillow.
-#
-# The macOS ``libomp`` dup-init abort that forces conda-forge torch on mac does
-# NOT occur on Windows, so PyPI wheels are safe here. mac/linux keep the full
-# conda-forge trio in ``environment.yml`` — use this file on Windows only:
+# Same as environment.yml, but the PyTorch trio AND Pillow come from pip:
+#   * conda-forge has no win-64 torchaudio, so the whole trio is installed from
+#     pip together (keeps the wheels mutually ABI-matched).
+#   * pip Pillow resolves its own DLLs without relying on %PATH%/System32, so it
+#     survives a contaminated system PATH where conda-forge Pillow throws
+#     ``_imaging`` WinError 193.
+# mac/linux use environment.yml (full conda-forge trio). Windows:
 #
 #   conda env create -f environment.windows.yml
-#
-# Pose detection + estimation are provided by the in-repo ``libs.giftpose``
-# library; no OpenMMLab packages (mmcv / mmdet / mmengine / mmpose) are
-# required at runtime. ``libs.giftpose`` auto-selects the fastest backend on
-# each host:
-#
-#   TensorRT (NVIDIA, *.engine present)  >  ONNX Runtime (*.onnx present)
-#       >  PyTorch (universal: cuda / mps / cpu)
-#
-# Optional accelerated artifacts can be produced from the .pth checkpoints:
-#
-#   python -m libs.giftpose.export.onnx_export
-#   python -m libs.giftpose.export.torchscript_export --device cpu|mps|cuda
-#   python -m libs.giftpose.export.trt_build           # NVIDIA only
 
 name: gift-meae
 
@@ -43,8 +21,7 @@ dependencies:
   - python=3.11
   - git
   - pip
-  # ``libs/Track`` imports ``pkg_resources``, which setuptools 75+ no longer
-  # ships by default. Pin <75 until libs/Track migrates to importlib.metadata.
+  # libs/Track imports pkg_resources, dropped by setuptools 75+.
   - setuptools<75
 
   # ----- Numerical / data ---------------------------------------------------
@@ -57,51 +34,34 @@ dependencies:
   - tqdm
   - shapely
   - loguru
-  # Pillow MUST come from conda-forge here, NOT pip. matplotlib / scikit-image /
-  # opencv already pull a conda Pillow; if pip's torchvision (below) is allowed
-  # to install its own Pillow on top, the overlay leaves a mismatched
-  # ``_imaging`` binary that fails with ``DLL load failed while importing
-  # _imaging: The operating system cannot run %1`` (WinError 193). Pinning it on
-  # conda-forge means the pip phase sees torchvision's Pillow dep already
-  # satisfied and skips it — one clean Pillow, no overlay. (torchvision uses
-  # Pillow only as a Python API, so conda Pillow + pip torchvision is fine.)
-  - pillow
+  # Pillow comes from pip (see pip section); conda pulls one transitively here.
 
   # ----- Vision / video -----------------------------------------------------
   - opencv
   - ffmpeg
   - pkg-config
-  # Explicit conda-forge channel: links av dynamically against the env's
-  # ffmpeg. PyPI's av wheel bundles its own ffmpeg dylibs which on macOS
-  # double-register AVF* ObjC classes against conda's ffmpeg.
+  # conda-forge av links against the env's ffmpeg (PyPI's av bundles its own).
   - conda-forge::av
 
   # ----- GUI (Config Builder + Mapper tools) --------------------------------
   - pyqt=5
 
   # ----- Analysis viewer (Tauri shell) --------------------------------------
-  # Tauri 2 requires rustc >= 1.77. Installing the Rust toolchain into the
-  # conda env (rather than via system-wide rustup) keeps everything contained:
-  # `conda activate gift-meae` brings rustc, cargo, python, and the npm-local
-  # @tauri-apps/cli all into scope at once. `conda env remove` wipes it.
+  # Rust toolchain (Tauri 2 needs rustc >= 1.77) kept inside the env.
   - conda-forge::rust
-
-  # NOTE: the PyTorch trio is installed via pip here, not conda — see the pip
-  # section below for why (no conda-forge torchaudio on win-64). Pillow stays on
-  # conda-forge (above) on purpose; do NOT add it to pip.
 
   - pip:
       # ----- Deep-learning runtime -------------------------------------------
-      # Full torch trio from pip (Windows only). conda-forge has no win-64
-      # torchaudio, so all three come from pip together — one index, mutually
-      # ABI-matched wheels (mixing conda pytorch with a pip torchaudio risks
-      # ``operator torchvision::nms does not exist``). PyPI's default Windows
-      # wheels are CUDA builds; to force a specific CUDA / CPU build, see the
-      # "CUDA users" section in the README. Version aligned with the whisperx
-      # 3.7.4 + pyannote.audio 3.4.0 pair below (pyannote pins torch==2.8.0).
+      # Torch trio from pip (no conda-forge win-64 torchaudio). PyPI's default
+      # Windows wheels are CUDA builds; see the README "CUDA users" section to
+      # pick a specific cu### / CPU build. Pinned to match whisperx 3.7.4 +
+      # pyannote.audio 3.4.0 (pyannote requires torch==2.8.0).
       - torch==2.8.0
       - torchvision==0.23.0
       - torchaudio==2.8.0
+
+      # Pillow from pip — robust against a broken system PATH (see header).
+      - pillow
 
       # ----- Misc utilities -------------------------------------------------
       - platformdirs
@@ -114,47 +74,37 @@ dependencies:
       - regex
       - cython
 
-      # Force modern omegaconf — denoiser's transitive hydra-core can pull
-      # the legacy 1.4 series, which breaks pyannote.audio's pickled VAD load.
+      # Modern omegaconf — denoiser's hydra-core can pull legacy 1.4 which
+      # breaks pyannote.audio's pickled VAD load.
       - omegaconf>=2.3
 
-      # Required by torch>=2.5's dynamo-based ``torch.onnx.export`` codepath
-      # used in libs/giftpose/export/onnx_export.py.
+      # Needed by torch>=2.5's dynamo torch.onnx.export (onnx_export.py).
       - onnxscript
 
-      # WAV I/O for src/utils/denoise.py — avoids torchaudio>=2.8's torchcodec
-      # routing (its bundled .dylibs ABI-skew with conda-forge ffmpeg).
+      # WAV I/O for src/utils/denoise.py (avoids torchaudio>=2.8 torchcodec).
       - soundfile
 
       # ----- Audio / transcription -----------------------------------------
-      # whisperx + pyannote.audio pinned in concert with torch=2.8.x above.
-      # pyannote.audio 4.0+ hard-pins ``torch==2.8.0`` exactly which blocks
-      # newer GPU support and security patches; whisperx itself excludes
-      # pyannote 4.0+, so the 3.x line is the stable target.
+      # whisperx + pyannote.audio pinned with torch=2.8.x; pyannote 4.0+ would
+      # hard-pin torch and whisperx excludes it, so 3.x is the stable target.
       - whisperx==3.7.4
       - pyannote.audio==3.4.0
 
       # ----- giftpose runtime: optional accelerated backends ---------------
-      # ONNX Runtime delivers a large CPU speedup vs the PyTorch backend;
-      # CUDAExecutionProvider on NVIDIA (use ``onnxruntime-gpu``);
-      # CoreMLExecutionProvider on macOS.
+      # ONNX Runtime: large CPU speedup; use onnxruntime-gpu for CUDA.
       - onnx>=1.17
       - onnxruntime>=1.20
-      # NVIDIA only — for the TRT backend, replace ``onnxruntime`` above
-      # with ``onnxruntime-gpu`` and uncomment the line below. Install is
-      # CUDA/driver-gated so this can't be a hard dep. Requires a Turing+
-      # GPU (compute capability >= 7.5); on TensorRT 10.12+ also add
-      # ``onnxconverter-common`` for the strong-typed fp16 engine path:
+      # TRT backend (NVIDIA, Turing+ / SM >= 7.5): swap onnxruntime for
+      # onnxruntime-gpu and uncomment below. TensorRT 10.12+ also needs
+      # onnxconverter-common for the strong-typed fp16 path.
       # - tensorrt
       # - onnxconverter-common
 
-      # FB Denoiser — unpinned; the omegaconf>=2.3 pin above mitigates its
-      # legacy hydra-core transitive.
+      # FB Denoiser (omegaconf>=2.3 above mitigates its hydra-core transitive).
       - denoiser
 
       # ----- Analysis viewer (Tauri sidecar) --------------------------------
-      # FastAPI sidecar serves the AnalysisSession JSON, video Range streams,
-      # and image artifacts to the Tauri/Vue frontend at src/utils/analysis_viewer/.
+      # FastAPI sidecar for the Tauri/Vue frontend.
       - fastapi
       - uvicorn[standard]
       - aiofiles

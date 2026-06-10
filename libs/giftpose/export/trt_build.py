@@ -33,16 +33,9 @@ def _parse_shape(spec: str) -> Tuple[str, Tuple[int, ...]]:
 
 
 def _make_builder(trt, logger):
-    """Create a ``trt.Builder``, turning the opaque pybind11 failure into an
-    actionable message.
-
-    ``createInferBuilder`` returns ``nullptr`` (surfacing as
-    ``TypeError: pybind11::init(): factory function returned nullptr``) when
-    TensorRT can't initialize on this GPU — most often because the GPU's
-    compute capability is below the installed TensorRT's floor (TRT 10 requires
-    SM >= 7.5 / Turing; Pascal ``sm_61`` and older are unsupported), or the
-    NVIDIA driver is older than the wheel's CUDA.
-    """
+    """Create a ``trt.Builder``, turning the opaque pybind11 nullptr failure
+    (GPU below TensorRT's SM floor, or driver older than the wheel's CUDA) into
+    an actionable message."""
     try:
         builder = trt.Builder(logger)
     except Exception as e:
