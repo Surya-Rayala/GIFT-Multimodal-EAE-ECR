@@ -225,6 +225,153 @@ def build_engine(
     print(f"built {engine_path}")
 
 
+def _trt_infer(engine, x):
+    """Run a single deserialized engine on one CUDA input tensor and return
+    ``{output_name: fp32 cuda tensor}``. Mirrors ``trt_backend._run_engine`` but
+    stands alone so the build step can verify an engine without constructing the
+    full dual-engine backend. TRT 10 tensor-named API."""
+    import torch
+    import tensorrt as trt  # type: ignore
+
+    def _td(name):
+        dt = engine.get_tensor_dtype(name)
+        return {
+            trt.DataType.HALF: torch.float16,
+            trt.DataType.FLOAT: torch.float32,
+            trt.DataType.INT32: torch.int32,
+        }.get(dt, torch.float32)
+
+    ctx = engine.create_execution_context()
+    stream = torch.cuda.Stream()
+    names = [engine.get_tensor_name(i) for i in range(engine.num_io_tensors)]
+    keep_alive = []  # inputs must outlive execute
+    # Pass 1: bind inputs (output shapes are only resolvable after this).
+    for name in names:
+        if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+            xt = x.to(_td(name)).contiguous()
+            keep_alive.append(xt)
+            ctx.set_input_shape(name, tuple(xt.shape))
+            ctx.set_tensor_address(name, int(xt.data_ptr()))
+    # Pass 2: allocate + bind outputs.
+    outputs = {}
+    for name in names:
+        if engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT:
+            shape = tuple(ctx.get_tensor_shape(name))
+            buf = torch.empty(shape, device="cuda", dtype=_td(name))
+            outputs[name] = buf
+            ctx.set_tensor_address(name, int(buf.data_ptr()))
+    ctx.execute_async_v3(stream.cuda_stream)
+    stream.synchronize()
+    return {k: v.float() for k, v in outputs.items()}
+
+
+def verify_trt_engine(
+    engine_path: str | Path,
+    weights_path: str | Path,
+    kind: str,
+    fp16: bool,
+    sample_frame: str | None = "input/Videos/Crested_Gecko/8-Trimmed.mp4",
+    tol: float | None = None,
+) -> float:
+    """Run the built ``.engine`` and the eager model on the same input and assert
+    they agree — the TRT analogue of ``verify_onnx`` / ``verify_torchscript``.
+
+    This is the step that catches an engine that built "successfully" but
+    diverges numerically (an fp16 precision problem, or a stale engine left on
+    disk). Verification is precision-aware:
+
+    * **detector**: compares dense ``boxes``/``scores`` with a per-output
+      relative tol — tight for the (default) fp32 engine, looser for ``--det-fp16``.
+    * **pose**: compares the *decoded keypoint positions* (argmax over SimCC) in
+      input-space pixels, not the raw fp16 logits — argmax is robust to fp16 so a
+      correct fp16 pose engine passes while a broken one (wrong shape / weights /
+      layout, off by many px) fails. Uses a real frame crop so the SimCC peaks are
+      sharp (random input has no peak and makes argmax meaningless).
+
+    Returns the worst diff (relative for detector, px for pose); raises on excess.
+    Only runnable where TensorRT + CUDA exist (the build host).
+    """
+    import numpy as np
+    import torch
+
+    from libs.giftpose.models.detector import build_rtmdet_m_person
+    from libs.giftpose.models.pose_estimator import build_rtmpose_x_halpe26
+    from libs.giftpose.export.onnx_export import _DetectorWithDecode
+    from libs.giftpose.weights.loader import load_state_dict_from_pth, strict_load
+    from libs.giftpose.runtime.trt_backend import _load_engine
+
+    dev = torch.device("cuda")
+    if kind == "detector":
+        model = _DetectorWithDecode(build_rtmdet_m_person()).to(dev).eval()
+        strict_load(model.model, load_state_dict_from_pth(weights_path, "detector"))
+        H, W = 640, 640
+    elif kind == "pose":
+        model = build_rtmpose_x_halpe26().to(dev).eval()
+        strict_load(model, load_state_dict_from_pth(weights_path, "pose"))
+        H, W = 384, 288
+    else:
+        raise ValueError(f"unknown kind: {kind}")
+
+    # Build the input. Pose wants a real crop (sharp SimCC peaks); the detector is
+    # fine on random noise since we only compare eager-vs-engine on identical input.
+    x = None
+    if kind == "pose" and sample_frame and Path(sample_frame).exists():
+        import cv2
+        from libs.giftpose.preprocess.normalize import normalize_pose_batch
+        cap = cv2.VideoCapture(sample_frame)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 60)
+        ok, frame = cap.read()
+        cap.release()
+        if ok and frame is not None:
+            fh, fw = frame.shape[:2]
+            cy, cx = fh // 2, fw // 2
+            crop = frame[cy - H // 2: cy + H // 2, cx - W // 2: cx + W // 2]
+            if crop.shape[:2] == (H, W):
+                x = normalize_pose_batch(crop[None], dev, dtype=torch.float32)
+    if x is None:
+        torch.manual_seed(0)
+        x = torch.randn(1, 3, H, W, device=dev, dtype=torch.float32)
+
+    with torch.inference_mode():
+        ref = model(x)
+    engine = _load_engine(str(engine_path))
+    outs = _trt_infer(engine, x)
+
+    if kind == "detector":
+        tol = tol if tol is not None else (1e-1 if fp16 else 2e-2)
+        worst = 0.0
+        for name, r in zip(("boxes", "scores"), ref):
+            r = r.detach().cpu().numpy()
+            o = outs[name].cpu().numpy()
+            if r.shape != o.shape:
+                raise RuntimeError(
+                    f"detector engine verify: shape mismatch {r.shape} vs {o.shape} "
+                    f"({name}) for {engine_path}"
+                )
+            scale = max(1.0, float(np.abs(r).max()))
+            worst = max(worst, float(np.abs(r.astype(np.float64) - o.astype(np.float64)).max()) / scale)
+        metric = f"worst relative diff = {worst:.3e}"
+    else:
+        from libs.giftpose.codecs.simcc import decode_simcc
+        tol = tol if tol is not None else 2.0  # input-space pixels
+        ref_k, _ = decode_simcc(ref[0].detach().cpu().numpy(), ref[1].detach().cpu().numpy())
+        eng_k, _ = decode_simcc(outs["pred_x"].cpu().numpy(), outs["pred_y"].cpu().numpy())
+        worst = float(np.abs(ref_k - eng_k).max())
+        metric = f"max keypoint diff = {worst:.3f}px"
+
+    prec = "fp16" if fp16 else "fp32"
+    unit = "" if kind == "detector" else "px"
+    print(f"  {kind} TRT engine verify ({prec}): {metric} (tol {tol:g}{unit})")
+    if worst > tol:
+        raise RuntimeError(
+            f"{kind} TRT engine diverges from eager ({metric} > {tol:g}{unit}) for "
+            f"{engine_path}. For a {prec} engine this means the build lost too much "
+            f"precision or the engine is stale — rebuild; if it's fp16, try fp32 "
+            f"(detector defaults to fp32; pass --no-fp16 for pose)."
+        )
+    return worst
+
+
 def _main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--det-weights", default="models/detect-best-mAP.pth")
@@ -243,9 +390,9 @@ def _main(argv: list[str] | None = None) -> int:
     p.add_argument("--skip-detector", action="store_true")
     p.add_argument("--skip-pose", action="store_true")
     p.add_argument("--no-verify", action="store_true",
-                   help="Skip the eager-vs-ONNX parity check before building "
-                        "(NOT recommended — verification is what catches a stale "
-                        "or buggy .onnx becoming a wrong engine).")
+                   help="Skip BOTH parity checks — eager-vs-ONNX before building "
+                        "and eager-vs-engine after (NOT recommended; these are what "
+                        "catch a stale/buggy .onnx or a precision-broken engine).")
     args = p.parse_args(argv)
     verify = not args.no_verify
 
@@ -265,6 +412,10 @@ def _main(argv: list[str] | None = None) -> int:
         _ensure_onnx(args.det_weights, args.det_onnx, "detector", verify=verify)
         build_engine(args.det_onnx, args.det_engine, fp16=det_fp16,
                      workspace_mb=args.workspace_mb)
+        if verify:
+            # Verify the built engine against eager — catches an fp16 build that
+            # lost too much precision or a stale engine, before it ships.
+            verify_trt_engine(args.det_engine, args.det_weights, "detector", fp16=det_fp16)
     if not args.skip_pose:
         _ensure_onnx(args.pose_weights, args.pose_onnx, "pose", verify=verify)
         # Pose handles a variable number of detections per frame; the TRT
@@ -276,6 +427,8 @@ def _main(argv: list[str] | None = None) -> int:
             max_shape="images:32x3x384x288",
             workspace_mb=args.workspace_mb,
         )
+        if verify:
+            verify_trt_engine(args.pose_engine, args.pose_weights, "pose", fp16=pose_fp16)
     return 0
 
 
