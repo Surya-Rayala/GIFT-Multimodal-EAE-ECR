@@ -362,6 +362,11 @@ class ProcessingEngine:
 
         initialize_keypoint_indices(self.config)
 
+        # Single meaningful detection floor: the detector's NMS score_thr is tied
+        # to ``box_conf_threshold`` (default 0.3, matching the OCSORT tracker's
+        # det_thresh / entry_conf_threshold). The detector won't emit or
+        # pose-estimate boxes weaker than the tracker would use anyway.
+        box_conf_threshold = self.config.get("box_conf_threshold", 0.3)
         self.inferencer = MMPoseInferencer(
             pose2d=self.config["pose2d_config"],
             pose2d_weights=self.config["pose2d_weights"],
@@ -371,6 +376,7 @@ class ProcessingEngine:
             det_cat_ids=self.config.get("det_cat_ids", (0,)),
             flip_test=self.config.get("flip_test"),
             compile_for_inference=self.config.get("compile_for_inference"),
+            det_score_thr=box_conf_threshold,
         )
 
         self.tracker = OCSORT(
@@ -393,7 +399,7 @@ class ProcessingEngine:
             entry_conf_threshold=0.3,
         )
 
-        self.box_conf_threshold = self.config.get("box_conf_threshold", 0.5)
+        self.box_conf_threshold = self.config.get("box_conf_threshold", 0.3)
         self.pose_conf_threshold = self.config.get("pose_conf_threshold", 0.5)
         self.device = self.config.get("device", "cpu")
         self.map_img = self.config.get("Map Image", None)

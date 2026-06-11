@@ -55,18 +55,30 @@ class MMPoseInferencer:
         prefer_backend: str | None = None,
         flip_test: bool | None = None,
         compile_for_inference: bool | None = None,
+        det_score_thr: float = 0.3,
+        det_iou_threshold: float = 0.6,
+        det_max_per_img: int = 100,
     ) -> None:
         _validate_tag(pose2d, _POSE_TAGS, "pose2d")
         _validate_tag(det_model, _DET_TAGS, "det_model")
         # det_cat_ids: ignored — the GIFT detector is single-class person.
         self._det_cat_ids = tuple(det_cat_ids)
 
+        # ``det_score_thr`` is the minimum detection confidence the detector
+        # bothers to emit (its NMS floor). It defaults to 0.3 to match the
+        # downstream tracker — OCSORT runs with ``det_thresh`` / ``entry_conf_
+        # threshold`` = 0.3 and discards anything weaker, so producing (and
+        # pose-estimating) boxes below 0.3 is wasted work. Callers wire this to
+        # ``box_conf_threshold`` so there is a single meaningful detection floor.
         self.backend = select_backend(
             det_weights=det_weights,
             pose_weights=pose2d_weights,
             device=device,
             prefer=prefer_backend,
             compile_for_inference=bool(compile_for_inference),
+            det_score_thr=det_score_thr,
+            det_iou_threshold=det_iou_threshold,
+            det_max_per_img=det_max_per_img,
         )
 
         # ``flip_test`` doubles the pose batch (original + horizontally

@@ -23,6 +23,7 @@ from typing import Tuple
 from libs.giftpose.export.onnx_export import (
     export_onnx_detector,
     export_onnx_pose,
+    verify_onnx,
 )
 
 
@@ -90,21 +91,39 @@ def _onnx_to_fp16(onnx_path: str | Path) -> Path | None:
         return None
 
 
-def _ensure_onnx(weights_path: str, onnx_path: str, kind: str) -> None:
-    """Export ONNX from .pth if the .onnx artifact is missing."""
-    if Path(onnx_path).exists():
-        return
-    if not Path(weights_path).exists():
-        raise FileNotFoundError(
-            f"{kind} weights not found at {weights_path}; cannot auto-export ONNX."
-        )
-    print(f"[trt_build] {onnx_path} missing — exporting from {weights_path}")
-    if kind == "detector":
-        export_onnx_detector(weights_path, onnx_path)
-    elif kind == "pose":
-        export_onnx_pose(weights_path, onnx_path)
-    else:
-        raise ValueError(f"unknown kind: {kind}")
+def _ensure_onnx(weights_path: str, onnx_path: str, kind: str, verify: bool = True) -> None:
+    """Export ONNX from .pth if the .onnx artifact is missing, then verify it
+    matches the eager model so a stale or buggy ONNX can't silently become a
+    TRT engine.
+
+    The verify step runs whether the ONNX was just exported OR already on disk —
+    a pre-existing ``.onnx`` left over from an older checkpoint is the classic
+    cause of "PyTorch works, TRT is wrong". Verification needs onnxruntime; if
+    it's absent in the build env we warn loudly rather than fail (the engine is
+    still built, just unverified)."""
+    if not Path(onnx_path).exists():
+        if not Path(weights_path).exists():
+            raise FileNotFoundError(
+                f"{kind} weights not found at {weights_path}; cannot auto-export ONNX."
+            )
+        print(f"[trt_build] {onnx_path} missing — exporting from {weights_path}")
+        if kind == "detector":
+            export_onnx_detector(weights_path, onnx_path)
+        elif kind == "pose":
+            export_onnx_pose(weights_path, onnx_path)
+        else:
+            raise ValueError(f"unknown kind: {kind}")
+
+    if verify:
+        try:
+            import onnxruntime  # noqa: F401
+        except Exception:
+            print(f"[trt_build] WARNING: onnxruntime not installed — skipping "
+                  f"{kind} ONNX verification. Install onnxruntime to guard "
+                  f"against stale/mismatched {onnx_path}.")
+            return
+        # Raises if the ONNX diverges from eager (stale checkpoint or bad export).
+        verify_onnx(onnx_path, weights_path, kind)
 
 
 def build_engine(
@@ -214,23 +233,44 @@ def _main(argv: list[str] | None = None) -> int:
     p.add_argument("--det-engine", default="models/detect-best-mAP.engine")
     p.add_argument("--pose-onnx", default="models/pose.onnx")
     p.add_argument("--pose-engine", default="models/pose.engine")
-    p.add_argument("--no-fp16", action="store_true")
+    p.add_argument("--no-fp16", action="store_true",
+                   help="Force fp32 for BOTH detector and pose engines.")
+    p.add_argument("--det-fp16", action="store_true",
+                   help="Build the detector in fp16 too (default fp32 — its "
+                        "scores ride the 0.5 confidence gate and fp16 flips "
+                        "boundary detections, causing missing/flickering boxes).")
     p.add_argument("--workspace-mb", type=int, default=4096)
     p.add_argument("--skip-detector", action="store_true")
     p.add_argument("--skip-pose", action="store_true")
+    p.add_argument("--no-verify", action="store_true",
+                   help="Skip the eager-vs-ONNX parity check before building "
+                        "(NOT recommended — verification is what catches a stale "
+                        "or buggy .onnx becoming a wrong engine).")
     args = p.parse_args(argv)
+    verify = not args.no_verify
 
-    fp16 = not args.no_fp16
+    # Precision is decoupled per model. The RTMDet person-detector's sigmoid
+    # scores cluster tightly around the 0.5 confidence gate applied downstream
+    # (``processing_engine.box_conf_threshold`` -> ``inferencer`` ``bbox_thr``),
+    # so fp16 accumulation through the backbone flips boundary detections in and
+    # out frame-to-frame — the "missing / inconsistent detections" symptom that
+    # PyTorch / TorchScript (fp32) don't show. The detector is a single 640x640
+    # pass, so building it fp32 is cheap and keeps the gate identical to the
+    # reference backends. Pose stays fp16 (keypoint argmax shift is sub-pixel).
+    # ``--no-fp16`` forces both to fp32; ``--det-fp16`` opts the detector back
+    # into fp16 for users who accept the accuracy risk for speed.
+    det_fp16 = (not args.no_fp16) and args.det_fp16
+    pose_fp16 = not args.no_fp16
     if not args.skip_detector:
-        _ensure_onnx(args.det_weights, args.det_onnx, "detector")
-        build_engine(args.det_onnx, args.det_engine, fp16=fp16,
+        _ensure_onnx(args.det_weights, args.det_onnx, "detector", verify=verify)
+        build_engine(args.det_onnx, args.det_engine, fp16=det_fp16,
                      workspace_mb=args.workspace_mb)
     if not args.skip_pose:
-        _ensure_onnx(args.pose_weights, args.pose_onnx, "pose")
+        _ensure_onnx(args.pose_weights, args.pose_onnx, "pose", verify=verify)
         # Pose handles a variable number of detections per frame; the TRT
         # engine carries dynamic batch range 1..32 (opt at 8).
         build_engine(
-            args.pose_onnx, args.pose_engine, fp16=fp16,
+            args.pose_onnx, args.pose_engine, fp16=pose_fp16,
             min_shape="images:1x3x384x288",
             opt_shape="images:8x3x384x288",
             max_shape="images:32x3x384x288",

@@ -18,10 +18,13 @@ from typing import Sequence
 import numpy as np
 
 # Default pose batch sizes warmed at backend init: powers of two covering the
-# common 1-16-people-per-frame range. cuDNN's per-shape autotune (when
-# ``benchmark=True``) is primed for these sizes so a frame with N detections
-# in this range hits a cached plan instead of paying a fresh ~5-50ms tune.
-DEFAULT_WARMUP_POSE_SIZES: tuple[int, ...] = (1, 2, 4, 8, 16)
+# common 1-16-people-per-frame range, plus 32 — the TRT pose engine's max
+# profile batch and the size of every full chunk when a busy frame is split
+# (``trt_backend.predict_pose``). cuDNN's per-shape autotune (when
+# ``benchmark=True``) and TRT's first-call shape resolution are primed for these
+# sizes so a frame with N detections in this range hits a cached plan instead of
+# paying a fresh ~5-50ms tune mid-pipeline.
+DEFAULT_WARMUP_POSE_SIZES: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
 
 
 @dataclass

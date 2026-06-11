@@ -41,6 +41,9 @@ class TorchScriptBackend(Backend):
         det_input_size: Tuple[int, int] = (640, 640),
         pose_input_size: Tuple[int, int] = (288, 384),
         flip_test: bool = True,
+        det_score_thr: float = 0.05,
+        det_iou_threshold: float = 0.6,
+        det_max_per_img: int = 100,
         warmup: bool = True,
         compile_for_inference: bool = False,
     ) -> None:
@@ -48,6 +51,11 @@ class TorchScriptBackend(Backend):
         self.det_input_size = det_input_size
         self.pose_input_size = pose_input_size
         self.flip_test = flip_test
+        # Detector NMS knobs — wired through for parity with the PyTorch / ONNX /
+        # TRT backends (previously hardcoded on this path).
+        self.det_score_thr = det_score_thr
+        self.det_iou_threshold = det_iou_threshold
+        self.det_max_per_img = det_max_per_img
 
         # MPS requires a CPU round-trip — Apple's Metal backend rejects
         # float64 constants baked into traced graphs by the tracer. For
@@ -94,7 +102,9 @@ class TorchScriptBackend(Backend):
         # the small post-NMS (~K boxes) result to CPU, not the dense tensor.
         boxes_t, scores_t = multiclass_nms_torch(
             boxes_dense, scores_dense,
-            score_thr=0.05, iou_threshold=0.6, max_per_img=100,
+            score_thr=self.det_score_thr,
+            iou_threshold=self.det_iou_threshold,
+            max_per_img=self.det_max_per_img,
         )
         if boxes_t.numel() == 0:
             return Detection(

@@ -69,6 +69,9 @@ class TRTBackend(Backend):
         det_input_size: Tuple[int, int] = (640, 640),
         pose_input_size: Tuple[int, int] = (288, 384),
         flip_test: bool = True,
+        det_score_thr: float = 0.05,
+        det_iou_threshold: float = 0.6,
+        det_max_per_img: int = 100,
         warmup: bool = True,
     ) -> None:
         import torch
@@ -78,12 +81,29 @@ class TRTBackend(Backend):
         self.det_input_size = det_input_size
         self.pose_input_size = pose_input_size
         self.flip_test = flip_test
+        # Detector NMS knobs — wired through (the PyTorch backend already exposes
+        # these; the TRT/ONNX paths previously hardcoded them, so the detector
+        # couldn't be tuned when running on an engine).
+        self.det_score_thr = det_score_thr
+        self.det_iou_threshold = det_iou_threshold
+        self.det_max_per_img = det_max_per_img
 
         self._det_engine = _load_engine(det_engine)
         self._pose_engine = _load_engine(pose_engine)
         self._det_ctx = self._det_engine.create_execution_context()
         self._pose_ctx = self._pose_engine.create_execution_context()
         self._stream = torch.cuda.Stream()
+
+        # Reused output buffers keyed by (engine id, binding name, shape, dtype).
+        # The previous code called ``torch.empty`` for every output on every
+        # ``_run_engine`` invocation; with the pose batch varying frame-to-frame
+        # (and chunked into up to ~7 calls/frame) that churned the CUDA caching
+        # allocator and fragmented it over a long video — a steady per-frame
+        # slowdown. A handful of distinct shapes recur, so caching the device
+        # buffers and reusing them keeps allocation flat. Safe because every
+        # caller copies the result off the buffer (NMS produces new tensors;
+        # pose does ``.cpu().numpy()``) before the next call can overwrite it.
+        self._out_bufs: dict = {}
 
         # Read the pose engine's batch profile so predict_pose can chunk
         # any oversized batch instead of hitting TRT's "Set dimension
@@ -150,9 +170,17 @@ class TRTBackend(Backend):
                 # infer the dynamic output shape (any -1 axis).
                 if -1 in shape:
                     shape = out_shapes[name]
-                buf = torch.empty(
-                    shape, device="cuda", dtype=self._torch_dtype(engine, name)
-                )
+                dtype = self._torch_dtype(engine, name)
+                # Reuse a cached device buffer for this (engine, name, shape,
+                # dtype) instead of allocating every call — avoids allocator
+                # churn/fragmentation across a long run. The buffer is written
+                # fresh by ``execute_async_v3`` below and fully read by the
+                # caller before the next call, so reuse is safe.
+                key = (id(engine), name, shape, dtype)
+                buf = self._out_bufs.get(key)
+                if buf is None:
+                    buf = torch.empty(shape, device="cuda", dtype=dtype)
+                    self._out_bufs[key] = buf
                 outputs[name] = buf
                 ctx.set_tensor_address(name, int(buf.data_ptr()))
         ctx.execute_async_v3(self._stream.cuda_stream)
@@ -184,7 +212,9 @@ class TRTBackend(Backend):
         )
         boxes_t, scores_t = multiclass_nms_torch(
             outs["boxes"], outs["scores"],
-            score_thr=0.05, iou_threshold=0.6, max_per_img=100,
+            score_thr=self.det_score_thr,
+            iou_threshold=self.det_iou_threshold,
+            max_per_img=self.det_max_per_img,
         )
         if boxes_t.numel() == 0:
             return Detection(

@@ -101,6 +101,78 @@ def export_onnx_pose(
     print(f"wrote {out_path}")
 
 
+def verify_onnx(
+    onnx_path: str | Path,
+    weights_path: str | Path,
+    kind: str,
+    tol: float = 1e-3,
+) -> float:
+    """Run the eager model and the exported ONNX on the same input under
+    onnxruntime; return the max-abs output diff and raise if it exceeds ``tol``.
+
+    This is the ONNX analogue of ``torchscript_export.verify_torchscript`` —
+    which is why the TorchScript path has never shipped a silent export bug and
+    the ONNX path (previously unverified) could. A stale ``.onnx`` (re-exported
+    from an older checkpoint than the ``.pth``) or a genuine op-translation bug
+    both surface here as a large diff, so callers can refuse to build a TRT
+    engine on top of it.
+
+    ``kind`` is ``"detector"`` (compares dense ``boxes``/``scores``) or
+    ``"pose"`` (compares ``pred_x``/``pred_y``). Uses random input — sufficient
+    to catch op-translation / stale-weight divergence; the dedicated
+    ``tools/parity.py`` harness covers real-frame, post-NMS recall.
+    """
+    import numpy as np
+    import onnxruntime as ort
+
+    if kind == "detector":
+        model = _DetectorWithDecode(build_rtmdet_m_person()).eval()
+        strict_load(model.model, load_state_dict_from_pth(weights_path, "detector"))
+        H, W = 640, 640
+    elif kind == "pose":
+        model = build_rtmpose_x_halpe26().eval()
+        strict_load(model, load_state_dict_from_pth(weights_path, "pose"))
+        H, W = 384, 288
+    else:
+        raise ValueError(f"unknown kind: {kind}")
+
+    torch.manual_seed(0)
+    x = torch.randn(1, 3, H, W, dtype=torch.float32)
+    with torch.inference_mode():
+        ref = model(x)
+    sess = ort.InferenceSession(
+        str(onnx_path), providers=["CPUExecutionProvider"]
+    )
+    outs = sess.run(None, {"images": x.numpy()})
+
+    # Relative tolerance per output: the detector emits box COORDINATES (pixel
+    # magnitudes up to ~700) alongside [0,1] scores, so a flat absolute tol
+    # would either false-flag sub-pixel rounding on the boxes or miss score
+    # drift. Scale by each output's own magnitude — a stale checkpoint shifts
+    # scores by O(0.1) and boxes by many px (both caught), while fp rounding
+    # (~1e-3 relative) passes.
+    worst_rel = 0.0
+    for r, o in zip(ref, outs):
+        r = r.detach().cpu().numpy()
+        if r.shape != o.shape:
+            raise RuntimeError(
+                f"{kind} ONNX verify: shape mismatch {r.shape} vs {o.shape} "
+                f"for {onnx_path}"
+            )
+        max_abs = float(np.abs(r.astype(np.float64) - o.astype(np.float64)).max())
+        scale = max(1.0, float(np.abs(r).max()))
+        worst_rel = max(worst_rel, max_abs / scale)
+    print(f"  {kind} ONNX verify: worst relative diff = {worst_rel:.3e} (tol {tol:.0e})")
+    if worst_rel > tol:
+        raise RuntimeError(
+            f"{kind} ONNX export diverges from eager ({worst_rel:.3e} > {tol:.0e} "
+            f"relative) for {onnx_path} — refusing to treat it as valid. Re-export "
+            f"from the current {weights_path}; if it still fails the export itself "
+            f"is buggy."
+        )
+    return worst_rel
+
+
 def _main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--det-weights", default="models/detect-best-mAP.pth")
@@ -110,12 +182,22 @@ def _main(argv: list[str] | None = None) -> int:
     p.add_argument("--opset", type=int, default=17)
     p.add_argument("--skip-detector", action="store_true")
     p.add_argument("--skip-pose", action="store_true")
+    p.add_argument("--verify", action="store_true",
+                   help="After export, load the .onnx under onnxruntime and "
+                        "assert it matches the eager model within tolerance.")
     args = p.parse_args(argv)
 
     if not args.skip_detector:
         export_onnx_detector(args.det_weights, args.det_out, opset=args.opset)
     if not args.skip_pose:
         export_onnx_pose(args.pose_weights, args.pose_out, opset=args.opset)
+
+    if args.verify:
+        print("verifying:")
+        if not args.skip_detector:
+            verify_onnx(args.det_out, args.det_weights, "detector")
+        if not args.skip_pose:
+            verify_onnx(args.pose_out, args.pose_weights, "pose")
     return 0
 
 

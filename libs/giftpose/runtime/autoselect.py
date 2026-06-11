@@ -52,6 +52,9 @@ def select_backend(
     fp16: bool | None = None,
     warmup: bool = True,
     compile_for_inference: bool = False,
+    det_score_thr: float = 0.05,
+    det_iou_threshold: float = 0.6,
+    det_max_per_img: int = 100,
 ) -> Backend:
     """Construct and return a ready-to-use backend.
 
@@ -103,25 +106,30 @@ def select_backend(
         else:
             want = "pytorch"
 
+    det_nms = dict(
+        det_score_thr=det_score_thr,
+        det_iou_threshold=det_iou_threshold,
+        det_max_per_img=det_max_per_img,
+    )
     if want == "trt":
         from libs.giftpose.runtime.trt_backend import TRTBackend
         assert det_engine and pose_engine
-        return TRTBackend(det_engine, pose_engine, warmup=warmup)
+        return TRTBackend(det_engine, pose_engine, warmup=warmup, **det_nms)
     if want == "onnx":
         from libs.giftpose.runtime.onnx_backend import ONNXBackend
         assert det_onnx and pose_onnx
         # ONNX EP graph init already happens at session-construction time —
         # no per-shape autotune layer to prime, so no warmup pass.
-        return ONNXBackend(det_onnx, pose_onnx, device=device)
+        return ONNXBackend(det_onnx, pose_onnx, device=device, **det_nms)
     if want == "torchscript":
         from libs.giftpose.runtime.torchscript_backend import TorchScriptBackend
         assert det_ts and pose_ts
         return TorchScriptBackend(
             det_ts, pose_ts, device=device, warmup=warmup,
-            compile_for_inference=compile_for_inference,
+            compile_for_inference=compile_for_inference, **det_nms,
         )
     from libs.giftpose.runtime.pytorch_backend import PyTorchBackend
     return PyTorchBackend(
         det_weights, pose_weights, device=device, fp16=fp16, warmup=warmup,
-        compile_for_inference=compile_for_inference,
+        compile_for_inference=compile_for_inference, **det_nms,
     )
