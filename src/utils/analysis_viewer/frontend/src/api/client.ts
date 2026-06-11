@@ -54,10 +54,12 @@ export async function initSidecarPort(): Promise<number | null> {
 }
 
 export function sidecarBaseUrl(): string {
+  // All backend endpoints live under /api/* (the bare /analysis and /compare
+  // paths serve the SPA shell, so the data API is namespaced out of their way).
   // Desktop / dev: an explicit port means the backend is on localhost.
-  if (cachedPort != null && cachedPort > 0) return `http://127.0.0.1:${cachedPort}`;
-  // Web mode: backend serves this page — use same origin via relative URLs.
-  return '';
+  if (cachedPort != null && cachedPort > 0) return `http://127.0.0.1:${cachedPort}/api`;
+  // Web mode: backend serves this page — same origin via a root-relative /api.
+  return '/api';
 }
 
 async function getJson<T>(path: string): Promise<T> {

@@ -23,11 +23,21 @@ import RightPanel from '@/components/RightPanel.vue';
 import { fetchConfig } from '@/api/client';
 import { useSessionStore } from '@/stores/session';
 import { useCompareStore } from '@/stores/compare';
+import { useUIStore } from '@/stores/ui';
 
 const session = useSessionStore();
 const compare = useCompareStore();
+const ui = useUIStore();
 
 onMounted(async () => {
+  // The path before `?run=` selects the initial view: `/compare[/]` opens
+  // Compare, `/analysis[/]` (and the bare `/`) opens Analysis. A deep-linked
+  // mode wins over the persisted `viewMode` so a shared link always lands where
+  // intended. In desktop/dev the pathname is `/`, leaving the stored mode as-is.
+  const pathname = window.location.pathname;
+  if (pathname.startsWith('/compare')) ui.viewMode = 'compare';
+  else if (pathname.startsWith('/analysis')) ui.viewMode = 'analysis';
+
   // In LAN web mode, learn the served outputs root so Compare can browse every
   // run under it (and so a deep-linked session's siblings show up).
   try {

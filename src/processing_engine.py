@@ -561,15 +561,19 @@ class ProcessingEngine:
         vs = cv2.VideoCapture(config["video_path"])
         frame_total = count_video_frames(vs)
 
-        outputs_root = os.path.abspath(config["output_path"])
+        # The provided output_path IS this run's folder — every artifact (and the
+        # RunInfo.json manifest below) is written flat into it. Point one run at one
+        # folder; Compare scans the parent root for sibling run folders.
+        self.output_directory = os.path.abspath(config["output_path"])
         self.video_basename = os.path.splitext(os.path.basename(config["video_path"]))[0]
 
         role = config.get("role") or "trainee"
         title = config.get("title") or self.video_basename
+        # run_id is a logical label stored in RunInfo.json (read back by Compare),
+        # no longer the folder name.
         run_id = make_run_id(role, title)
         self.run_id = run_id
         config["run_id"] = run_id
-        self.output_directory = os.path.join(outputs_root, run_id)
         os.makedirs(self.output_directory, exist_ok=True)
 
         save_run_info(

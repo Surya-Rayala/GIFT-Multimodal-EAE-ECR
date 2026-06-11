@@ -393,9 +393,9 @@ path** to the URL.
 #### Reading the URL
 
 ```
-http://<host-ip>:8000/?run=/path/to/output/trainee_Test_Video_20260521_165915
-└─┬─┘  └──┬───┘ └─┬┘ └┬┘└───────────────────────┬──────────────────────────┘
-scheme   host    port  query  the run folder's path ON THE HOST MACHINE
+http://<host-ip>:8000/analysis/?run=/path/to/output/run1
+└─┬─┘  └──┬───┘ └─┬┘ └───┬────┘└─┬─┘└────────┬─────────┘
+scheme   host    port   view    query   run folder path (on host)
 ```
 
 | Part | Meaning |
@@ -403,7 +403,8 @@ scheme   host    port  query  the run folder's path ON THE HOST MACHINE
 | `http://` | plain HTTP (no certificate) — intended for a trusted LAN |
 | `<host-ip>` | the **serving machine's** IP on the network (the `--serve` command prints it, e.g. `192.168.1.42`). From the host itself you can also use `127.0.0.1`. |
 | `:8000` | the `--port` the server is listening on |
-| `/?run=…` | which session to open. The value is the **absolute path to the run folder on the host**, exactly as it exists on the serving machine's disk — *not* a path on the viewer's own device. |
+| `view` | which view to open: nothing (just `/`) or `/analysis/` → **Analysis**; `/compare/` → **Compare** (lands with the reference dropdown ready). A deep-linked view wins over the last-used mode. |
+| `?run=…` | which session to open. The value is the **absolute path to the run folder on the host**, exactly as it exists on the serving machine's disk — *not* a path on the viewer's own device. |
 
 So the same link works from any device on the network; the path is always resolved
 on the host. You can also point `?run=` at the `..._Analysis.json` file inside a run
@@ -413,20 +414,21 @@ sessions at once.
 
 #### What people can and can't reach
 
-The folder you pass to `--outputs-root` when starting the server is the **only**
-place the server will read from:
+`--outputs-root` decides which **sessions** can be opened — not every file they reference:
 
-- A `?run=` path is accepted **only if it resolves inside `--outputs-root`**;
-  anything else (e.g. `?run=/etc/passwd` or another user's home folder) is refused
-  with `403 Forbidden`. The same limit applies to every data request the page makes
-  (session JSON, videos, images, transcription, drill-window, and **Compare**).
-- **Compare** can therefore reach *any* run **under that root** — that's how it lists
-  sibling runs and expert references — but nothing above or outside it.
-- The restriction is by real path, so symlinks pointing outside the root don't escape it.
-- There is **no login or password** — anyone who can reach `http://<host-ip>:8000`
-  can view everything under the root. Host it only on a trusted network, and point
-  `--outputs-root` at just the folder you intend to share (e.g. one project's
-  `output/`, not your whole home directory).
+- A `?run=` path is accepted **only if it resolves inside `--outputs-root`** (by real
+  path, so symlinks can't escape); anything else — `?run=/etc/passwd`, another user's
+  home folder — is refused with `403 Forbidden`. **Compare** likewise only lists and
+  reads sibling runs **under the root**.
+- The files a loaded session **points to** — its videos and images, including the
+  **original source video** in your input folder — are then served from *wherever they
+  live on the host*, even outside the root. Only files an opened session actually
+  references are served, so the server still can't be coaxed into reading an unrelated
+  arbitrary path.
+- There is **no login or password** — anyone who can reach `http://<host-ip>:8000` can
+  view every session under the root (and the files those sessions reference). Host it
+  only on a trusted network, and point `--outputs-root` at just the folder you mean to
+  share (e.g. one project's `output/`, not your whole home directory).
 
 #### Finding the host IP and connecting
 
@@ -724,7 +726,7 @@ python run_engine_local.py <path/to/session.vmeta.xml> [options]
   - Enable detailed logging (DEBUG). Without this flag, logging is limited to errors.
 
 - `-o`, `--output_path` (str, default: `output/`)
-  - Directory where outputs should be written.
+  - This run's output folder — all artifacts (incl. `RunInfo.json`) are written flat into it. Give each run its own folder (e.g. `output/run1/`) so they sit as siblings under one parent for Compare.
 
 #### Notes
 
@@ -741,6 +743,6 @@ python run_engine_local.py input/test.vmeta.xml
 # Verbose logs
 python run_engine_local.py input/test.vmeta.xml --verbose
 
-# Force transcode and write outputs to a custom directory
-python run_engine_local.py input/test.vmeta.xml --force_transcode --output_path ./my_outputs/
+# Force transcode and write this run's outputs into its own folder
+python run_engine_local.py input/test.vmeta.xml --force_transcode --output_path ./output/run1/
 ```

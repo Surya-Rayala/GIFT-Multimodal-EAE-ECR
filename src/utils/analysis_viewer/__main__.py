@@ -77,8 +77,10 @@ def _serve(host: str, port: int, outputs_root: Path, rebuild: bool) -> None:
     print(f"    this machine:  http://127.0.0.1:{port}")
     if host == "0.0.0.0":
         print(f"    other devices: http://{lan}:{port}")
-    print(f"    open a session by appending its folder path, e.g.:")
-    print(f"        http://{lan if host == '0.0.0.0' else host}:{port}/?run=<run_folder_under_outputs_root>")
+    host_str = lan if host == "0.0.0.0" else host
+    print(f"    open a session by appending its folder path; the path picks the view:")
+    print(f"        http://{host_str}:{port}/analysis/?run=<run_folder_under_outputs_root>   # Analysis view")
+    print(f"        http://{host_str}:{port}/compare/?run=<run_folder_under_outputs_root>    # Compare view")
     print(f"    (only folders under the outputs root above can be opened)\n")
 
     cmd = [
