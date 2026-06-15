@@ -21,9 +21,77 @@ import subprocess
 from typing import Optional
 
 from .audio import _find_binary
+from .torch_memory import free_torch_memory
 
 
 VALID_MODELS = ("dns48", "dns64", "master64")
+
+# Chunked-inference geometry (seconds at the model's 16 kHz rate). Demucs
+# activation memory scales linearly with input length (resample=4 internal
+# upsampling), so long clips are processed in fixed windows of at most
+# CHUNK + LEFT + RIGHT seconds — constant memory regardless of clip length.
+# Clips up to one window take the identical single-forward path (bit-exact).
+#
+# Chunked output is *not* bit-equal to a full-clip forward: the models are
+# causal and their bottleneck LSTM carries clip-long state (effectively a
+# running noise estimate), so a window-local pass is an equally valid but
+# slightly different denoise. Measured on real field audio (110 s, dns48):
+# 10 s left context + 60 s chunks reconstruct the full-pass output at ~40 dB
+# SNR (p99.9 |diff| ~0.4% of full scale), before the dry/wet blend further
+# dilutes the residual. 0.25 s right context covers the resampling filters.
+_CHUNK_SEC = 60.0
+_CTX_LEFT_SEC = 10.0
+_CTX_RIGHT_SEC = 0.25
+
+
+def _denoise_forward(model, noisy):
+    """Run ``model`` over ``noisy`` (B, C, T) with bounded activation memory.
+
+    Returns a tensor the same length as ``noisy`` so the caller's dry/wet
+    blend lines up sample-for-sample.
+
+    Demucs's ``normalize=True`` scales the input by the std of the *whole*
+    clip; per-chunk normalization would scale each chunk differently on
+    non-stationary audio and audibly change the output. So the chunked path
+    applies the global scaling once, runs the chunks with the model's
+    internal normalization disabled, and rescales at the end. The remaining
+    full-pass mismatch is the bottleneck LSTM's clip-long state (see module
+    constants above for the measured ~40 dB parity).
+    """
+    import torch  # local import — module stays importable without torch
+
+    sr = int(model.sample_rate)
+    chunk = int(_CHUNK_SEC * sr)
+    lctx = int(_CTX_LEFT_SEC * sr)
+    rctx = int(_CTX_RIGHT_SEC * sr)
+    total = noisy.shape[-1]
+
+    if total <= chunk + lctx + rctx:
+        with torch.no_grad():
+            return model(noisy)
+
+    saved_normalize = model.normalize
+    if saved_normalize:
+        mono = noisy.mean(dim=1, keepdim=True)
+        std = mono.std(dim=-1, keepdim=True)
+        noisy = noisy / (model.floor + std)
+        model.normalize = False
+    else:
+        std = 1.0
+
+    try:
+        cores = []
+        for start in range(0, total, chunk):
+            end = min(start + chunk, total)
+            a = max(0, start - lctx)
+            b = min(total, end + rctx)
+            with torch.no_grad():
+                est = model(noisy[..., a:b])
+            cores.append(est[..., start - a : start - a + (end - start)])
+            del est
+        return std * torch.cat(cores, dim=-1)
+    finally:
+        model.normalize = saved_normalize
 
 
 def _extract_audio_16k_mono(source_video: str, output_wav: str) -> bool:
@@ -145,6 +213,7 @@ def denoise_audio_to_wav(
         logging.warning("denoise: failed to extract 16 kHz mono audio from %s", source_video_path)
         return False
 
+    model = wav = noisy = estimate = None
     try:
         try:
             # soundfile returns (samples, channels) for stereo or (samples,)
@@ -164,8 +233,7 @@ def denoise_audio_to_wav(
         try:
             noisy = convert_audio(wav.unsqueeze(0), sr, model.sample_rate, model.chin)
             noisy = noisy.to(device)
-            with torch.no_grad():
-                estimate = model(noisy)
+            estimate = _denoise_forward(model, noisy)
             estimate = (1.0 - dry) * estimate + dry * noisy
             out = estimate.squeeze(0).cpu().numpy()  # (channels, samples)
         except Exception:
@@ -182,3 +250,7 @@ def denoise_audio_to_wav(
         return os.path.exists(output_wav_path) and os.path.getsize(output_wav_path) > 0
     finally:
         _safe_remove(tmp_wav)
+        # Drop the model + waveform tensors and return their allocator blocks
+        # before WhisperX loads — the denoiser shouldn't linger alongside ASR.
+        model = wav = noisy = estimate = None
+        free_torch_memory(device)

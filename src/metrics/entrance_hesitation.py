@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from .metric import AbstractMetric
 from ._shared import load_inroom_ids, pick_latest, select_entry_tracks, team_size
 from .utils import arg_first_non_null
+from ..utils.run_metadata import resolve_fps_from_metadata
 
 
 class EntranceHesitation_Metric(AbstractMetric):
@@ -56,7 +57,13 @@ class EntranceHesitation_Metric(AbstractMetric):
         os.makedirs(session_folder, exist_ok=True)
         img_path = os.path.join(session_folder, "ENTRANCE_HESITATION_Comparison.png")
         txt_path = os.path.join(session_folder, "ENTRANCE_HESITATION_Comparison.txt")
-        frame_rate = float(self.config.get("frame_rate", 30.0) or 30.0)
+        # Each run may have been recorded at a different fps; read each side's
+        # own value from its RunMetadata sidecar so the gap-seconds (and the
+        # timeline graphic) use the right conversion per side. Falls back to
+        # the config fps when a sidecar is missing.
+        config_fps = float(self.config.get("frame_rate", 30.0) or 30.0)
+        trainee_fps = resolve_fps_from_metadata(session_folder, fallback=config_fps) or config_fps
+        reference_fps = resolve_fps_from_metadata(expert_folder, fallback=config_fps) or config_fps
 
         _pick_latest = pick_latest
         _load_inroom_ids = load_inroom_ids
@@ -156,14 +163,14 @@ class EntranceHesitation_Metric(AbstractMetric):
 
         max_entries = max(len(frame_starts_expert), len(frame_starts_trainee))
 
-        def _gap_seconds(frames: List[int], entry_idx: int) -> Optional[float]:
+        def _gap_seconds(frames: List[int], entry_idx: int, fps: float) -> Optional[float]:
             if entry_idx <= 1 or entry_idx > len(frames):
                 return None
             a = frames[entry_idx - 2]
             b = frames[entry_idx - 1]
             if a is None or b is None:
                 return None
-            return (int(b) - int(a)) / frame_rate
+            return (int(b) - int(a)) / fps
 
         def _gap_score(gap_sec: Optional[float], gap_number: int) -> Optional[float]:
             if gap_sec is None:
@@ -184,8 +191,8 @@ class EntranceHesitation_Metric(AbstractMetric):
             expert_id = expert_ids_ordered[entry - 1] if entry <= len(expert_ids_ordered) else None
             trainee_id = trainee_ids_ordered[entry - 1] if entry <= len(trainee_ids_ordered) else None
 
-            expert_gap = _gap_seconds(frame_starts_expert, entry)
-            trainee_gap = _gap_seconds(frame_starts_trainee, entry)
+            expert_gap = _gap_seconds(frame_starts_expert, entry, reference_fps)
+            trainee_gap = _gap_seconds(frame_starts_trainee, entry, trainee_fps)
 
             gap_number = max(0, entry - 1)
             expert_score = _gap_score(expert_gap, gap_number) if gap_number > 0 else None
@@ -299,7 +306,8 @@ class EntranceHesitation_Metric(AbstractMetric):
             session_folder,
             frame_starts_expert,
             frame_starts_trainee,
-            frame_rate,
+            reference_fps,
+            trainee_fps,
         )
 
         text = score_part + " " + time_part + "\n" + details_csv
@@ -317,22 +325,26 @@ class EntranceHesitation_Metric(AbstractMetric):
         }
 
     @staticmethod
-    def __generateExpertCompareGraphic(output_folder, frame_start_expert, frame_start_trainee, frame_rate: float):
+    def __generateExpertCompareGraphic(
+        output_folder, frame_start_expert, frame_start_trainee,
+        frame_rate_expert: float, frame_rate_trainee: float,
+    ):
         frame_start_expert = list(frame_start_expert) if frame_start_expert is not None else []
         frame_start_trainee = list(frame_start_trainee) if frame_start_trainee is not None else []
         if not frame_start_expert and not frame_start_trainee:
             return
 
-        frame_rate = float(frame_rate or 30.0)
+        frame_rate_expert = float(frame_rate_expert or 30.0)
+        frame_rate_trainee = float(frame_rate_trainee or 30.0)
 
-        def _to_relative_seconds(frames: List[float]) -> List[float]:
+        def _to_relative_seconds(frames: List[float], fps: float) -> List[float]:
             if not frames:
                 return []
             base = float(min(frames))
-            return [(float(f) - base) / frame_rate for f in frames]
+            return [(float(f) - base) / fps for f in frames]
 
-        x_expert = _to_relative_seconds(frame_start_expert)
-        x_trainee = _to_relative_seconds(frame_start_trainee)
+        x_expert = _to_relative_seconds(frame_start_expert, frame_rate_expert)
+        x_trainee = _to_relative_seconds(frame_start_trainee, frame_rate_trainee)
 
         max_val = max(
             max(x_expert) if x_expert else 0.0,

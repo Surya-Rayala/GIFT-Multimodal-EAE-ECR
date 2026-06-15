@@ -19,6 +19,7 @@ from ._shared import (
     select_entry_tracks,
     team_size,
 )
+from ..utils.run_metadata import resolve_fps_from_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +284,12 @@ class EntranceVectors_Metric(AbstractMetric):
                 "Text": err_text,
             }
 
-        frame_rate = float(self.config.get("frame_rate", 30.0) or 30.0)
+        # Read each run's own recorded fps so the entry-velocity fit window
+        # (window_sec × fps frames) is correct per side when the two runs were
+        # recorded at different frame rates. Falls back to config fps.
+        config_fps = float(self.config.get("frame_rate", 30.0) or 30.0)
+        trainee_fps = resolve_fps_from_metadata(session_folder, fallback=config_fps) or config_fps
+        reference_fps = resolve_fps_from_metadata(expert_folder, fallback=config_fps) or config_fps
         window_sec = ENTRY_VECTOR_WINDOW_SEC
 
         try:
@@ -327,11 +333,11 @@ class EntranceVectors_Metric(AbstractMetric):
             }
 
         expert_infos = [
-            _per_track_info(t, frame_rate=frame_rate, window_sec=window_sec)
+            _per_track_info(t, frame_rate=reference_fps, window_sec=window_sec)
             for t in expert_tracks
         ]
         trainee_infos = [
-            _per_track_info(t, frame_rate=frame_rate, window_sec=window_sec)
+            _per_track_info(t, frame_rate=trainee_fps, window_sec=window_sec)
             for t in trainee_tracks
         ]
 

@@ -7,10 +7,13 @@ Order of EP fallback (whichever is available + matches the requested device):
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import List, Tuple
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from libs.giftpose.codecs.simcc import decode_simcc
 from libs.giftpose.meta import FLIP_INDICES
@@ -96,6 +99,13 @@ class ONNXBackend(Backend):
             )
         self.det_sess = ort.InferenceSession(det_onnx, sess_options=sess_opts, providers=eps)
         self.pose_sess = ort.InferenceSession(pose_onnx, sess_options=sess_opts, providers=eps)
+        # ORT silently drops unavailable EPs at session creation (e.g. CUDA EP
+        # listed but its libs fail to load) — log what actually got used.
+        logger.info(
+            "ONNX EPs — det: %s, pose: %s",
+            self.det_sess.get_providers()[0],
+            self.pose_sess.get_providers()[0],
+        )
 
     def predict_detector(self, frame_bgr: np.ndarray) -> Detection:
         h, w = frame_bgr.shape[:2]

@@ -721,15 +721,23 @@ class MoveAlongWall_Metric(AbstractMetric):
         trainee_fps = resolve_fps_from_metadata(session_folder, fallback=fps) or fps
         reference_fps = resolve_fps_from_metadata(expert_folder, fallback=fps) or fps
 
+        # Match the live engine's window: it scores this metric over
+        # [frame 1 .. drill_end]. Each run's drill end lives in its own
+        # DrillWindow.json sidecar.
+        reference_drill_end = _load_drill_end(expert_folder)
+        trainee_drill_end = _load_drill_end(session_folder)
+
         expert_infos = self._prep_infos(
             expert_tracks, expert_capture, expert_entry,
             keypoint_details=expert_kp, bbox_details=expert_bbox,
             pixel_mapper=pixel_mapper, fps=reference_fps,
+            drill_end=reference_drill_end,
         )
         trainee_infos = self._prep_infos(
             trainee_tracks, trainee_capture, trainee_entry,
             keypoint_details=trainee_kp, bbox_details=trainee_bbox,
             pixel_mapper=pixel_mapper, fps=trainee_fps,
+            drill_end=trainee_drill_end,
         )
 
         # Pull the wall-violation flag windows + per-track total durations
@@ -746,6 +754,7 @@ class MoveAlongWall_Metric(AbstractMetric):
             outside_seconds_by_track=reference_seconds,
             out_name="STAY_ALONG_WALL_Reference.png",
             title="Reference",
+            fps=reference_fps,
         )
         self.__generateExpertCompareGraphic(
             output_folder=session_folder,
@@ -755,6 +764,7 @@ class MoveAlongWall_Metric(AbstractMetric):
             outside_seconds_by_track=trainee_seconds,
             out_name="STAY_ALONG_WALL_Trainee.png",
             title="Trainee",
+            fps=trainee_fps,
         )
 
         text, saved_text = _format_comparison_report(expert_infos, trainee_infos)
@@ -796,8 +806,16 @@ class MoveAlongWall_Metric(AbstractMetric):
         bbox_details: Optional[Dict[Tuple[int, int], Any]],
         pixel_mapper,
         fps: float,
+        drill_end: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Compute per-entrant L, score, excursions for offline comparison."""
+        """Compute per-entrant L, score, excursions for offline comparison.
+
+        ``drill_end`` clamps each entrant's scoring window the same way the
+        live engine does (it runs this metric with ``drill_start=1`` but caps
+        the end at the detected drill end). Passing it keeps the recomputed
+        per-entrant scores / time totals identical to the run's saved score;
+        omitting it would count post-drill wandering the live run excluded.
+        """
         # Match the live ``process()`` rule: keep only the first
         # ``num_tracks`` entrants by entry order. Anyone beyond that (e.g.
         # a 5th tracked person when team_size is 4) is excluded from the
@@ -824,6 +842,8 @@ class MoveAlongWall_Metric(AbstractMetric):
             entry_frame = first + 1
             last_seen = last + 1
             end_frame = min(int(capture_map.get(tid, last_seen)), last_seen)
+            if drill_end is not None:
+                end_frame = min(end_frame, int(drill_end))
             end_frame = max(entry_frame, end_frame)
             windows[tid] = (entry_frame, end_frame)
 
@@ -921,6 +941,7 @@ class MoveAlongWall_Metric(AbstractMetric):
         outside_seconds_by_track: Dict[int, float],
         out_name: str,
         title: str,
+        fps: float = 30.0,
     ) -> None:
         os.makedirs(output_folder, exist_ok=True)
         img = map_view.copy()
@@ -1016,35 +1037,49 @@ class MoveAlongWall_Metric(AbstractMetric):
         gap = 10
         line_h = 24
 
-        # Per-entrant violation TIME shown in the legend — summed straight
-        # from the wall flags the live engine saved in Analysis.json (via
-        # ``outside_seconds_by_track``). No reclassification here: if a
-        # track has flags A (4.2s) + B (1.1s) the legend shows 5.3s outside.
-        # An entrant with no flags shows 0.0s (e.g. only sub-MIN_EXCURSION
-        # blips, which the engine didn't surface as flags so the legend
-        # stays in step with the timeline).
-        items: List[Tuple[int, int, float]] = []  # (entry_number, track_id, outside_sec)
+        # Per-entrant off-wall RATIO shown in the legend: the flagged
+        # wall-excursion time (summed straight from the wall flags the live
+        # engine saved in Analysis.json, via ``outside_seconds_by_track``)
+        # divided by the entrant's total evaluated window — (end_frame -
+        # entry_frame + 1) / fps, the same window the metric scored over.
+        # Expressed as a percentage so it's comparable across entrants with
+        # different window lengths. An entrant with no flags shows 0%
+        # (sub-MIN_EXCURSION blips aren't surfaced as flags, so the legend
+        # stays in step with the timeline / highlighter).
+        NOTE_SIZE = 12
+        note_lines = [
+            "% off-wall = flagged off-wall time",
+            "÷ time evaluated for that entrant",
+        ]
+
+        items: List[Tuple[int, int, float]] = []  # (entry_number, track_id, off_wall_pct)
         for info in infos:
             entry_number = info.get("entry_number")
             track_id = info.get("track_id")
             if entry_number is None or track_id is None:
                 continue
             sec = float(outside_seconds_by_track.get(int(track_id), 0.0))
-            items.append((int(entry_number), int(track_id), sec))
+            window_frames = int(info.get("end_frame", 0)) - int(info.get("entry_frame", 0)) + 1
+            considered_sec = (window_frames / fps) if (fps > 0 and window_frames > 0) else 0.0
+            pct = 100.0 * min(1.0, max(0.0, sec / considered_sec)) if considered_sec > 0 else 0.0
+            items.append((int(entry_number), int(track_id), pct))
         items.sort(key=lambda x: x[0])
 
-        def _entrant_label(entry: int, sec: float) -> str:
-            return f"Entrant #{entry} · {sec:.1f}s outside"
+        def _entrant_label(entry: int, pct: float) -> str:
+            return f"Entrant #{entry} · {pct:.0f}% off-wall"
 
         # Width = widest TrueType-rendered string (title in title size,
-        # everything else in body size).
+        # per-entrant + highlight rows in body size, note in note size).
         max_w = text_size(title, size_px=TITLE_SIZE)[0]
         for s in ["Highlighter = flagged wall excursion"] + [
-            _entrant_label(entry, sec) for entry, _, sec in items
+            _entrant_label(entry, pct) for entry, _, pct in items
         ]:
             max_w = max(max_w, text_size(s, size_px=BODY_SIZE)[0])
+        for s in note_lines:
+            max_w = max(max_w, text_size(s, size_px=NOTE_SIZE)[0])
 
-        n_lines = 2 + len(items)  # title + highlight + per-entrant rows
+        # title + highlight + per-entrant rows + a small gap + note lines
+        n_lines = 2 + len(items) + len(note_lines)
         panel_w = pad * 2 + sw + gap + max_w
         panel_h = pad * 2 + line_h * max(1, n_lines)
 
@@ -1087,18 +1122,30 @@ class MoveAlongWall_Metric(AbstractMetric):
         )
         y += line_h
 
-        for entry_number, track_id, outside_sec in items:
+        for entry_number, track_id, off_wall_pct in items:
             color = _color_for_id(track_id)
             cv2.rectangle(img, (x0 + pad, y + 4), (x0 + pad + sw, y + 4 + sw), color, -1)
             cv2.rectangle(img, (x0 + pad, y + 4), (x0 + pad + sw, y + 4 + sw), (255, 255, 255), 1)
             draw_text(
                 img,
-                _entrant_label(entry_number, outside_sec),
+                _entrant_label(entry_number, off_wall_pct),
                 (x0 + pad + sw + gap, y),
                 size_px=BODY_SIZE,
                 fill_bgr=(255, 255, 255),
             )
             y += line_h
+
+        # Explanatory note at the bottom of the legend (dimmer + smaller so it
+        # reads as a caption, not another entrant row).
+        for note in note_lines:
+            draw_text(
+                img,
+                note,
+                (x0 + pad, y),
+                size_px=NOTE_SIZE,
+                fill_bgr=(180, 180, 180),
+            )
+            y += int(round(NOTE_SIZE * 1.5))
 
         cv2.imwrite(os.path.join(output_folder, out_name), img)
 
@@ -1303,6 +1350,26 @@ def _track_id_from_flag(flag: Dict[str, Any]) -> Optional[int]:
         except (TypeError, ValueError):
             return None
     return None
+
+
+def _load_drill_end(folder: str) -> Optional[int]:
+    """Read ``end_frame`` from a run's ``*_DrillWindow.json`` sidecar.
+
+    Returns None when the sidecar is missing/unreadable so the caller falls
+    back to the full track length (matching pre-drill-window runs).
+    """
+    import json
+
+    path = pick_latest(folder, "*_DrillWindow.json")
+    if path is None:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        end = data.get("end_frame") if isinstance(data, dict) else None
+        return int(end) if end is not None else None
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
 
 
 def _load_wall_flags(folder: str) -> Tuple[Dict[int, List[Tuple[int, int]]], Dict[int, float]]:

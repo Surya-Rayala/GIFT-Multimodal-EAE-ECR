@@ -158,7 +158,10 @@ def compute_drill_window(
         )
 
     drill_start_frame = max(1, int(drill_start_frame))
-    drill_start_sec = drill_start_frame / fps if fps > 0 else 0.0
+    # Time convention: starts use (frame-1)/fps — 1-indexed frame N begins at
+    # (N-1)/fps — matching the metrics and the deferred-transcription audio
+    # slice offset; ends keep frame/fps (end of frame).
+    drill_start_sec = (drill_start_frame - 1) / fps if fps > 0 else 0.0
 
     # ---- Pull the transcription -------------------------------------------
     transcription = _load_transcription(transcription_path) if transcription_path else None

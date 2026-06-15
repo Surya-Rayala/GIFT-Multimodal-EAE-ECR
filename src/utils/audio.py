@@ -11,12 +11,22 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import threading
 from typing import Optional
 
 
 def _find_binary(name: str) -> Optional[str]:
-    return shutil.which(name)
+    found = shutil.which(name)
+    if found:
+        return found
+    # When invoked via the env's python without activating the env (PATH has
+    # no env bin), look next to the interpreter — conda/venv installs place
+    # ffmpeg/ffprobe there. Otherwise audio mux/extraction silently degrades.
+    candidate = os.path.join(os.path.dirname(sys.executable), name)
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    return None
 
 
 def has_audio_stream(video_path: str) -> bool:

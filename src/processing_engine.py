@@ -24,17 +24,17 @@ from tqdm import tqdm
 from libs.Track import OCSORT
 from libs.Track.processing.utils import load_entry_polygons, load_pixel_mapper
 from src.helper_functions import (
-    annotate_camera_tracking_with_clearance,
-    annotate_camera_video,
-    annotate_camera_with_gaze_triangle,
-    annotate_clearance_video,
+    annotate_camera_videos_combined,
     annotate_map_pod_video,
     annotate_map_pod_with_paths_video,
     annotate_map_video,
     annotate_map_with_gaze,
+    camera_tracking_overlay_spec,
+    clearance_overlay_spec,
     compute_gaze_vector,
     compute_room_coverage,
     compute_threat_clearance,
+    gaze_triangle_overlay_spec,
     initialize_keypoint_indices,
     run_pod_analysis,
     save_gaze_cache,
@@ -42,6 +42,7 @@ from src.helper_functions import (
     save_position_cache,
     save_room_coverage_cache,
     save_threat_clearance_cache,
+    tracking_with_clearance_overlay_spec,
 )
 
 from .metrics import *
@@ -59,6 +60,7 @@ from .utils.drill_window import (
     find_drill_start_frame,
     save_drill_window_sidecar,
 )
+from .utils.torch_memory import free_torch_memory
 from .utils.transcode import transcode
 from .utils.transcription import transcribe_video
 from .utils.video import count_video_frames, get_video_framerate
@@ -404,6 +406,18 @@ class ProcessingEngine:
         self.device = self.config.get("device", "cpu")
         self.map_img = self.config.get("Map Image", None)
         self.keypoint_indices = self.config.get("keypoint_indices", None)
+
+    def _release_inferencer(self) -> None:
+        """Drop the detection/pose backend once the frame loop is done.
+
+        The backend (detector + pose weights, runtime sessions/engines) is
+        only used inside the per-frame loop; releasing it before
+        transcription / annotation / metrics returns its RAM (and GPU cache)
+        to the rest of the run. ``_initialize_components`` recreates it for
+        the next vmeta.
+        """
+        self.inferencer = None
+        free_torch_memory(getattr(self, "device", None))
 
     def mt_initialize(self, messages, vmeta_paths, output_path):
         logging.debug(f"Received initialization message with {len(vmeta_paths)} vmeta files.")
@@ -769,8 +783,11 @@ class ProcessingEngine:
                     map_velocity = map_velocity.tolist() if map_velocity.size >= 2 else None
 
                 if kps is not None:
-                    keypoints = kps[:, :2].tolist()
-                    keypoint_scores = kps[:, 2].tolist()
+                    # 0.01 px / 1e-3 score quantization — keeps the serialized
+                    # TrackerOutput.json floats short (5-8x smaller file);
+                    # downstream consumers only do distance/threshold math.
+                    keypoints = np.round(kps[:, :2].astype(float), 2).tolist()
+                    keypoint_scores = np.round(kps[:, 2].astype(float), 3).tolist()
                 else:
                     keypoints, keypoint_scores = [], []
 
@@ -837,6 +854,9 @@ class ProcessingEngine:
             for idx, mx, my in map_points:
                 all_map_points.append([frame_num, idx, mx, my])
 
+        vs.release()
+        self._release_inferencer()
+
         inroom_ids = self._resolve_inroom_ids(tracker_output, config)
         entry_ids = self._resolve_entry_ids(tracker_output)
         logging.debug(f"Resolved entry IDs from tracker metadata: {entry_ids}")
@@ -858,7 +878,12 @@ class ProcessingEngine:
         if drill_window_enabled:
             drill_start_frame_detected = find_drill_start_frame(tracker_output)
             if drill_start_frame_detected is not None and enable_transcription:
-                drill_start_sec = float(drill_start_frame_detected) / fps if fps > 0 else 0.0
+                # Time convention: starts use (frame-1)/fps — frame N begins
+                # at (N-1)/fps for 1-indexed frames — matching the metrics'
+                # frame→seconds math; ends use frame/fps (end of frame).
+                drill_start_sec = (
+                    (float(drill_start_frame_detected) - 1.0) / fps if fps > 0 else 0.0
+                )
                 logging.info(
                     "Running deferred transcription on audio slice from %.3fs (frame %d) onward.",
                     drill_start_sec, drill_start_frame_detected,
@@ -933,36 +958,96 @@ class ProcessingEngine:
                 audio_end_sec=drill_end_sec,
             )
 
-        if "annotate_camera_video" in self.enabled_visualizations:
-            annotate_camera_video(
-                tracker_output=tracker_output,
-                frame_rate=config["frame_rate"],
-                output_directory=self.output_directory,
-                video_basename=self.video_basename,
-                inroom_ids=inroom_ids,
-                gaze_conf_threshold=self.pose_conf_threshold,
-                video_path=config["video_path"],
-                start_frame=drill_start_frame,
-                end_frame=drill_end_frame,
-            )
-            _attach_audio("annotate_camera_video")
+        # ------------------------------------------------------------------
+        # Camera-view overlays — all enabled overlays are drawn in ONE decode
+        # pass over the source video (decode dominates annotation cost).
+        # ``keypoint_details``/``bbox_details`` and the threat-clearance map
+        # are computed up front: clearance overlays need the map at draw
+        # time, and the metric context reuses all three later.
+        # ------------------------------------------------------------------
+        bbox_details = {}
+        keypoint_details = {}
+        for entry in tracker_output:
+            frame_idx = entry["frame"]
+            for obj in entry["objects"]:
+                tid = obj["id"]
+                bbox_details[(frame_idx, tid)] = tuple(obj["bbox"])
+                keypoint_details[(frame_idx, tid)] = (obj["keypoints"], obj["keypoint_scores"])
 
-        if "annotate_camera_with_gaze_triangle" in self.enabled_visualizations:
-            annotate_camera_with_gaze_triangle(
-                tracker_output=tracker_output,
-                gaze_info=gaze_info,
-                frame_rate=config["frame_rate"],
-                output_directory=self.output_directory,
-                video_basename=self.video_basename,
+        clearance_map = None
+        if needs_threat_clearance:
+            clearance_map = compute_threat_clearance(
+                tracker_output,
+                keypoint_details,
+                gaze_info,
                 inroom_ids=inroom_ids,
-                half_angle_deg=half_visual_angle_deg,
-                alpha=0.2,
-                show_inroom_gaze=False,
+                visual_angle_deg=visual_angle_deg,
+                intersection_frames=threat_interaction_frames,
+                wrist_frames=max(1, int(threat_interaction_frames * 0.1)),
+                gaze_frames=max(1, int(threat_interaction_frames * 0.5)),
+                start_frame=drill_start_frame,
+                end_frame=drill_end_frame,
+            )
+
+        camera_overlay_specs = []
+        camera_overlay_keys = []
+        if "annotate_camera_video" in self.enabled_visualizations:
+            camera_overlay_specs.append(
+                camera_tracking_overlay_spec(
+                    self.output_directory,
+                    self.video_basename,
+                    inroom_ids,
+                    gaze_conf_threshold=self.pose_conf_threshold,
+                )
+            )
+            camera_overlay_keys.append("annotate_camera_video")
+        if "annotate_camera_with_gaze_triangle" in self.enabled_visualizations:
+            camera_overlay_specs.append(
+                gaze_triangle_overlay_spec(
+                    gaze_info,
+                    self.output_directory,
+                    self.video_basename,
+                    inroom_ids,
+                    half_angle_deg=half_visual_angle_deg,
+                    alpha=0.2,
+                    show_inroom_gaze=False,
+                )
+            )
+            camera_overlay_keys.append("annotate_camera_with_gaze_triangle")
+        if clearance_map is not None and "annotate_clearance_video" in self.enabled_visualizations:
+            camera_overlay_specs.append(
+                clearance_overlay_spec(
+                    clearance_map,
+                    self.output_directory,
+                    self.video_basename,
+                    inroom_ids,
+                )
+            )
+            camera_overlay_keys.append("annotate_clearance_video")
+        if clearance_map is not None and "annotate_camera_tracking_with_clearance" in self.enabled_visualizations:
+            camera_overlay_specs.append(
+                tracking_with_clearance_overlay_spec(
+                    clearance_map,
+                    self.output_directory,
+                    self.video_basename,
+                    inroom_ids,
+                    gaze_conf_threshold=self.pose_conf_threshold,
+                    show_clearing_id=True,
+                )
+            )
+            camera_overlay_keys.append("annotate_camera_tracking_with_clearance")
+
+        if camera_overlay_specs:
+            annotate_camera_videos_combined(
+                tracker_output,
+                config["frame_rate"],
+                camera_overlay_specs,
                 video_path=config["video_path"],
                 start_frame=drill_start_frame,
                 end_frame=drill_end_frame,
             )
-            _attach_audio("annotate_camera_with_gaze_triangle")
+            for viz_key in camera_overlay_keys:
+                _attach_audio(viz_key)
 
         if "annotate_map_video" in self.enabled_visualizations:
             annotate_map_video(
@@ -1015,7 +1100,10 @@ class ProcessingEngine:
 
         tracker_json_path = os.path.join(self.output_directory, f"{self.video_basename}_TrackerOutput.json")
         with open(tracker_json_path, "w") as f:
-            json.dump(tracker_output, f, indent=4)
+            # Compact separators: this is the largest sidecar (per-frame,
+            # per-person keypoints) and machine-read only — indenting it
+            # multiplies file size and write time for no reader.
+            json.dump(tracker_output, f, separators=(",", ":"))
         logging.debug(f"Saved TrackerOutput to: {tracker_json_path}")
         logging.debug(
             f"Saved PositionCache to: {os.path.join(self.output_directory, f'{self.video_basename}_PositionCache.txt')}"
@@ -1105,15 +1193,6 @@ class ProcessingEngine:
                     end_frame=drill_end_frame,
                 )
 
-        bbox_details = {}
-        keypoint_details = {}
-        for entry in tracker_output:
-            frame_idx = entry["frame"]
-            for obj in entry["objects"]:
-                tid = obj["id"]
-                bbox_details[(frame_idx, tid)] = tuple(obj["bbox"])
-                keypoint_details[(frame_idx, tid)] = (obj["keypoints"], obj["keypoint_scores"])
-
         context = MetricContext(
             tracker_output=tracker_output,
             all_frames=all_frames,
@@ -1133,50 +1212,9 @@ class ProcessingEngine:
             pixel_mapper=self.mapper,
         )
 
-        if needs_threat_clearance:
-            clearance_map = compute_threat_clearance(
-                tracker_output,
-                keypoint_details,
-                gaze_info,
-                inroom_ids=inroom_ids,
-                visual_angle_deg=visual_angle_deg,
-                intersection_frames=threat_interaction_frames,
-                wrist_frames=max(1, int(threat_interaction_frames * 0.1)),
-                gaze_frames=max(1, int(threat_interaction_frames * 0.5)),
-                start_frame=drill_start_frame,
-                end_frame=drill_end_frame,
-            )
-
-            if "annotate_clearance_video" in self.enabled_visualizations:
-                annotate_clearance_video(
-                    tracker_output=tracker_output,
-                    clearance_map=clearance_map,
-                    frame_rate=config["frame_rate"],
-                    output_directory=self.output_directory,
-                    video_basename=self.video_basename,
-                    inroom_ids=inroom_ids,
-                    video_path=config["video_path"],
-                    start_frame=drill_start_frame,
-                    end_frame=drill_end_frame,
-                )
-                _attach_audio("annotate_clearance_video")
-
-            if "annotate_camera_tracking_with_clearance" in self.enabled_visualizations:
-                annotate_camera_tracking_with_clearance(
-                    tracker_output=tracker_output,
-                    clearance_map=clearance_map,
-                    frame_rate=config["frame_rate"],
-                    output_directory=self.output_directory,
-                    video_basename=self.video_basename,
-                    inroom_ids=inroom_ids,
-                    gaze_conf_threshold=self.pose_conf_threshold,
-                    show_clearing_id=True,
-                    video_path=config["video_path"],
-                    start_frame=drill_start_frame,
-                    end_frame=drill_end_frame,
-                )
-                _attach_audio("annotate_camera_tracking_with_clearance")
-
+        # Clearance map + overlays were produced in the combined camera pass
+        # above; here we only persist the cache and expose it to metrics.
+        if clearance_map is not None:
             save_threat_clearance_cache(clearance_map, self.output_directory, self.video_basename)
             context.threat_clearance = clearance_map
 

@@ -24,11 +24,29 @@ that a failed transcription never breaks the pipeline.
 import json
 import logging
 import os
+import shutil
+import sys
 from typing import Any, Dict, Optional
 
 from .audio import extract_audio_to_wav, has_audio_stream
 from .certs import install_certifi_https
 from .denoise import denoise_audio_to_wav
+from .torch_memory import free_torch_memory
+
+
+def _ensure_ffmpeg_on_path() -> None:
+    """``whisperx.load_audio`` shells out to a bare ``ffmpeg``.
+
+    When the engine is invoked via the env's python without activating the
+    env, the env bin (where conda installs ffmpeg) isn't on PATH and whisperx
+    raises FileNotFoundError. Prepend the interpreter's directory so the
+    subprocess resolves — mirrors ``audio._find_binary``'s fallback.
+    """
+    if shutil.which("ffmpeg"):
+        return
+    exe_dir = os.path.dirname(sys.executable)
+    if os.path.isfile(os.path.join(exe_dir, "ffmpeg")):
+        os.environ["PATH"] = exe_dir + os.pathsep + os.environ.get("PATH", "")
 
 
 SCHEMA_VERSION = "1.2"
@@ -236,6 +254,8 @@ def transcribe_video(
         )
         return None
 
+    _ensure_ffmpeg_on_path()
+
     # Denoiser / wav2vec2 / pyannote weights download via torch.hub (urllib);
     # route TLS through certifi so a broken OS cert store doesn't block them.
     install_certifi_https()
@@ -352,10 +372,21 @@ def transcribe_video(
             )
             denoise_wav_path = None
 
+    def _cleanup_slice() -> None:
+        # Temp slice WAV must go on every exit path, not just the happy one.
+        if sliced_input_path and os.path.exists(sliced_input_path):
+            try:
+                os.remove(sliced_input_path)
+            except OSError:
+                logging.debug(
+                    "Could not remove sliced input WAV %s", sliced_input_path, exc_info=True
+                )
+
     try:
         audio = whisperx.load_audio(audio_input_path)
     except Exception:
         logging.exception("whisperx.load_audio failed for %s", audio_input_path)
+        _cleanup_slice()
         return None
 
     try:
@@ -371,6 +402,7 @@ def transcribe_video(
         )
     except Exception:
         logging.exception("whisperx.load_model failed (model=%s, device=%s)", model, device)
+        _cleanup_slice()
         return None
 
     try:
@@ -384,13 +416,21 @@ def transcribe_video(
         result = asr_model.transcribe(audio, **transcribe_kwargs)
     except Exception:
         logging.exception("whisperx transcribe failed for %s", source_video_path)
+        _cleanup_slice()
         return None
+    finally:
+        # The ASR model (~3 GB for large-v2) is done after transcribe; free it
+        # before the wav2vec2 alignment model loads so the two never coexist.
+        del asr_model
+        free_torch_memory(device)
 
     detected_language = result.get("language") if isinstance(result, dict) else None
     segments = result.get("segments", []) if isinstance(result, dict) else []
     aligned = False
 
     if run_alignment and detected_language and segments:
+        align_model = None
+        align_metadata = None
         try:
             align_model, align_metadata = whisperx.load_align_model(
                 language_code=detected_language, device=device
@@ -413,7 +453,14 @@ def transcribe_video(
                 detected_language,
                 exc_info=True,
             )
+        finally:
+            align_model = None
+            align_metadata = None
+            free_torch_memory(device)
 
+    # The raw waveform (float32 @16 kHz) has no further use — only the
+    # segment dicts feed serialization below.
+    del audio
     serialized_segments = _serialize_segments(segments)
     if audio_offset_sec > 0:
         for seg in serialized_segments:
@@ -464,6 +511,7 @@ def transcribe_video(
         logging.info("Saved transcription to %s (%d segments)", out_path, len(payload["segments"]))
     except OSError:
         logging.exception("Failed to write transcription JSON to %s", out_path)
+        _cleanup_slice()
         return None
 
     if denoise_wav_path and not keep_denoised_wav:
@@ -479,10 +527,6 @@ def transcribe_video(
         except OSError:
             logging.debug("Could not remove denoised WAV %s", denoise_wav_path, exc_info=True)
 
-    if sliced_input_path and os.path.exists(sliced_input_path):
-        try:
-            os.remove(sliced_input_path)
-        except OSError:
-            logging.debug("Could not remove sliced input WAV %s", sliced_input_path, exc_info=True)
+    _cleanup_slice()
 
     return payload

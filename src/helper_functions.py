@@ -373,7 +373,263 @@ def _boxes_intersect(boxA: Tuple[float, float, float, float], boxB: Tuple[float,
 
 # ----------------------------------------------------------------------
 # Camera-view annotations
+#
+# Every camera-view overlay follows the same recipe: stream the source
+# video, copy each frame, draw, write. Decoding the source dominates that
+# cost, so ``annotate_camera_videos_combined`` writes N overlays in a single
+# decode pass. Each overlay contributes ``(out_path, draw_fn)`` built by a
+# ``*_overlay_spec`` factory; the public ``annotate_*`` functions remain as
+# signature-compatible single-spec wrappers.
 # ----------------------------------------------------------------------
+
+_CAMERA_SKELETON = [
+    (15, 13), (13, 11), (11, 19),
+    (16, 14), (14, 12), (12, 19),
+    (17, 18), (18, 19),
+    (18, 5), (5, 7), (7, 9),
+    (18, 6), (6, 8), (8, 10),
+    (1, 2), (0, 1), (0, 2),
+    (1, 3), (2, 4), (3, 5),
+    (4, 6), (15, 20), (15, 22),
+    (15, 24), (16, 21), (16, 23),
+    (16, 25),
+]
+
+
+def annotate_camera_videos_combined(
+    tracker_output: List[Dict],
+    frame_rate: int,
+    specs: Sequence[Tuple[str, Any]],
+    *,
+    video_path: Optional[str] = None,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
+) -> None:
+    """Write N camera-view overlay videos in one pass over the source video.
+
+    ``specs`` is a sequence of ``(out_path, draw_fn)`` where
+    ``draw_fn(frame, frame_data)`` mutates its private copy of the decoded
+    frame for that overlay.
+    """
+    if not specs:
+        return
+    if start_frame is not None or end_frame is not None:
+        tracker_output = [
+            f for f in tracker_output if _in_window(int(f.get("frame", 0)), start_frame, end_frame)
+        ]
+
+    cap, get_frame = _get_frame_stream(video_path)
+    writers: List[Tuple[cv2.VideoWriter, Any]] = []
+    try:
+        first_idx = tracker_output[0]["frame"] if tracker_output else 1
+        first_frame = get_frame(first_idx)
+        if first_frame is None:
+            raise ValueError(
+                "Unable to read first frame for camera annotations: "
+                + ", ".join(os.path.basename(p) for p, _ in specs)
+            )
+
+        height, width = first_frame.shape[:2]
+        for out_path, draw_fn in specs:
+            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+            writers.append(
+                (
+                    cv2.VideoWriter(
+                        out_path, cv2.VideoWriter_fourcc(*"avc1"), frame_rate, (width, height)
+                    ),
+                    draw_fn,
+                )
+            )
+
+        for frame_data in tracker_output:
+            frame = get_frame(frame_data["frame"])
+            if frame is None:
+                break
+            for writer, draw_fn in writers:
+                overlay = frame.copy()
+                draw_fn(overlay, frame_data)
+                writer.write(overlay)
+    finally:
+        for writer, _ in writers:
+            writer.release()
+        if cap is not None:
+            cap.release()
+
+
+def _draw_track_boxes(
+    frame: np.ndarray,
+    frame_data: Dict,
+    inroom_ids: set,
+    track_colors: Dict[int, Tuple[int, int, int]],
+    predefined_colors: List[Tuple[int, int, int]],
+) -> None:
+    """Box + ID label for every tracked object (shared overlay first pass)."""
+    for obj in frame_data["objects"]:
+        trk_id = obj["id"]
+        x1, y1, x2, y2 = obj["bbox"]
+        color = _get_track_color(trk_id, inroom_ids, track_colors, predefined_colors)
+        id_text = f"ID: InRoom {trk_id}" if trk_id in inroom_ids else f"ID: {trk_id}"
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+        cv2.putText(frame, id_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 3)
+
+
+def camera_tracking_overlay_spec(
+    output_directory: str,
+    video_basename: str,
+    inroom_ids: List[int] = None,
+    gaze_conf_threshold: float = 0.3,
+) -> Tuple[str, Any]:
+    inroom = _normalize_inroom_ids(inroom_ids)
+    predefined_colors, track_colors = _build_track_color_cache()
+    out_path = os.path.join(output_directory, f"{video_basename}_Tracking_Overlays.mp4")
+
+    def draw(frame: np.ndarray, frame_data: Dict) -> None:
+        for obj in frame_data["objects"]:
+            trk_id = obj["id"]
+            x1, y1, x2, y2 = obj["bbox"]
+            color = _get_track_color(trk_id, inroom, track_colors, predefined_colors)
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+
+            id_text = f"ID: InRoom {trk_id}" if trk_id in inroom else f"ID: {trk_id}"
+            cv2.putText(frame, id_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 3)
+
+            kps = obj.get("keypoints", [])
+            scores = obj.get("keypoint_scores", [])
+            if len(kps) == 26 and len(scores) == 26:
+                for (x, y), s in zip(kps, scores):
+                    if s >= gaze_conf_threshold:
+                        cv2.circle(frame, (int(x), int(y)), 3, color, -1)
+
+                for i1, i2 in _CAMERA_SKELETON:
+                    if scores[i1] >= gaze_conf_threshold and scores[i2] >= gaze_conf_threshold:
+                        p1 = (int(kps[i1][0]), int(kps[i1][1]))
+                        p2 = (int(kps[i2][0]), int(kps[i2][1]))
+                        cv2.line(frame, p1, p2, color, 1)
+
+    return out_path, draw
+
+
+def gaze_triangle_overlay_spec(
+    gaze_info: Dict[Tuple[int, int], Tuple[float, float, float, float]],
+    output_directory: str,
+    video_basename: str,
+    inroom_ids: List[int] = None,
+    half_angle_deg: float = 30.0,
+    alpha: float = 0.2,
+    show_inroom_gaze: bool = True,
+) -> Tuple[str, Any]:
+    inroom = _normalize_inroom_ids(inroom_ids)
+    predefined_colors, track_colors = _build_track_color_cache()
+    out_path = os.path.join(output_directory, f"{video_basename}_Gaze_Triangles.mp4")
+
+    def draw(frame: np.ndarray, frame_data: Dict) -> None:
+        _draw_track_boxes(frame, frame_data, inroom, track_colors, predefined_colors)
+
+        tri_len = math.hypot(frame.shape[1], frame.shape[0]) * 1.5
+        for obj in frame_data["objects"]:
+            trk_id = obj["id"]
+            if trk_id in inroom and not show_inroom_gaze:
+                continue
+
+            gaze = gaze_info.get((frame_data["frame"], trk_id))
+            if gaze is None:
+                continue
+
+            color = _get_track_color(trk_id, inroom, track_colors, predefined_colors)
+            ox, oy, dx, dy = gaze
+            tri = _gaze_triangle((ox, oy), (dx, dy), half_angle_deg, length=tri_len).astype(int)
+
+            tri_overlay = np.zeros_like(frame, dtype=np.uint8)
+            cv2.fillConvexPoly(tri_overlay, tri, color)
+            cv2.addWeighted(tri_overlay, alpha, frame, 1.0, 0, dst=frame)
+
+    return out_path, draw
+
+
+def clearance_overlay_spec(
+    clearance_map: Dict[int, Tuple[Optional[int], Optional[int], Optional[int]]],
+    output_directory: str,
+    video_basename: str,
+    inroom_ids: List[int] = None,
+) -> Tuple[str, Any]:
+    inroom = _normalize_inroom_ids(inroom_ids)
+    predefined_colors, track_colors = _build_track_color_cache()
+    out_path = os.path.join(output_directory, f"{video_basename}_Clearance_Callouts.mp4")
+
+    def draw(frame: np.ndarray, frame_data: Dict) -> None:
+        _draw_track_boxes(frame, frame_data, inroom, track_colors, predefined_colors)
+
+        for inroom_id in inroom:
+            start, end, _ = clearance_map.get(inroom_id, (None, None, None))
+            if end is None or frame_data["frame"] < end:
+                continue
+
+            obj = next((o for o in frame_data["objects"] if o.get("id") == inroom_id), None)
+            if obj is None:
+                continue
+
+            x1, y1, x2, y2 = obj["bbox"]
+            color = (255, 255, 255)
+            id_text = f"ID: InRoom {inroom_id}"
+            (id_w, _), _ = cv2.getTextSize(id_text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 3)
+            cv2.putText(frame, "CLEARED!", (x1 + id_w + 10, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 3)
+
+    return out_path, draw
+
+
+def tracking_with_clearance_overlay_spec(
+    clearance_map: Dict[int, Tuple[Optional[int], Optional[int], Optional[int]]],
+    output_directory: str,
+    video_basename: str,
+    inroom_ids: List[int] = None,
+    gaze_conf_threshold: float = 0.3,
+    show_clearing_id: bool = True,
+) -> Tuple[str, Any]:
+    inroom = _normalize_inroom_ids(inroom_ids)
+    predefined_colors, track_colors = _build_track_color_cache()
+    out_path = os.path.join(output_directory, f"{video_basename}_Tracking_WithClearance.mp4")
+
+    def draw(frame: np.ndarray, frame_data: Dict) -> None:
+        for obj in frame_data["objects"]:
+            trk_id = obj["id"]
+            x1, y1, x2, y2 = obj["bbox"]
+            color = _get_track_color(trk_id, inroom, track_colors, predefined_colors)
+            id_text = f"ID: InRoom {trk_id}" if trk_id in inroom else f"ID: {trk_id}"
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+            cv2.putText(frame, id_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 3)
+
+            kps = obj.get("keypoints", [])
+            scores = obj.get("keypoint_scores", [])
+            if len(kps) == 26 and len(scores) == 26:
+                for (kx, ky), s in zip(kps, scores):
+                    if s >= gaze_conf_threshold:
+                        cv2.circle(frame, (int(kx), int(ky)), 3, color, -1)
+
+                for i1, i2 in _CAMERA_SKELETON:
+                    if scores[i1] >= gaze_conf_threshold and scores[i2] >= gaze_conf_threshold:
+                        pt1 = (int(kps[i1][0]), int(kps[i1][1]))
+                        pt2 = (int(kps[i2][0]), int(kps[i2][1]))
+                        cv2.line(frame, pt1, pt2, color, 1)
+
+        for inroom_id in inroom:
+            start, end, fid = clearance_map.get(inroom_id, (None, None, None))
+            if end is None or frame_data["frame"] < end:
+                continue
+
+            obj = next((o for o in frame_data["objects"] if o.get("id") == inroom_id), None)
+            if obj is None:
+                continue
+
+            x1, y1, x2, y2 = obj["bbox"]
+            color = (255, 255, 255)
+            id_text = f"ID: InRoom {inroom_id}"
+            (id_w, _), _ = cv2.getTextSize(id_text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 3)
+            label = f"CLEARED by {fid}!" if show_clearing_id and fid is not None and fid != -1 else "CLEARED!"
+            cv2.putText(frame, label, (x1 + id_w + 10, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 3)
+
+    return out_path, draw
 
 
 def annotate_camera_video(
@@ -388,74 +644,14 @@ def annotate_camera_video(
     start_frame: Optional[int] = None,
     end_frame: Optional[int] = None,
 ):
-    skeleton = [
-        (15, 13), (13, 11), (11, 19),
-        (16, 14), (14, 12), (12, 19),
-        (17, 18), (18, 19),
-        (18, 5), (5, 7), (7, 9),
-        (18, 6), (6, 8), (8, 10),
-        (1, 2), (0, 1), (0, 2),
-        (1, 3), (2, 4), (3, 5),
-        (4, 6), (15, 20), (15, 22),
-        (15, 24), (16, 21), (16, 23),
-        (16, 25),
-    ]
-
-    if start_frame is not None or end_frame is not None:
-        tracker_output = [
-            f for f in tracker_output if _in_window(int(f.get("frame", 0)), start_frame, end_frame)
-        ]
-
-    inroom_ids = _normalize_inroom_ids(inroom_ids)
-    predefined_colors, track_colors = _build_track_color_cache()
-
-    cap, get_frame = _get_frame_stream(video_path)
-
-    out_path = os.path.join(output_directory, f"{video_basename}_Tracking_Overlays.mp4")
-    first_idx = tracker_output[0]["frame"] if tracker_output else 1
-    first_frame = get_frame(first_idx)
-    if first_frame is None:
-        if cap is not None:
-            cap.release()
-        raise ValueError("Unable to read first frame for annotate_camera_video")
-
-    height, width = first_frame.shape[:2]
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"avc1"), frame_rate, (width, height))
-
-    for frame_data in tracker_output:
-        frame = get_frame(frame_data["frame"])
-        if frame is None:
-            break
-        frame = frame.copy()
-
-        for obj in frame_data["objects"]:
-            trk_id = obj["id"]
-            x1, y1, x2, y2 = obj["bbox"]
-            color = _get_track_color(trk_id, inroom_ids, track_colors, predefined_colors)
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-
-            id_text = f"ID: InRoom {trk_id}" if trk_id in inroom_ids else f"ID: {trk_id}"
-            cv2.putText(frame, id_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 3)
-
-            kps = obj.get("keypoints", [])
-            scores = obj.get("keypoint_scores", [])
-            if len(kps) == 26 and len(scores) == 26:
-                for (x, y), s in zip(kps, scores):
-                    if s >= gaze_conf_threshold:
-                        cv2.circle(frame, (int(x), int(y)), 3, color, -1)
-
-                for i1, i2 in skeleton:
-                    if scores[i1] >= gaze_conf_threshold and scores[i2] >= gaze_conf_threshold:
-                        p1 = (int(kps[i1][0]), int(kps[i1][1]))
-                        p2 = (int(kps[i2][0]), int(kps[i2][1]))
-                        cv2.line(frame, p1, p2, color, 1)
-
-        writer.write(frame)
-
-    writer.release()
-    if cap is not None:
-        cap.release()
+    annotate_camera_videos_combined(
+        tracker_output,
+        frame_rate,
+        [camera_tracking_overlay_spec(output_directory, video_basename, inroom_ids, gaze_conf_threshold)],
+        video_path=video_path,
+        start_frame=start_frame,
+        end_frame=end_frame,
+    )
 
 
 def annotate_camera_with_gaze_triangle(
@@ -473,64 +669,24 @@ def annotate_camera_with_gaze_triangle(
     start_frame: Optional[int] = None,
     end_frame: Optional[int] = None,
 ):
-    if start_frame is not None or end_frame is not None:
-        tracker_output = [
-            f for f in tracker_output if _in_window(int(f.get("frame", 0)), start_frame, end_frame)
-        ]
-
-    inroom_ids = _normalize_inroom_ids(inroom_ids)
-    predefined_colors, track_colors = _build_track_color_cache()
-
-    cap, get_frame = _get_frame_stream(video_path)
-
-    out_path = os.path.join(output_directory, f"{video_basename}_Gaze_Triangles.mp4")
-    first_idx = tracker_output[0]["frame"] if tracker_output else 1
-    first_frame = get_frame(first_idx)
-    if first_frame is None:
-        if cap is not None:
-            cap.release()
-        raise ValueError("Unable to read first frame for annotate_camera_with_gaze_triangle")
-
-    height, width = first_frame.shape[:2]
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"avc1"), frame_rate, (width, height))
-    tri_len = math.hypot(width, height) * 1.5
-
-    for frame_data in tracker_output:
-        frame = get_frame(frame_data["frame"])
-        if frame is None:
-            break
-        frame = frame.copy()
-
-        for obj in frame_data["objects"]:
-            trk_id = obj["id"]
-            x1, y1, x2, y2 = obj["bbox"]
-            color = _get_track_color(trk_id, inroom_ids, track_colors, predefined_colors)
-            id_text = f"ID: InRoom {trk_id}" if trk_id in inroom_ids else f"ID: {trk_id}"
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-            cv2.putText(frame, id_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 3)
-
-        for obj in frame_data["objects"]:
-            trk_id = obj["id"]
-            if trk_id in inroom_ids and not show_inroom_gaze:
-                continue
-
-            gaze = gaze_info.get((frame_data["frame"], trk_id))
-            if gaze is None:
-                continue
-
-            color = _get_track_color(trk_id, inroom_ids, track_colors, predefined_colors)
-            ox, oy, dx, dy = gaze
-            tri = _gaze_triangle((ox, oy), (dx, dy), half_angle_deg, length=tri_len).astype(int)
-
-            tri_overlay = np.zeros_like(frame, dtype=np.uint8)
-            cv2.fillConvexPoly(tri_overlay, tri, color)
-            cv2.addWeighted(tri_overlay, alpha, frame, 1.0, 0, dst=frame)
-
-        writer.write(frame)
-
-    writer.release()
-    if cap is not None:
-        cap.release()
+    annotate_camera_videos_combined(
+        tracker_output,
+        frame_rate,
+        [
+            gaze_triangle_overlay_spec(
+                gaze_info,
+                output_directory,
+                video_basename,
+                inroom_ids,
+                half_angle_deg,
+                alpha,
+                show_inroom_gaze,
+            )
+        ],
+        video_path=video_path,
+        start_frame=start_frame,
+        end_frame=end_frame,
+    )
 
 
 def annotate_clearance_video(
@@ -545,61 +701,14 @@ def annotate_clearance_video(
     start_frame: Optional[int] = None,
     end_frame: Optional[int] = None,
 ):
-    if start_frame is not None or end_frame is not None:
-        tracker_output = [
-            f for f in tracker_output if _in_window(int(f.get("frame", 0)), start_frame, end_frame)
-        ]
-
-    inroom_ids = _normalize_inroom_ids(inroom_ids)
-    predefined_colors, track_colors = _build_track_color_cache()
-
-    cap, get_frame = _get_frame_stream(video_path)
-
-    out_path = os.path.join(output_directory, f"{video_basename}_Clearance_Callouts.mp4")
-    first_idx = tracker_output[0]["frame"] if tracker_output else 1
-    first_frame = get_frame(first_idx)
-    if first_frame is None:
-        if cap is not None:
-            cap.release()
-        raise ValueError("Unable to read first frame for annotate_clearance_video")
-
-    height, width = first_frame.shape[:2]
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"avc1"), frame_rate, (width, height))
-
-    for frame_data in tracker_output:
-        frame = get_frame(frame_data["frame"])
-        if frame is None:
-            break
-        frame = frame.copy()
-
-        for obj in frame_data["objects"]:
-            trk_id = obj["id"]
-            x1, y1, x2, y2 = obj["bbox"]
-            color = _get_track_color(trk_id, inroom_ids, track_colors, predefined_colors)
-            id_text = f"ID: InRoom {trk_id}" if trk_id in inroom_ids else f"ID: {trk_id}"
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-            cv2.putText(frame, id_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 3)
-
-        for inroom_id in inroom_ids:
-            start, end, _ = clearance_map.get(inroom_id, (None, None, None))
-            if end is None or frame_data["frame"] < end:
-                continue
-
-            obj = next((o for o in frame_data["objects"] if o.get("id") == inroom_id), None)
-            if obj is None:
-                continue
-
-            x1, y1, x2, y2 = obj["bbox"]
-            color = (255, 255, 255)
-            id_text = f"ID: InRoom {inroom_id}"
-            (id_w, _), _ = cv2.getTextSize(id_text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 3)
-            cv2.putText(frame, "CLEARED!", (x1 + id_w + 10, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 3)
-
-        writer.write(frame)
-
-    writer.release()
-    if cap is not None:
-        cap.release()
+    annotate_camera_videos_combined(
+        tracker_output,
+        frame_rate,
+        [clearance_overlay_spec(clearance_map, output_directory, video_basename, inroom_ids)],
+        video_path=video_path,
+        start_frame=start_frame,
+        end_frame=end_frame,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -1306,90 +1415,23 @@ def annotate_camera_tracking_with_clearance(
     start_frame: Optional[int] = None,
     end_frame: Optional[int] = None,
 ):
-    skeleton = [
-        (15, 13), (13, 11), (11, 19),
-        (16, 14), (14, 12), (12, 19),
-        (17, 18), (18, 19),
-        (18, 5), (5, 7), (7, 9),
-        (18, 6), (6, 8), (8, 10),
-        (1, 2), (0, 1), (0, 2),
-        (1, 3), (2, 4), (3, 5),
-        (4, 6), (15, 20), (15, 22),
-        (15, 24), (16, 21), (16, 23),
-        (16, 25),
-    ]
-
-    if start_frame is not None or end_frame is not None:
-        tracker_output = [
-            f for f in tracker_output if _in_window(int(f.get("frame", 0)), start_frame, end_frame)
-        ]
-
-    inroom_ids = _normalize_inroom_ids(inroom_ids)
-    predefined_colors, track_colors = _build_track_color_cache()
-
-    cap, get_frame = _get_frame_stream(video_path)
-
-    os.makedirs(output_directory, exist_ok=True)
-    out_path = os.path.join(output_directory, f"{video_basename}_Tracking_WithClearance.mp4")
-    first_idx = tracker_output[0]["frame"] if tracker_output else 1
-    first_frame = get_frame(first_idx)
-    if first_frame is None:
-        if cap is not None:
-            cap.release()
-        raise ValueError("Unable to read first frame for annotate_camera_tracking_with_clearance")
-
-    height, width = first_frame.shape[:2]
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"avc1"), frame_rate, (width, height))
-
-    for frame_data in tracker_output:
-        frame = get_frame(frame_data["frame"])
-        if frame is None:
-            break
-        frame = frame.copy()
-
-        for obj in frame_data["objects"]:
-            trk_id = obj["id"]
-            x1, y1, x2, y2 = obj["bbox"]
-            color = _get_track_color(trk_id, inroom_ids, track_colors, predefined_colors)
-            id_text = f"ID: InRoom {trk_id}" if trk_id in inroom_ids else f"ID: {trk_id}"
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-            cv2.putText(frame, id_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 3)
-
-            kps = obj.get("keypoints", [])
-            scores = obj.get("keypoint_scores", [])
-            if len(kps) == 26 and len(scores) == 26:
-                for (kx, ky), s in zip(kps, scores):
-                    if s >= gaze_conf_threshold:
-                        cv2.circle(frame, (int(kx), int(ky)), 3, color, -1)
-
-                for i1, i2 in skeleton:
-                    if scores[i1] >= gaze_conf_threshold and scores[i2] >= gaze_conf_threshold:
-                        pt1 = (int(kps[i1][0]), int(kps[i1][1]))
-                        pt2 = (int(kps[i2][0]), int(kps[i2][1]))
-                        cv2.line(frame, pt1, pt2, color, 1)
-
-        for inroom_id in inroom_ids:
-            start, end, fid = clearance_map.get(inroom_id, (None, None, None))
-            if end is None or frame_data["frame"] < end:
-                continue
-
-            obj = next((o for o in frame_data["objects"] if o.get("id") == inroom_id), None)
-            if obj is None:
-                continue
-
-            x1, y1, x2, y2 = obj["bbox"]
-            color = (255, 255, 255)
-            id_text = f"ID: InRoom {inroom_id}"
-            (id_w, _), _ = cv2.getTextSize(id_text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 3)
-            label = f"CLEARED by {fid}!" if show_clearing_id and fid is not None and fid != -1 else "CLEARED!"
-            cv2.putText(frame, label, (x1 + id_w + 10, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 3)
-
-        writer.write(frame)
-
-    writer.release()
-    if cap is not None:
-        cap.release()
+    annotate_camera_videos_combined(
+        tracker_output,
+        frame_rate,
+        [
+            tracking_with_clearance_overlay_spec(
+                clearance_map,
+                output_directory,
+                video_basename,
+                inroom_ids,
+                gaze_conf_threshold,
+                show_clearing_id,
+            )
+        ],
+        video_path=video_path,
+        start_frame=start_frame,
+        end_frame=end_frame,
+    )
 
 
 def compute_room_coverage(

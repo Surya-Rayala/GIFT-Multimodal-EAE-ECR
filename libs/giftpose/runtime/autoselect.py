@@ -5,14 +5,22 @@ Order (per device):
   cpu:  ONNX (CPU EP) > TorchScript > PyTorch
   mps:  TorchScript (.torchscript.mps.pt) > PyTorch  [ONNX/CoreML skipped —
         the graph splits into 9-12 partitions and runs slower than native MPS]
+
+On CUDA without TRT engines, note that TorchScript artifacts are traced fp32
+(no autocast baked in) and may run slower than the eager PyTorch backend's
+fp16 autocast path; pass ``MMPoseInferencer(prefer_backend="pytorch")`` to
+override the autoselect order in that case.
 """
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 from typing import Optional
 
 from libs.giftpose.runtime.base import Backend
+
+logger = logging.getLogger(__name__)
 
 
 def _try_import(mod: str) -> bool:
@@ -20,6 +28,25 @@ def _try_import(mod: str) -> bool:
         importlib.import_module(mod)
         return True
     except (ImportError, ModuleNotFoundError):
+        return False
+
+
+def _onnx_supports_device(device: str) -> bool:
+    """True when onnxruntime can actually execute on ``device``.
+
+    A CPU-only ORT build still imports fine on a CUDA box; without this gate
+    autoselect would pick ONNX and ORT would silently fall back to the CPU EP,
+    leaving the GPU idle. (mps never reaches here — that branch is excluded.)
+    """
+    if device != "cuda":
+        return True  # CPUExecutionProvider is always present
+    try:
+        import onnxruntime as ort
+        return bool(
+            set(ort.get_available_providers())
+            & {"CUDAExecutionProvider", "TensorrtExecutionProvider"}
+        )
+    except Exception:
         return False
 
 
@@ -99,12 +126,14 @@ def select_backend(
         elif (
             device != "mps"  # CoreMLEP fragments the graph; skip ONNX on MPS
             and det_onnx and pose_onnx and _try_import("onnxruntime")
+            and _onnx_supports_device(device)
         ):
             want = "onnx"
         elif det_ts and pose_ts:
             want = "torchscript"
         else:
             want = "pytorch"
+    logger.info("giftpose backend: %s (device=%s)", want, device)
 
     det_nms = dict(
         det_score_thr=det_score_thr,

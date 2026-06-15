@@ -72,8 +72,15 @@ class TotalEntryTime_Metric(AbstractMetric):
     def _exp_penalty(overrun: float, limit: float) -> float:
         return exponential_time_penalty(overrun, limit)
 
-    @staticmethod
-    def expertCompare(session_folder: str, expert_folder: str, map_image=None, config=None):
+    def expertCompare(self, session_folder: str, expert_folder: str, map_image=None, config=None):
+        # The engine's primary call passes session/expert/map_image only (no
+        # config), so fall back to the config this metric was built with —
+        # otherwise ``team_size`` is lost and the chart plots every non-inroom
+        # track (e.g. 5 dots) instead of the capped team_size entrants the
+        # live score uses. Matches the instance-method contract of the other
+        # three entry metrics.
+        if config is None:
+            config = getattr(self, "config", None)
         _pick_latest = pick_latest
         _load_inroom_ids = load_inroom_ids
 
@@ -239,7 +246,6 @@ class TotalEntryTime_Metric(AbstractMetric):
         _, _, _, trainee_delta_secs = _span_seconds(trainee_frames, trainee_fps)
         reference_limit_secs = _allowed_total_entry_duration(len(expert_frames), base_threshold, second_threshold)
         trainee_limit_secs = _allowed_total_entry_duration(len(trainee_frames), base_threshold, second_threshold)
-        plot_limit_secs = _allowed_total_entry_duration(n_tracks, base_threshold, second_threshold) if n_tracks > 0 else 0.0
 
         reference_score = _score(reference_delta_secs, reference_limit_secs)
         trainee_score = _score(trainee_delta_secs, trainee_limit_secs)
@@ -276,14 +282,32 @@ class TotalEntryTime_Metric(AbstractMetric):
                 ax.text(max(trainee_t) + 0.05, 0.0,
                         f"{(trainee_delta_secs or 0.0):.2f}s", va="center")
 
-            if plot_limit_secs > 0:
+            # Allowed-span reference line. Each side's score uses a limit based
+            # on its OWN entrant count (reference_limit_secs / trainee_limit_secs),
+            # so draw per-side ticks when they differ. When both sides have the
+            # same entrant count (the common case) the limits match and we draw
+            # one full-height line — identical to the prior behaviour.
+            if (
+                reference_limit_secs == trainee_limit_secs
+                and reference_limit_secs and reference_limit_secs > 0
+            ):
                 ax.axvline(
-                    plot_limit_secs,
+                    reference_limit_secs,
                     linestyle="--",
                     color="#ef4444",
                     linewidth=1.8,
-                    label=f"{plot_limit_secs:.2f}s allowed span",
+                    label=f"{reference_limit_secs:.2f}s allowed span",
                 )
+            else:
+                def _draw_side_limit(limit, y, color):
+                    if limit and limit > 0:
+                        ax.plot([limit, limit], [y - 0.18, y + 0.18],
+                                linestyle="--", color=color, linewidth=1.8, zorder=4)
+                        ax.annotate(f"allowed {limit:.2f}s", xy=(limit, y + 0.2),
+                                    ha="center", va="bottom", fontsize=8, color=color)
+
+                _draw_side_limit(reference_limit_secs, 1.0, _REFERENCE_COLOR)
+                _draw_side_limit(trainee_limit_secs, 0.0, _TRAINEE_COLOR)
             ax.set_yticks([0.0, 1.0])
             ax.set_yticklabels(["Trainee", "Reference"])
             ax.set_xlabel("Seconds since first team entry")
