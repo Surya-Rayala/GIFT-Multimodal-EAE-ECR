@@ -36,3 +36,7 @@ DESCRIPTION.md
 
 # Keep the .gitkeep placeholders that hold empty dirs in git
 !**/.gitkeep
+
+# IEEE TLT paper workspace (validation study, inter-team analysis, paper
+# figures) — data/results, not repo code; never shared via git
+/Results-for-TLT/

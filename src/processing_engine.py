@@ -698,6 +698,15 @@ class ProcessingEngine:
         processed_frames = 0
         tracks_by_id: Dict[int, List[Optional[Tuple[float, float]]]] = {}
 
+        # Opt-in early stop: when ``max_frames_after_first_entry`` is set,
+        # processing halts that many frames after the tracker's first
+        # confirmed entry (same signal find_drill_start_frame uses). Lets
+        # batch/validation runs skip long post-drill footage. Absent from
+        # production configs -> no behavior change.
+        max_after_entry = config.get("max_frames_after_first_entry")
+        max_after_entry = int(max_after_entry) if max_after_entry else None
+        first_entry_frame_live: Optional[int] = None
+
         for frame_num in tqdm(range(1, frame_total + 1), desc="Processing frames", unit="frame"):
             ret, frame = vs.read()
             if not ret or frame is None:
@@ -853,6 +862,21 @@ class ProcessingEngine:
             all_frames.append(map_points)
             for idx, mx, my in map_points:
                 all_map_points.append([frame_num, idx, mx, my])
+
+            if max_after_entry is not None:
+                if first_entry_frame_live is None:
+                    if any(o.get("is_entry") or o.get("birth_location") == "entry"
+                           for o in frame_objects):
+                        first_entry_frame_live = frame_num
+                if (first_entry_frame_live is not None
+                        and frame_num >= first_entry_frame_live + max_after_entry):
+                    logging.info(
+                        "Early stop: %d frames processed after first entry at frame %d "
+                        "(max_frames_after_first_entry=%d).",
+                        frame_num - first_entry_frame_live, first_entry_frame_live,
+                        max_after_entry,
+                    )
+                    break
 
         vs.release()
         self._release_inferencer()
