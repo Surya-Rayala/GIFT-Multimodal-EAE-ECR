@@ -61,10 +61,14 @@ def create_app() -> FastAPI:
 
     @app.get("/api/config")
     def get_config() -> dict:
-        """Runtime config the frontend reads at startup. In server mode it learns
-        the outputs root so Compare can browse every run under it."""
-        root = cfg.outputs_root()
-        return {"outputs_root": root, "serve_mode": root is not None}
+        """Runtime config the frontend reads at startup. ``outputs_root`` is the
+        folder Compare browses by default (when known); ``restricted`` says
+        whether the server confines access to it (``--outputs-root``)."""
+        return {
+            "outputs_root": cfg.browse_root(),
+            "serve_mode": cfg.serve_mode(),
+            "restricted": cfg.outputs_root() is not None,
+        }
 
     # In server mode, serve the built Vue app from the same origin so a single URL
     # works from any device on the network. The SPA is a single page; the path

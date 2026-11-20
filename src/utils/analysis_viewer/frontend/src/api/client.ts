@@ -125,9 +125,15 @@ export function fetchHealth(): Promise<{ ok: boolean; service: string }> {
 export interface ServerConfig {
   outputs_root: string | null;
   serve_mode: boolean;
+  /** True only when the server was started with `--outputs-root`. */
+  restricted?: boolean;
 }
 
-/** Runtime server config. In web mode, `outputs_root` is the folder Compare can browse. */
+/**
+ * Runtime server config. In web mode, `outputs_root` is the folder Compare
+ * browses by default (when known). Access is confined to it only when
+ * `restricted` is true.
+ */
 export function fetchConfig(): Promise<ServerConfig> {
   return getJson<ServerConfig>(`/config`);
 }

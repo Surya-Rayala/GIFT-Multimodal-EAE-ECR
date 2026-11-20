@@ -386,9 +386,14 @@ on the same network — each viewing a different session at the same time.
 
 ```bash
 conda activate gift-meae
-python -m src.utils.analysis_viewer --serve --outputs-root /path/to/output
+python -m src.utils.analysis_viewer --serve --outputs-root /path/to/output   # restricted to that folder
+python -m src.utils.analysis_viewer --serve                                  # no restriction
 # options: --host (default 0.0.0.0) · --port (default 8000) · --rebuild
 ```
+
+Access restriction is **opt-in**: only `--outputs-root` confines the server to one folder.
+Without it, any run folder path on the host can be opened (the startup banner says
+`access: UNRESTRICTED`), and Compare defaults to the opened run's parent folder.
 
 This builds the frontend once and runs a web server (no desktop window). It prints
 the URLs to share. To open a specific session, append its **host-machine folder
@@ -418,7 +423,7 @@ sessions at once.
 
 #### What people can and can't reach
 
-`--outputs-root` decides which **sessions** can be opened — not every file they reference:
+When given, `--outputs-root` decides which **sessions** can be opened — not every file they reference:
 
 - A `?run=` path is accepted **only if it resolves inside `--outputs-root`** (by real
   path, so symlinks can't escape); anything else — `?run=/etc/passwd`, another user's
@@ -433,6 +438,9 @@ sessions at once.
   view every session under the root (and the files those sessions reference). Host it
   only on a trusted network, and point `--outputs-root` at just the folder you mean to
   share (e.g. one project's `output/`, not your whole home directory).
+- **Without `--outputs-root`** none of the folder checks apply: anyone who can reach
+  the server can open any run folder (or `_Analysis.json`) the hosting user can read,
+  and the files it references. Use that only on a network you fully trust.
 
 #### Finding the host IP and connecting
 

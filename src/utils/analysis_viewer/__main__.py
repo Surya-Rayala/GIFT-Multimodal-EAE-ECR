@@ -24,7 +24,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 from ..node_runtime import REPO_ROOT, ensure_workspace_packages, prepare_runtime
 
@@ -51,13 +51,23 @@ def _lan_ip() -> str:
         s.close()
 
 
-def _serve(host: str, port: int, outputs_root: Path, rebuild: bool) -> None:
+def _serve(
+    host: str,
+    port: int,
+    outputs_root: Optional[Path],
+    rebuild: bool,
+    browse_root: Optional[Path] = None,
+) -> None:
     """Host the viewer as a LAN web app served from a single origin.
 
     Builds the Vue frontend once (Node auto-provisioned), then runs the FastAPI
-    sidecar bound to ``host:port`` serving both the UI and the API. Access is
-    restricted to session folders under ``outputs_root``; people open a specific
-    session by deep-linking its host path: ``/?run=/abs/path/to/<run_folder>``.
+    sidecar bound to ``host:port`` serving both the UI and the API. People open a
+    specific session by deep-linking its host path:
+    ``/?run=/abs/path/to/<run_folder>``.
+
+    Access is restricted to session folders under ``outputs_root`` only when one
+    is given (``--outputs-root``); without it any run folder path is accepted.
+    ``browse_root`` (unrestricted mode) only pre-fills Compare's run list.
     """
     if rebuild or not (DIST_DIR / "index.html").is_file():
         print(f"[{LABEL}] building frontend (one-time)…")
@@ -68,20 +78,37 @@ def _serve(host: str, port: int, outputs_root: Path, rebuild: bool) -> None:
         subprocess.run([npm, "run", "build"], cwd=FRONTEND_DIR, env=build_env, check=True)
 
     env = os.environ.copy()
-    env["GIFT_VIEWER_OUTPUTS_ROOT"] = str(outputs_root)
+    # Never inherit a restriction (or browse hint) from the calling shell: the
+    # flags passed to this launcher alone decide it.
+    env.pop("GIFT_VIEWER_OUTPUTS_ROOT", None)
+    env.pop("GIFT_VIEWER_BROWSE_ROOT", None)
+    if outputs_root is not None:
+        env["GIFT_VIEWER_OUTPUTS_ROOT"] = str(outputs_root)
+    elif browse_root is not None:
+        env["GIFT_VIEWER_BROWSE_ROOT"] = str(browse_root)
+    env["GIFT_VIEWER_SERVE"] = "1"
     env["GIFT_VIEWER_DIST"] = str(DIST_DIR)
 
     lan = _lan_ip()
     print(f"\n[{LABEL}] serving the Analysis Viewer over the network")
-    print(f"    outputs root (accessible): {outputs_root}")
+    if outputs_root is not None:
+        print(f"    access restricted to sessions under: {outputs_root}")
+    else:
+        print("    access: UNRESTRICTED (no --outputs-root) — anyone who can reach this")
+        print("            server can open any run folder this user can read.")
+        print("            Pass --outputs-root <folder> to restrict it.")
     print(f"    this machine:  http://127.0.0.1:{port}")
     if host == "0.0.0.0":
         print(f"    other devices: http://{lan}:{port}")
     host_str = lan if host == "0.0.0.0" else host
-    print(f"    open a session by appending its folder path; the path picks the view:")
-    print(f"        http://{host_str}:{port}/analysis/?run=<run_folder_under_outputs_root>   # Analysis view")
-    print(f"        http://{host_str}:{port}/compare/?run=<run_folder_under_outputs_root>    # Compare view")
-    print(f"    (only folders under the outputs root above can be opened)\n")
+    where = "run_folder_under_outputs_root" if outputs_root is not None else "absolute_run_folder_path"
+    print("    open a session by appending its folder path; the path picks the view:")
+    print(f"        http://{host_str}:{port}/analysis/?run=<{where}>   # Analysis view")
+    print(f"        http://{host_str}:{port}/compare/?run=<{where}>    # Compare view")
+    if outputs_root is not None:
+        print("    (only folders under the outputs root above can be opened)\n")
+    else:
+        print()
 
     cmd = [
         sys.executable,
@@ -172,8 +199,9 @@ def main() -> None:
     parser.add_argument(
         "--outputs-root",
         help=(
-            "Folder the server may expose (only sessions under it are openable). "
-            "Defaults to the run's parent if a run is given, else ./output."
+            "Restrict --serve to sessions under this folder (only they are "
+            "openable). Without it, access is unrestricted: any run folder path "
+            "can be opened."
         ),
     )
     parser.add_argument(
@@ -187,15 +215,17 @@ def main() -> None:
         fail(f"Frontend directory missing: {FRONTEND_DIR}")
 
     if args.serve:
+        # The restriction is opt-in: only an explicit --outputs-root confines
+        # access. A positional run then merely pre-fills Compare's run list.
+        root: Optional[Path] = None
+        browse: Optional[Path] = None
         if args.outputs_root:
             root = Path(args.outputs_root).expanduser().resolve()
+            if not root.is_dir():
+                fail(f"Outputs root not found or not a directory: {root}")
         elif args.run:
-            root = Path(args.run).expanduser().resolve().parent
-        else:
-            root = (REPO_ROOT / "output").resolve()
-        if not root.is_dir():
-            fail(f"Outputs root not found or not a directory: {root}")
-        _serve(args.host, args.port, root, args.rebuild)
+            browse = Path(args.run).expanduser().resolve().parent
+        _serve(args.host, args.port, root, args.rebuild, browse_root=browse)
         return
 
     runtime = prepare_runtime(LABEL)

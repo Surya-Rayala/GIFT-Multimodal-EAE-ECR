@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from src.utils.run_info import list_runs
 
-from ..config import enforce_under_root, outputs_root as configured_root
+from ..config import browse_root as configured_root, enforce_under_root
 
 router = APIRouter()
 
@@ -26,9 +26,9 @@ def get_runs(
         "mode — defaults to the configured outputs root.",
     ),
 ) -> List[Dict[str, Any]]:
-    # In server mode the configured root is the default and the ceiling: a passed
-    # root must resolve under it (enforce_under_root). In desktop mode the query
-    # param is required and any path is accepted.
+    # With a restriction root (--serve --outputs-root) that root is the default
+    # and the ceiling: a passed root must resolve under it (enforce_under_root).
+    # Otherwise any path is accepted; the optional browse root is the default.
     root = outputs_root or (configured_root() or "")
     if not root:
         raise HTTPException(status_code=400, detail="outputs_root query parameter is required")
