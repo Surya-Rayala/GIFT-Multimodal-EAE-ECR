@@ -60,6 +60,8 @@ from .orientation import (
 )
 from .utils.audio import attach_audio_in_place, has_audio_stream
 from .utils.config import load_config, load_vmeta
+from .utils.media_source import is_stream_url, redact_url, safe_basename
+from .utils.stream_ingest import StreamError, StreamIngest
 from .utils.run_info import load_run_info, make_run_id, save_run_info
 from .utils.run_metadata import load_run_metadata, save_run_metadata
 from .utils.drill_window import (
@@ -79,6 +81,30 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 logging.getLogger("libs.Track.trackers.basetracker").setLevel(logging.ERROR)
+
+
+# Frame-count stand-in for a live stream (no known length) wherever an upper
+# bound is required up front; windows are clamped to the frames actually
+# processed once the stream ends.
+STREAM_FRAME_SENTINEL = 10 ** 9
+
+
+def _file_frames(vs: "cv2.VideoCapture", frame_total: int):
+    """File input: ``(frame_num, frame, None)`` for frames 1..frame_total."""
+    for frame_num in range(1, frame_total + 1):
+        ret, frame = vs.read()
+        if not ret or frame is None:
+            return
+        yield frame_num, frame, None
+
+
+def _read_json(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def _extras_key(kps: np.ndarray) -> tuple:
@@ -360,7 +386,69 @@ class ProcessingEngine:
         self.video_basename = ""
         self.writeXML = True
         self.config = config if config is not None else None
+        # Live-stream sessions: recorders armed ahead of their turn (keyed by
+        # abs vmeta path) and the one being processed now.
+        self._stream_ingests: Dict[str, StreamIngest] = {}
+        self.stream: Optional[StreamIngest] = None
+        # Title-derived artifact basenames, unique per output folder.
+        self._basenames: Dict[str, str] = {}
+        self._used_basenames: Dict[str, set] = {}
         logging.debug("Ready to receive requests.")
+
+    def _output_basename(self, vmeta_path: str, title: str, output_path: str) -> str:
+        """Artifact file stem for a vmeta: its title, made filesystem-safe.
+
+        Never derived from the video location (a stream URL would yield names
+        like ``1234?pkt_size=1316_Analysis.json``). Two vmetas with the same
+        title writing into the same folder get ``_2``, ``_3``… so neither
+        overwrites the other's artifacts.
+        """
+        key = os.path.abspath(vmeta_path)
+        if key in self._basenames:
+            return self._basenames[key]
+        base = safe_basename(title)
+        used = self._used_basenames.setdefault(os.path.abspath(output_path), set())
+        name, n = base, 2
+        while name in used:
+            name = f"{base}_{n}"
+            n += 1
+        used.add(name)
+        self._basenames[key] = name
+        return name
+
+    def _prearm_streams(self, vmeta_paths, output_path) -> None:
+        """Start receiving every stream vmeta of this request immediately.
+
+        vmetas are processed one after another, but live streams (e.g. several
+        GoPros) all start sending now — each gets its recorder before any
+        processing so nothing a later stream sends in the meantime is lost.
+        """
+        for vmeta_path in vmeta_paths:
+            key = os.path.abspath(vmeta_path)
+            if vmeta_path in self.processed_vmetas or key in self._stream_ingests:
+                continue
+            try:
+                cfg_path, video, _st, _role, title = load_vmeta(vmeta_path)
+            except Exception:
+                continue  # reported when its turn comes
+            if not is_stream_url(video):
+                continue
+            try:
+                base = self._output_basename(vmeta_path, title, output_path)
+                ingest = StreamIngest(video, output_path, base, _read_json(cfg_path))
+                self._stream_ingests[key] = ingest.start()
+            except Exception:
+                logging.exception("Could not start receiving %s", redact_url(video))
+
+    def _close_streams(self) -> None:
+        for ingest in [self.stream, *self._stream_ingests.values()]:
+            if ingest is not None:
+                try:
+                    ingest.close()
+                except Exception:
+                    logging.warning("Stream cleanup failed", exc_info=True)
+        self._stream_ingests.clear()
+        self.stream = None
 
     @staticmethod
     def _resolve_pose_selection(config: dict) -> tuple[str, str]:
@@ -627,6 +715,7 @@ class ProcessingEngine:
         logging.debug(f"Received initialization message with {len(vmeta_paths)} vmeta files.")
 
         try:
+            self._prearm_streams(vmeta_paths, output_path)
             for vmeta_path in vmeta_paths:
                 if vmeta_path not in self.processed_vmetas:
                     logging.debug(f"Starting processing of {vmeta_path}...")
@@ -645,6 +734,10 @@ class ProcessingEngine:
             logging.error("Unable to process the received vmeta files. Printing stack trace...")
             logging.error(e, exc_info=True)
             return "error"
+        finally:
+            # Never leave a recorder listening after the request (errors,
+            # streams pre-armed but not reached).
+            self._close_streams()
 
     def __parse_messages(self, messages):
         all_keys = set()
@@ -671,11 +764,56 @@ class ProcessingEngine:
         config["role"] = role
         config["title"] = title
         config["vmeta_path"] = os.path.abspath(vmeta_path)
+        # Every artifact is named from the vmeta title, never the location.
+        config["output_basename"] = self._output_basename(vmeta_path, title, output_path)
+        self.stream = None
+        if is_stream_url(video_path):
+            return self.__load_stream(config, vmeta_path, video_path, output_path)
+        config["input_is_stream"] = False
         if self.force_transcode:
             video_path = transcode(video_path)
         fps = get_video_framerate(video_path)
         if fps is None:
             fps = 30
+        config["frame_rate"] = fps
+        config["frame_time"] = int((1 / fps) * 1000)
+        return config
+
+    def __load_stream(self, config, vmeta_path, url, output_path):
+        """Live-stream input: receive it and take fps/size from the stream.
+
+        The recorder is usually already running (pre-armed by
+        ``mt_initialize``). ``probe`` blocks until video arrives (up to
+        ``stream_connect_timeout_sec``) and measures the real frame rate from
+        the stream's metadata and timestamps — the config's ``frame_rate``
+        is only a fallback, because the stream's rate can differ from the
+        recording the room was set up with.
+        """
+        config["input_is_stream"] = True
+        config["stream_url"] = url
+        if self.force_transcode:
+            logging.warning("force_transcode does not apply to stream input; ignored.")
+        ingest = self._stream_ingests.pop(os.path.abspath(vmeta_path), None)
+        if ingest is None:
+            ingest = StreamIngest(url, output_path, config["output_basename"], config).start()
+        self.stream = ingest
+        try:
+            info = ingest.probe()
+        except StreamError as exc:
+            try:
+                with open(ingest.report_path, "w", encoding="utf-8") as fh:
+                    json.dump({**ingest.report(0), "error": str(exc)}, fh, indent=2)
+            except OSError:
+                pass
+            raise
+        fps = float(ingest.fps or config.get("frame_rate") or 30.0)
+        cfg_fps = config.get("frame_rate")
+        if cfg_fps and abs(float(cfg_fps) - fps) / fps > 0.01:
+            logging.warning(
+                "Stream frame rate %.3f differs from the config's frame_rate %.3f; "
+                "all frame/time conversions use the stream's rate.", fps, float(cfg_fps),
+            )
+        config["stream_info"] = info
         config["frame_rate"] = fps
         config["frame_time"] = int((1 / fps) * 1000)
         return config
@@ -784,14 +922,25 @@ class ProcessingEngine:
         needs_threat_clearance = "threat_clearance" in required_compute
         needs_room_coverage = "room_coverage" in required_compute
 
-        vs = cv2.VideoCapture(config["video_path"])
-        frame_total = count_video_frames(vs)
+        # Live stream (``__load_stream``): frames come from the CFR-normalized
+        # stream source and there is no known frame count. File: unchanged.
+        stream = self.stream if config.get("input_is_stream") else None
+        is_stream = stream is not None
+        vs = None
+        if is_stream:
+            frame_total = None
+        else:
+            vs = cv2.VideoCapture(config["video_path"])
+            frame_total = count_video_frames(vs)
 
         # The provided output_path IS this run's folder — every artifact (and the
         # RunInfo.json manifest below) is written flat into it. Point one run at one
         # folder; Compare scans the parent root for sibling run folders.
         self.output_directory = os.path.abspath(config["output_path"])
-        self.video_basename = os.path.splitext(os.path.basename(config["video_path"]))[0]
+        # Artifact names come from the vmeta title (see ``_output_basename``).
+        self.video_basename = config.get("output_basename") or safe_basename(
+            config.get("title") or os.path.splitext(os.path.basename(config["video_path"]))[0]
+        )
 
         role = config.get("role") or "trainee"
         title = config.get("title") or self.video_basename
@@ -836,6 +985,19 @@ class ProcessingEngine:
         # parallel path is exposed to; the drill end is then decided instantly
         # from the stored transcript when the first entry is detected.
         streaming_asr = bool(config.get("streaming_transcription", True))
+        if is_stream and not streaming_asr:
+            logging.warning(
+                "streaming_transcription=false (static audio prepass) needs the whole "
+                "audio before the frame loop, which a live stream cannot provide — "
+                "transcribing in parallel instead."
+            )
+            streaming_asr = True
+
+        def _audio_chunk_source():
+            if is_stream:
+                return stream.audio_source()
+            from .utils.audio_stream import FileAudioChunkSource
+            return FileAudioChunkSource(config["video_path"])
 
         def _transcribe_full_audio() -> None:
             """One-shot Parakeet transcription of the whole audio.
@@ -848,11 +1010,10 @@ class ProcessingEngine:
             """
             try:
                 from .utils.asr_session import build_session
-                from .utils.audio_stream import FileAudioChunkSource
                 session = build_session(config)
                 segments: List[Dict[str, Any]] = []
                 try:
-                    src = FileAudioChunkSource(config["video_path"])
+                    src = _audio_chunk_source()
                     buf: List[np.ndarray] = []
                     pos = 0.0
                     while True:
@@ -981,10 +1142,13 @@ class ProcessingEngine:
                         source_path=config["video_path"],
                         drill_start_frame=entry_frame,
                         fps=fps_cfg,
-                        frame_total=frame_total,
+                        # A stream's length is unknown: the window is
+                        # clamped to the processed frames after the loop.
+                        frame_total=frame_total if frame_total else STREAM_FRAME_SENTINEL,
                         config=config,
                         session=session,
                         denoise_session=denoise_session,
+                        audio_source=stream.audio_source() if is_stream else None,
                     )
                 finally:
                     session.close()
@@ -1036,22 +1200,35 @@ class ProcessingEngine:
             finally:
                 end_locator_done.set()
 
-        for frame_num in tqdm(range(1, frame_total + 1), desc="Processing frames", unit="frame"):
-            ret, frame = vs.read()
-            if not ret or frame is None:
-                break
+        # Frame source. A stream yields frames on a constant-frame-rate grid:
+        # frame N is always t = (N-1)/fps however the packets arrived, and a
+        # slot the network/encoder left empty is filled by repeating the last
+        # frame (``meta.duplicate``). The image is identical, so the stateless
+        # detector/pose result is reused instead of recomputed; the tracker
+        # still advances one step so its frame-based timing stays correct.
+        frame_iter = stream.frames() if is_stream else _file_frames(vs, frame_total)
+        last_instances: Optional[list] = None
+        loop_stop_reason: Optional[str] = None
+        stream_settings = stream.settings if is_stream else None
 
+        for frame_num, frame, frame_meta in tqdm(
+            frame_iter, total=frame_total, desc="Processing frames", unit="frame",
+        ):
             processed_frames += 1
 
-            infer_results = self.inferencer(
-                frame,
-                return_vis=False,
-                bbox_thr=self.box_conf_threshold,
-                kpt_thr=self.pose_conf_threshold,
-                pose_based_nms=True,
-            )
-            res = next(infer_results)
-            instances = res["predictions"][0]
+            if frame_meta is not None and frame_meta.duplicate and last_instances is not None:
+                instances = last_instances
+            else:
+                infer_results = self.inferencer(
+                    frame,
+                    return_vis=False,
+                    bbox_thr=self.box_conf_threshold,
+                    kpt_thr=self.pose_conf_threshold,
+                    pose_based_nms=True,
+                )
+                res = next(infer_results)
+                instances = res["predictions"][0]
+                last_instances = instances
 
             dets = []
             matched_keypoints = []
@@ -1271,6 +1448,7 @@ class ProcessingEngine:
                     frame_num - first_entry_frame_live, first_entry_frame_live,
                     max_after_entry,
                 )
+                loop_stop_reason = "max_frames_after_first_entry"
                 break
             if stop_at_end and end_locator_done.is_set():
                 _w = end_locator_result.get("window")
@@ -1280,10 +1458,81 @@ class ProcessingEngine:
                         "Stopping at frame %d: drill end identified at frame %d (%s).",
                         frame_num, int(_w.end_frame), _w.decision_reason,
                     )
+                    loop_stop_reason = "drill_end"
                     break
+            if stream_settings is not None:
+                # A live stream need not end on its own: cap the processed
+                # media time overall and after the first entry (no "room
+                # clear" ever confirmed). Both are generous safety nets.
+                media_sec = frame_num / fps_cfg
+                if media_sec >= stream_settings.max_duration_sec:
+                    logging.warning("Stream processing cap reached (%.0fs); stopping.", media_sec)
+                    loop_stop_reason = "max_duration"
+                    break
+                if (first_entry_frame_live is not None
+                        and (frame_num - first_entry_frame_live) / fps_cfg
+                        >= stream_settings.max_after_entry_sec):
+                    _w = end_locator_result.get("window")
+                    if _w is None or _w.end_uncertain:
+                        logging.warning(
+                            "No drill end within %.0fs of the first entry; stopping.",
+                            stream_settings.max_after_entry_sec,
+                        )
+                        loop_stop_reason = "max_after_entry"
+                        break
 
-        vs.release()
+        if vs is not None:
+            vs.release()
         self._release_inferencer()
+
+        stream_report: Optional[Dict[str, Any]] = None
+        if is_stream:
+            # Done with the live input: stop receiving (the drill-end
+            # locator, if still reading, then sees the end of the audio),
+            # write {base}.mp4 — the processed frames on their CFR clock plus
+            # the stream audio on the same clock — and switch every
+            # post-processing consumer (overlays, audio mux, viewer) to it.
+            try:
+                frame_iter.close()
+            except Exception:
+                pass
+            stream.request_stop(loop_stop_reason or "stream_ended")
+            if end_locator_thread is not None:
+                end_locator_thread.join()
+            stream_report = stream.finalize(processed_frames)
+            final_video = (stream_report.get("artifacts") or {}).get("video")
+            config["video_path"] = final_video or ""
+            if not final_video:
+                logging.error("The stream recording could not be written; camera-view "
+                              "overlays and audio will be skipped.")
+            logging.info(
+                "Stream processed: %d frames @ %.3f fps (%d repeated for gaps, %d dropped); "
+                "stop: %s.", processed_frames, fps_cfg,
+                stream_report["video"].get("frames_duplicated", 0),
+                stream_report["video"].get("frames_dropped", 0),
+                stream_report.get("stop_reason"),
+            )
+
+        if loop_stop_reason == "drill_end":
+            # The loop stops at the drill end only once "room clear" is
+            # confirmed, so a late confirmation (transcription slower than the
+            # frame loop: busy CPU, fast GPU, a 30 fps source) leaves frames
+            # processed past the end. They are not part of the drill; keeping
+            # them would let post-drill footage pick the entrants (longest
+            # tracked) and make results depend on processing speed. Drop them,
+            # exactly as if the loop had stopped on the end frame.
+            _w = end_locator_result.get("window")
+            _end = int(_w.end_frame) if _w is not None else processed_frames
+            if processed_frames > _end:
+                logging.info("Discarding %d frame(s) processed past the drill end (frame %d).",
+                             processed_frames - _end, _end)
+                tracker_output = [e for e in tracker_output if int(e["frame"]) <= _end]
+                all_frames = all_frames[:_end]
+                all_map_points = [p for p in all_map_points if int(p[0]) <= _end]
+                gaze_info = {k: v for k, v in gaze_info.items() if int(k[0]) <= _end}
+                tracks_by_id = {tid: traj[:_end] for tid, traj in tracks_by_id.items()
+                                if any(p is not None for p in traj[:_end])}
+                processed_frames = _end
 
         inroom_ids = self._resolve_inroom_ids(tracker_output, config)
         entry_ids = self._resolve_entry_ids(tracker_output)
@@ -1347,6 +1596,17 @@ class ProcessingEngine:
                 start_time_sec=0.0,
                 end_time_sec=processed_frames / fps if fps > 0 else None,
             )
+
+        if drill_window.end_frame > processed_frames:
+            # The window cannot extend past the last frame analyzed. A stream's
+            # locator runs with an unbounded frame count; a file's container
+            # frame count can include frames its edit list discards (GoPro
+            # MP4s: 4-48 leading frames), which never decode.
+            drill_window.end_frame = max(int(drill_window.start_frame), int(processed_frames))
+            drill_window.end_time_sec = drill_window.end_frame / fps if fps > 0 else None
+            if not drill_window.end_uncertain:
+                drill_window.decision_reason += (
+                    "; clamped_to_stream_end" if is_stream else "; clamped_to_last_frame")
 
         save_drill_window_sidecar(
             drill_window,
@@ -1432,6 +1692,7 @@ class ProcessingEngine:
 
         preserve_audio_enabled = (
             bool(config.get("preserve_audio", True))
+            and bool(config.get("video_path"))
             and has_audio_stream(config["video_path"])
         )
 
@@ -1535,6 +1796,10 @@ class ProcessingEngine:
             )
             camera_overlay_keys.append("annotate_camera_tracking_with_clearance")
 
+        if camera_overlay_specs and not (config.get("video_path") and os.path.isfile(config["video_path"])):
+            logging.error("No readable source video for camera overlays (%s); skipped.",
+                          config.get("video_path"))
+            camera_overlay_specs = []
         if camera_overlay_specs:
             annotate_camera_videos_combined(
                 tracker_output,
@@ -1628,12 +1893,54 @@ class ProcessingEngine:
         # Persist the runtime fps (read from the actual video) so offline
         # comparisons against this session's caches can recover the same
         # value rather than trusting the map JSON, which can drift.
+        source_info: Dict[str, Any] = {"type": "file"}
+        if is_stream and stream_report is not None:
+            sv = stream_report.get("video") or {}
+            # Stream gaps inside the drill window: those frames are repeats of
+            # the last received frame, so the analysis there rests on held, not
+            # observed, video. Surfaced so a reviewer can weigh the scores.
+            drill_gaps: List[Dict[str, Any]] = []
+            norm = getattr(stream.video, "normalizer", None)
+            for g in (norm.gaps if norm is not None else []):
+                g_lo = int(g["start_frame"])
+                g_hi = g_lo + int(g["frames"]) - 1
+                lo, hi = max(g_lo, drill_start_frame), min(g_hi, drill_end_frame)
+                if hi >= lo:
+                    drill_gaps.append({"start_frame": lo, "frames": hi - lo + 1,
+                                       "sec": round((hi - lo + 1) / fps, 3) if fps > 0 else None})
+            drill_repeated = sum(g["frames"] for g in drill_gaps)
+            if drill_repeated:
+                logging.warning(
+                    "Stream gaps inside the drill window: %d repeated frames (%.2fs) in %d gap(s); "
+                    "scores there rest on held frames.", drill_repeated,
+                    drill_repeated / fps if fps > 0 else 0.0, len(drill_gaps),
+                )
+            source_info = {
+                "type": "stream",
+                "url": redact_url(config.get("stream_url")),
+                "fps_source": sv.get("fps_source"),
+                "metadata_fps": sv.get("metadata_fps"),
+                "measured_fps": sv.get("measured_fps"),
+                "source_size": sv.get("source_size"),
+                "frames_duplicated": sv.get("frames_duplicated"),
+                "frames_dropped": sv.get("frames_dropped"),
+                "gap_count": sv.get("gap_count"),
+                "timestamp_outliers": sv.get("timestamp_outliers"),
+                "drill_window_repeated_frames": drill_repeated,
+                "drill_window_repeated_sec": round(drill_repeated / fps, 3) if fps > 0 else None,
+                "drill_window_gaps": drill_gaps[:100],
+                "stop_reason": stream_report.get("stop_reason"),
+                "audio_present": (stream_report.get("audio") or {}).get("present"),
+                "report": stream.report_path,
+                "capture": (stream_report.get("artifacts") or {}).get("capture"),
+            }
         try:
             save_run_metadata(
                 self.output_directory,
                 self.video_basename,
                 fps=float(config.get("frame_rate") or 0.0),
                 video_path=config.get("video_path"),
+                extra={"source": source_info},
             )
         except Exception:
             logging.warning("Failed to write run-metadata sidecar.", exc_info=True)
@@ -1852,9 +2159,10 @@ class ProcessingEngine:
             f"{self.video_basename}_GazeCache.txt",
         )
         empty_map_path = os.path.join(self.output_directory, "EmptyMap.png")
+        # The file save_metrics_cache actually writes.
         metrics_cache_path = os.path.join(
             self.output_directory,
-            f"{self.video_basename}_MetricsCache.txt",
+            f"{self.video_basename}_Metrics.csv",
         )
         analysis_json_path = os.path.join(
             self.output_directory,
@@ -1895,12 +2203,16 @@ class ProcessingEngine:
                 ),
                 pod_sectors_path=pod_sectors_path,
                 pod_camera_path=pod_camera_path,
+                source_info=source_info,
             )
             # v2 artifacts shape: flat path under the data section (matches
             # the viewer's ArtifactsBlock mirror).
-            analysis_session.setdefault("artifacts", {}).setdefault("data", {})[
-                "metrics_cache"
-            ] = metrics_cache_path
+            data_artifacts = analysis_session.setdefault("artifacts", {}).setdefault("data", {})
+            data_artifacts["metrics_cache"] = metrics_cache_path
+            if is_stream:
+                data_artifacts["stream_report"] = stream.report_path
+                if source_info.get("capture"):
+                    data_artifacts["stream_capture"] = source_info["capture"]
 
             with open(analysis_json_path, "w") as f:
                 json.dump(analysis_session, f, indent=4)
@@ -1908,6 +2220,8 @@ class ProcessingEngine:
         except Exception:
             logging.error("Failed to build or save analysis session JSON.", exc_info=True)
 
+        if is_stream:
+            self.stream = None  # finalized; nothing left running
         return metric_scores
 
     def get_assessment(self, timestamp, metric_name):

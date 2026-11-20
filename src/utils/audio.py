@@ -12,7 +12,6 @@ import os
 import shutil
 import subprocess
 import sys
-import threading
 from typing import Optional
 
 
@@ -97,6 +96,25 @@ def probe_audio_duration_sec(video_path: str) -> Optional[float]:
     return None
 
 
+def probe_video_duration_sec(video_path: str) -> Optional[float]:
+    """Duration (seconds) of ``video_path``'s first video stream, or None."""
+    if not video_path or not os.path.exists(video_path):
+        return None
+    ffprobe = _find_binary("ffprobe")
+    if ffprobe is None:
+        return None
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=duration", "-of", "csv=p=0", video_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        val = float((result.stdout or "").strip().splitlines()[0])
+        return val if val > 0 else None
+    except (subprocess.TimeoutExpired, OSError, ValueError, IndexError):
+        return None
+
+
 def mux_audio_from_source(
     silent_video: str,
     audio_source: str,
@@ -112,6 +130,12 @@ def mux_audio_from_source(
     is sliced to that range using ffmpeg's ``-ss`` / ``-to`` (input-side) and
     re-encoded to AAC (stream-copy doesn't survive sub-second seeks). When no
     slice is requested both streams are stream-copied as before.
+
+    The output always keeps every video frame: its length is the silent
+    video's duration (``-t``), and a re-encoded audio slice that ends a few
+    milliseconds early (AAC frame alignment) is padded with silence
+    (``apad``). ``-shortest`` would instead cut the last video frames off at
+    the audio's end, so an overlay would no longer cover the whole window.
 
     Returns True on success, False on any failure. Never raises.
     """
@@ -130,11 +154,17 @@ def mux_audio_from_source(
     if audio_end_sec is not None and audio_end_sec > 0:
         cmd += ["-to", f"{float(audio_end_sec):.3f}"]
     cmd += ["-i", audio_source, "-map", "0:v", "-map", "1:a:0", "-c:v", "copy"]
+    video_sec = probe_video_duration_sec(silent_video)
     if slicing:
         cmd += ["-c:a", "aac", "-b:a", "192k"]
+        if video_sec:
+            cmd += ["-af", "apad"]
     else:
         cmd += ["-c:a", "copy"]
-    cmd += ["-shortest", output_path]
+    if video_sec:
+        cmd += ["-t", f"{video_sec:.6f}", output_path]
+    else:
+        cmd += ["-shortest", output_path]
 
     try:
         result = subprocess.run(

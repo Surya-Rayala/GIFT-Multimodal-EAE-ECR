@@ -16,6 +16,7 @@ Python integration engine for processing session videos using metadata in a `.vm
 - [Config file](#config-file-spaceenvironment-metadata)
 - [Running the engine](#running-the-engine-backend)
 - [Running locally](#running-the-local-engine-without-gift)
+- [Live stream input (MPEG-TS over UDP, GoPro, …)](STREAMING.md)
 - [POD establishment & orientation metrics](#pod-establishment--orientation-metrics)
 
 ## Requirements
@@ -495,6 +496,8 @@ The Input Folder must contain:
 
 The Output Folder is where generated outputs are written (videos, logs, metrics, and any other artifacts produced by the pipeline).
 
+Every artifact is named from the vmeta **title** — `{title}_Analysis.json`, `{title}_Tracking_Overlays.mp4`, `{title}_Metrics.csv`, … — never from the video's file name or URL. The title is made filesystem-safe first (path separators and characters Windows forbids become `_`, whitespace becomes `_`; e.g. `Iguana Run 3: A/B` → `Iguana_Run_3_A_B`). If two vmetas in one request share a title and output folder, the second gets `_2`, and so on. Without a title the video's file stem is used (for a stream, the vmeta file name minus GIFT's `stream-` prefix).
+
 ### `.vmeta.xml` format
 
 The engine is driven by a **Vmeta** file (`.vmeta.xml`). This XML contains metadata about a single session/video and points the engine to:
@@ -537,8 +540,8 @@ Below is a minimal example:
 #### Fields
 
 - `<technical><location>...` 
-  - Relative (or absolute) path to the input video.
-  - This must match the on-disk video filename. If you move/rename a video, update this path.
+  - Relative (or absolute) path to the input video, **or a live stream URL** — e.g. GIFT's `udp://127.0.0.1:1234?pkt_size=1316`, a GoPro feed on another address/port, `rtsp://…`, `srt://…`. Any `scheme:` location other than `file:` is detected as a stream (Windows drive paths like `C:\…` are not), used as-is (never joined onto the course folder), and received live — see [STREAMING.md](STREAMING.md).
+  - For a file: this must match the on-disk video filename. If you move/rename a video, update this path.
 
 - `<general><identifier><catalog>start_time</catalog><entry>...` 
   - Session start time as a Unix epoch timestamp in **milliseconds**.
@@ -547,7 +550,7 @@ Below is a minimal example:
   - Time offset (in milliseconds) applied relative to `start_time` (often `0`).
 
 - `<general><identifier><catalog>title</catalog><entry>...` 
-  - A human-readable session title used for labeling outputs.
+  - A human-readable session title. It labels the run and is the file-name prefix of every artifact (see [Output Folder](#output-folder)).
 
 - `<general><identifier><catalog>space_metadata_file</catalog><entry>...` 
   - Name/path of the config file that provides spatial/environment metadata used by the pipeline.

@@ -48,6 +48,16 @@ drill end** rather than transcribing the whole tail. If `stop_at_drill_end`
 confirmed "room clear", the detector reports `end_uncertain` and the pipeline
 runs to the last available frame — never crashes.
 
+**Live stream input** (vmeta location is a `udp://…` / `rtsp://…` URL — see
+[STREAMING.md](STREAMING.md)): the `AudioChunkSource` is the stream's audio
+timeline instead of an ffmpeg file reader. Audio is split from the same
+MPEG-TS as the video and placed on the video clock (t = 0 is frame 1; gaps
+become silence). `read()` blocks until the requested window has arrived and
+returns `None` once the stream has ended. Everything downstream (detector,
+LocalAgreement, frame math, sidecars) is unchanged. `streaming_transcription:
+false` is overridden for streams, because the whole audio isn't available up
+front.
+
 ## Optional denoise
 
 `enable_denoise` runs Facebook Denoiser (`dns48`) before ASR via

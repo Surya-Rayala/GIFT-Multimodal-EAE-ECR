@@ -5,10 +5,18 @@ import numpy as np
 from shapely.geometry import Polygon
 import cv2
 
+from .media_source import file_url_to_path, is_stream_url, vmeta_stem
 from .paths import resolve_all_config_paths
 
 
 def load_vmeta(path):
+    """Parse a ``.vmeta.xml`` → ``(cfg_file, video, start_time, role, title)``.
+
+    ``video`` is either a file path (resolved against the vmeta's folder) or,
+    when ``technical/location`` holds a stream URL (``udp://…``, ``rtsp://…``
+    — see :func:`src.utils.media_source.is_stream_url`), the URL itself,
+    untouched: a URL must never be joined onto the course folder.
+    """
     ns = "{http://ltsc.ieee.org/xsd/LOM}"
     tree = ElementTree.parse(path)
     root = tree.getroot()
@@ -20,7 +28,12 @@ def load_vmeta(path):
     location = technical.find("{}location".format(ns))
     if location is None:
         raise SyntaxError("Missing location attribute in technical field of vmeta file.")
-    video_file = location.text
+    video_file = (location.text or "").strip()
+    if not video_file:
+        raise SyntaxError("Empty location in technical field of vmeta file.")
+    is_stream = is_stream_url(video_file)
+    if not is_stream:
+        video_file = file_url_to_path(video_file)
 
     # Find room cfg file and start time
     general = root.find("{}general".format(ns))
@@ -55,12 +68,17 @@ def load_vmeta(path):
         )
 
     if not title:
-        title = os.path.splitext(os.path.basename(video_file))[0]
+        # Outputs are named from the title. Without one, a file keeps its
+        # video stem; a stream URL has no meaningful stem, so use the vmeta
+        # file name instead (minus GIFT's ``stream-`` copy prefix).
+        title = (vmeta_stem(path) if is_stream
+                 else os.path.splitext(os.path.basename(video_file))[0])
 
     # Format full paths based on vmeta path
     dir_name = os.path.dirname(path)
     cfg_file = os.path.join(dir_name, cfg_file)
-    video_file = os.path.join(dir_name, video_file)
+    if not is_stream:
+        video_file = os.path.join(dir_name, video_file)
     return cfg_file, video_file, int(start_time), role, title
 
 def load_config(path):

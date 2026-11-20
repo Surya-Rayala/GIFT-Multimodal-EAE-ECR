@@ -378,9 +378,14 @@ def build_analysis_session(
     pod_orientation: Optional[Dict[str, Any]] = None,
     pod_sectors_path: Optional[str] = None,
     pod_camera_path: Optional[str] = None,
+    source_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Build the analysis-session payload (schema v2.0, metric-centric).
+
+    ``source_info`` (optional) describes where the video came from —
+    ``{"type": "file"}`` or a live stream's summary (URL, fps source, gaps
+    repaired …) — and is stored as ``video.source``.
 
     Internally this still computes entrance-only data (the only phase the engine
     emits today), but the output shape replaces the legacy ``phases[]`` block
@@ -1059,6 +1064,7 @@ def build_analysis_session(
             "frame_rate": float(frame_rate),
             "total_frames": int(total_frames or 0),
             "duration_sec": _safe_float(duration_sec),
+            **({"source": dict(source_info)} if source_info else {}),
         },
         "timeline": {
             "items": timeline_items,
