@@ -6,10 +6,15 @@ on only the actual drill segment rather than the full source video.
 
 * Drill start  : the first tracker frame where any track has
                  ``is_entry=True`` or ``birth_location == "entry"``.
-* Drill end    : the latest transcript segment (after drill_start) whose
-                 normalized text contains every word listed in
-                 ``drill_window_required_words`` (default ``"room,clear"``).
-                 Words may appear in any order with filler between them.
+* Drill end    : the clearance call: a transcript segment in which every
+                 word listed in ``drill_window_required_words`` (default
+                 ``"room,clear"``) is spoken after the drill start, in any
+                 order, with filler between them. The window ends at the
+                 word that completes the call (plus a grace tail), taken
+                 from the ASR's word timestamps — not at the segment's end.
+                 Segment boundaries follow the ASR's punctuation, which
+                 changes with tiny audio differences (it can merge the call
+                 with seconds of later chatter); word times do not.
                  A small mean-alignment-confidence gate filters out
                  obvious cross-room ghosts; if the gate eliminates every
                  candidate we fall back to the latest qualifying segment
@@ -34,14 +39,17 @@ import logging
 import os
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
 
-GRACE_TAIL_SEC = 0.5            # extra audio kept after the matched segment
+GRACE_TAIL_SEC = 0.5            # extra time kept after the clearance call
 DEFAULT_REQUIRED_WORDS = "room,clear"
 DEFAULT_MIN_ALIGN_SCORE = 0.4   # lenient — mostly trust the word-presence rule
+# Streaming confirmation: the same call in two consecutive passes may move by
+# an ASR step or two as the right-context grows.
+CONFIRM_TOLERANCE_SEC = 0.5
 
 # Punctuation stripping: keep apostrophes inside words (e.g. "don't") but
 # drop everything else. ASR output includes punctuation glued to tokens.
@@ -59,6 +67,9 @@ class DrillWindow:
     required_words: List[str] = field(default_factory=list)
     start_time_sec: Optional[float] = None
     end_time_sec: Optional[float] = None
+    # The word that completed the clearance call: {"word", "start_sec",
+    # "end_sec"}; ``word`` is None when the segment had no word timing.
+    end_anchor: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -75,6 +86,43 @@ def _tokenize(text: str) -> List[str]:
         return []
     cleaned = _PUNCT_RE.sub(" ", text.lower())
     return cleaned.split()
+
+
+def _match_tokens(text: str) -> Set[str]:
+    """Tokens for required-word matching: a possessive/contracted form also
+    counts as its base word ("room's clear" → room)."""
+    toks = _tokenize(text)
+    return set(toks) | {t[:-2] for t in toks if t.endswith("'s") and len(t) > 2}
+
+
+def _clearance_call(
+    seg: Dict[str, Any], drill_start_sec: float, required_set: Set[str]
+) -> Optional[Dict[str, Any]]:
+    """Where in ``seg`` the clearance call is completed, or None.
+
+    Walks the segment's words spoken at/after the drill start and returns the
+    word at which every required word has been heard. The window is anchored
+    on that word's timestamps: the ASR's word times are stable, while its
+    segment boundaries follow its punctuation and can swallow seconds of
+    unrelated speech. Without usable word timing the whole segment stands in
+    for the call (the segment must then start at/after the drill start).
+    """
+    words = [w for w in seg.get("words") or []
+             if isinstance(w.get("start"), (int, float)) and isinstance(w.get("end"), (int, float))]
+    seen: Set[str] = set()
+    for w in words:
+        if float(w["start"]) < drill_start_sec:
+            continue
+        seen |= _match_tokens(w.get("word", "")) & required_set
+        if required_set <= seen:
+            return {"word": w.get("word"), "start_sec": float(w["start"]), "end_sec": float(w["end"])}
+    seg_start, seg_end = seg.get("start"), seg.get("end")
+    if not isinstance(seg_start, (int, float)) or seg_start < drill_start_sec:
+        return None
+    if not required_set <= _match_tokens(seg.get("text", "")):
+        return None
+    end = float(seg_end) if isinstance(seg_end, (int, float)) else float(seg_start)
+    return {"word": None, "start_sec": float(seg_start), "end_sec": end}
 
 
 def _mean_align_score(words: Optional[List[Dict[str, Any]]]) -> Optional[float]:
@@ -112,42 +160,41 @@ def _load_transcription(path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _candidate_summary(seg: Dict[str, Any], required: List[str]) -> Dict[str, Any]:
+def _candidate_summary(cand: Tuple[Dict[str, Any], Dict[str, Any]], required: List[str]) -> Dict[str, Any]:
+    seg, call = cand
     return {
         "id": seg.get("id"),
         "start_sec": seg.get("start"),
         "end_sec": seg.get("end"),
         "text": seg.get("text"),
         "mean_align_score": _mean_align_score(seg.get("words")),
-        "matched_words": [w for w in required if w in set(_tokenize(seg.get("text", "")))],
+        "matched_words": [w for w in required if w in _match_tokens(seg.get("text", ""))],
+        "call_end_sec": call["end_sec"],
     }
 
 
 # ---------------------------------------------------------------------------
 # Shared scan/select core — used by both the batch ``compute_drill_window``
 # and the streaming ``DrillEndDetector`` so there is exactly one rule
-# implementation. A "candidate" is a segment that starts at/after the drill
-# start and whose normalized text contains every required word.
+# implementation. A "candidate" is a segment in which every required word is
+# spoken at/after the drill start, paired with where that call completes.
 # ---------------------------------------------------------------------------
 def _qualifying_candidates(
     segments: List[Dict[str, Any]],
     drill_start_sec: float,
-    required_set: set,
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
+    required_set: Set[str],
+) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    out: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for seg in segments:
-        seg_start = seg.get("start")
-        if not isinstance(seg_start, (int, float)):
-            continue
-        if seg_start < drill_start_sec:
-            continue
-        if required_set.issubset(set(_tokenize(seg.get("text", "")))):
-            out.append(seg)
+        call = _clearance_call(seg, drill_start_sec, required_set)
+        if call is not None:
+            out.append((seg, call))
+    out.sort(key=lambda c: c[1]["end_sec"])
     return out
 
 
 def _select_candidate(
-    candidates: List[Dict[str, Any]],
+    candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]],
     min_score: float,
     *,
     prefer: str = "latest",
@@ -160,7 +207,7 @@ def _select_candidate(
     The gate is lenient: a ``None`` mean score (no per-word scores — e.g. the
     Parakeet path) still passes, so word-presence remains the primary rule.
     """
-    scored = [(c, _mean_align_score(c.get("words"))) for c in candidates]
+    scored = [(c, _mean_align_score(c[0].get("words"))) for c in candidates]
     passing = [c for (c, s) in scored if s is None or s >= min_score]
     if passing:
         chosen = passing[0] if prefer == "first" else passing[-1]
@@ -172,7 +219,7 @@ def _select_candidate(
 
 
 def _window_from_candidate(
-    chosen: Dict[str, Any],
+    chosen: Tuple[Dict[str, Any], Dict[str, Any]],
     *,
     reason: str,
     drill_start_frame: int,
@@ -183,10 +230,8 @@ def _window_from_candidate(
     candidate_summaries: List[Dict[str, Any]],
     required: List[str],
 ) -> DrillWindow:
-    seg_end_sec = chosen.get("end")
-    if not isinstance(seg_end_sec, (int, float)):
-        seg_end_sec = chosen.get("start", drill_start_sec)
-    end_sec = float(seg_end_sec) + max(0.0, grace_tail)
+    seg, call = chosen
+    end_sec = call["end_sec"] + max(0.0, grace_tail)
     end_frame = int(round(end_sec * fps))
     end_frame = max(drill_start_frame, min(total_frames, end_frame))
     return DrillWindow(
@@ -195,16 +240,17 @@ def _window_from_candidate(
         end_uncertain=False,
         decision_reason=reason,
         matched_segment={
-            "id": chosen.get("id"),
-            "start_sec": chosen.get("start"),
-            "end_sec": chosen.get("end"),
-            "text": chosen.get("text"),
-            "mean_align_score": _mean_align_score(chosen.get("words")),
+            "id": seg.get("id"),
+            "start_sec": seg.get("start"),
+            "end_sec": seg.get("end"),
+            "text": seg.get("text"),
+            "mean_align_score": _mean_align_score(seg.get("words")),
         },
         candidates=candidate_summaries,
         required_words=required,
         start_time_sec=drill_start_sec,
         end_time_sec=end_frame / fps if fps > 0 else None,
+        end_anchor=dict(call),
     )
 
 
@@ -329,11 +375,11 @@ class DrillEndDetector:
         self.min_score = float(config.get("drill_window_min_align_score", DEFAULT_MIN_ALIGN_SCORE))
         self.grace_tail = float(config.get("drill_window_grace_tail_sec", GRACE_TAIL_SEC))
         # Latest full-transcript pass (each pass supersedes the previous —
-        # the worker re-transcribes the growing buffer), plus the set of
-        # qualifying-candidate keys seen in the previous pass (for the
-        # two-consecutive-pass confirmation).
+        # the worker re-transcribes the growing buffer), plus the call times
+        # seen in the previous pass (for the two-consecutive-pass
+        # confirmation).
         self._segments: List[Dict[str, Any]] = []
-        self._prev_keys: set = set()
+        self._prev_calls: List[float] = []
 
     @property
     def has_pending(self) -> bool:
@@ -344,27 +390,27 @@ class DrillEndDetector:
         far past the true end we transcribe while still getting the extra
         right-context LocalAgreement needs.
         """
-        return bool(self._prev_keys)
-
-    @staticmethod
-    def _key(seg: Dict[str, Any]) -> float:
-        # 0.5 s bins tolerate the small start-time drift between passes.
-        return round(float(seg.get("start", 0.0)) * 2.0) / 2.0
+        return bool(self._prev_calls)
 
     def update(self, segments: List[Dict[str, Any]]) -> Optional[DrillWindow]:
-        """Feed the current pass's full segment list; return a window if fired."""
+        """Feed the current pass's full segment list; return a window if fired.
+
+        A call is confirmed when the previous pass heard it too, at the same
+        time within ``CONFIRM_TOLERANCE_SEC``. Calls are matched by when the
+        call was completed, not by segment: between passes the ASR may
+        re-punctuate and merge or split the surrounding segments.
+        """
         self._segments = list(segments or [])
         candidates = _qualifying_candidates(
             self._segments, self.drill_start_sec, self.required_set
         )
-        cur_keys = {self._key(c) for c in candidates}
-        confirmed = cur_keys & self._prev_keys
-        self._prev_keys = cur_keys
+        prev, self._prev_calls = self._prev_calls, [c[1]["end_sec"] for c in candidates]
+        confirmed = [c for c in candidates
+                     if any(abs(c[1]["end_sec"] - p) <= CONFIRM_TOLERANCE_SEC for p in prev)]
         if not confirmed:
             return None
         # Earliest confirmed qualifier that also passes the (lenient) gate.
-        confirmed_cands = [c for c in candidates if self._key(c) in confirmed]
-        chosen, reason = _select_candidate(confirmed_cands, self.min_score, prefer="first")
+        chosen, reason = _select_candidate(confirmed, self.min_score, prefer="first")
         return self._build(chosen, reason.replace("selected_", "streaming_confirmed_"))
 
     def finalize(self) -> DrillWindow:
@@ -386,7 +432,7 @@ class DrillEndDetector:
         chosen, reason = _select_candidate(candidates, self.min_score, prefer="latest")
         return self._build(chosen, reason)
 
-    def _build(self, chosen: Dict[str, Any], reason: str) -> DrillWindow:
+    def _build(self, chosen: Tuple[Dict[str, Any], Dict[str, Any]], reason: str) -> DrillWindow:
         candidates = _qualifying_candidates(
             self._segments, self.drill_start_sec, self.required_set
         )

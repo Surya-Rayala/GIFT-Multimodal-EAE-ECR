@@ -28,13 +28,21 @@ and re-transcribes it each step. It **stops ~one confirmation chunk past the
 drill end** rather than transcribing the whole tail. If `stop_at_drill_end`
 (default), the video frame loop also stops at the located end frame.
 
-**Drill-end rule** (`DrillEndDetector` in `src/utils/drill_window.py`): fire on
-the **first** transcript segment at/after the drill start that contains every
-required word (`drill_window_required_words`, default `room,clear`), confirmed
-by **two consecutive passes** (LocalAgreement-2) so a transient mis-hearing of
-"clear" cannot end the drill early. The end is the **segment (sentence)
-boundary** so the trimmed audio ends at a natural pause, not mid-word. The same
-scan/select core also serves the offline `compute_drill_window`.
+**Drill-end rule** (`DrillEndDetector` in `src/utils/drill_window.py`):
+* Fire on the **first** transcript segment in which every required word
+  (`drill_window_required_words`, default `room,clear`; "room's" counts as "room") is
+  spoken after the drill start.
+* Require **two consecutive passes** to hear the call at the same time (±0.5 s,
+  LocalAgreement-2), so a transient mis-hearing of "clear" cannot end the drill early.
+* End the drill at the **word that completes the call** plus the grace tail, using the
+  ASR's word timestamps. It used to end at the segment (sentence) end.
+  * Why: Parakeet draws segments by punctuation, and that changes with tiny audio
+    differences. One extra comma merged the call with 6 s of later chatter and moved the
+    drill end, and with it the wall score.
+  * Word times stay put across encodings, re-segmentation and streaming passes.
+  * Trade-off: trimmed drill clips now end 0.5 s after "clear", which can be mid-sentence.
+* Segments without word timing fall back to the segment end.
+* The same scan/select core also serves the offline `compute_drill_window`.
 
 **Cut-robustness:** if the audio ends (or a live conversation is cut) before a
 confirmed "room clear", the detector reports `end_uncertain` and the pipeline
@@ -71,7 +79,7 @@ audio through — the pipeline never breaks.
 | `asr_stream_confirm_sec` | 3.0 | Shorter chunk to confirm a tentative end |
 | `drill_window_required_words` | `room,clear` | Phrase that marks the drill end |
 | `drill_window_min_align_score` | 0.4 | Lenient word-confidence gate |
-| `drill_window_grace_tail_sec` | 0.5 | Padding after the matched segment |
+| `drill_window_grace_tail_sec` | 0.5 | Padding after the word that completes the call |
 | `enable_denoise` | false | FB Denoiser pre-pass |
 
 ## Artifacts
@@ -79,5 +87,6 @@ audio through — the pipeline never breaks.
 `{basename}_Transcription.json` — schema in `src/utils/transcription.py`:
 `{schema_version, source_video_basename, language, model, aligned,
 audio_window, denoise, segments:[{id, start, end, text, words:[{word, start,
-end, score}]}]}`. `{basename}_DrillWindow.json` — the resolved window and the
-matched segment. `{basename}_denoised.wav` when denoise is on.
+end, score}]}]}`. `{basename}_DrillWindow.json` — the resolved window, the
+matched segment, and `end_anchor` (the word that ended the drill, with its
+times). `{basename}_denoised.wav` when denoise is on.
