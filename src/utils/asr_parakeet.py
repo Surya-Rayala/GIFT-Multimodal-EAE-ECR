@@ -35,6 +35,12 @@ class ParakeetSession(TranscriptionSession):
         self._model = None
 
     def load(self) -> None:
+        # NeMo logs ~50 INFO/WARNING lines while importing and restoring the
+        # model (training/validation config dumps, CUDA notes) that would land
+        # in the run's progress output; keep only NeMo's errors.
+        from nemo.utils import logging as nemo_logging
+        nemo_logging.setLevel(logging.ERROR)
+        logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
         import nemo.collections.asr as nemo_asr
         self._model = nemo_asr.models.ASRModel.from_pretrained(self.model_name)
         self._model.eval()

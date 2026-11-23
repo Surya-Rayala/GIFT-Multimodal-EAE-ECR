@@ -1454,7 +1454,12 @@ class StreamIngest:
         self.video_path = os.path.join(self.output_dir, f"{basename}.mp4")
         self._video_tmp = os.path.join(self.output_dir, f"{basename}_stream_video.tmp.mp4")
         self._audio_tmp = os.path.join(self.output_dir, f"{basename}_stream_audio.tmp.wav")
-        for stale in (self._video_tmp, self._audio_tmp):
+        # A previous session's files in the same folder must go before the
+        # recorder starts: a leftover capture would look like data already
+        # arriving (and be read as this stream), and its size would mask the
+        # new capture's growth from the idle check.
+        for stale in (self.capture_path, self.report_path, self.video_path,
+                      self._video_tmp, self._audio_tmp):
             try:
                 os.remove(stale)
             except OSError:

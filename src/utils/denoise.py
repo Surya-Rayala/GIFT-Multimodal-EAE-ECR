@@ -60,6 +60,10 @@ class DenoiseSession:
             self._ok = False
             return False
 
+    def load(self) -> bool:
+        """Load the model now instead of on the first chunk."""
+        return self._ensure()
+
     def feed(self, samples):
         """Denoise one forward chunk (float32 mono 16 kHz) → float32 mono."""
         import numpy as np

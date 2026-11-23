@@ -1138,7 +1138,6 @@ def save_pod_camera_frame(overlay_video: str, out_path: str, pod_frame: int,
     cv2.putText(cam, label, (16, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 6)
     cv2.putText(cam, label, (16, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
     cv2.imwrite(out_path, cam)
-    print(f"[orientation] wrote {out_path}")
     return out_path
 
 
@@ -1373,11 +1372,13 @@ def run_replay(run_folder: str, sector_angle: Optional[float] = None,
         # identification and orientation against the map-view artifacts.
         overlay_video = pick_latest(run_folder, f"{base}_Tracking_Overlays.mp4")
         if overlay_video:
-            save_pod_camera_frame(
+            cam_path = save_pod_camera_frame(
                 overlay_video,
                 os.path.join(run_folder, f"{base}_POD_CameraFrame.png"),
                 pod_frame, drill_start, data["pod_sec"],
             )
+            if cam_path:
+                print(f"[orientation] wrote {cam_path}")
     print(f"[orientation] wrote {cache_path}")
     print(f"[orientation] wrote {json_path}")
     print(f"[orientation] wrote {video_path}")

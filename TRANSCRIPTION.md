@@ -21,42 +21,39 @@ fine) and `numpy>=2`; it pins `transformers~=4.57`. The env caps
 ## Streaming, forward-only, stop-at-confirmed-end
 
 Transcription is **stream-compatible**: it never seeks to end-of-file and never
-loads the whole clip. As soon as the tracker confirms the first entry, a
-background worker (`src/utils/drill_stream.py`) reads the audio in forward
-chunks from an `AudioChunkSource` (`src/utils/audio_stream.py`), grows a buffer,
-and re-transcribes it each step. It **stops ~one confirmation chunk past the
-drill end** rather than transcribing the whole tail. If `stop_at_drill_end`
-(default), the video frame loop also stops at the located end frame.
+loads the whole clip. The speech models (Parakeet, and the denoiser if enabled)
+load before the frame loop starts, so loading never stalls the drill. As soon as
+the tracker confirms the first entry, a background worker
+(`src/utils/drill_stream.py`) reads the audio in forward chunks from an
+`AudioChunkSource` (`src/utils/audio_stream.py`), grows a buffer, and
+re-transcribes it each step. It **stops ~one confirmation chunk past the drill
+end** rather than transcribing the whole tail. If `stop_at_drill_end` (default),
+the video frame loop also stops at the located end frame.
 
 **Drill-end rule** (`DrillEndDetector` in `src/utils/drill_window.py`):
-* Fire on the **first** transcript segment in which every required word
+- The call is the **first** transcript segment in which every required word
   (`drill_window_required_words`, default `room,clear`; "room's" counts as "room") is
   spoken after the drill start.
-* Require **two consecutive passes** to hear the call at the same time (±0.5 s,
-  LocalAgreement-2), so a transient mis-hearing of "clear" cannot end the drill early.
-* End the drill at the **word that completes the call** plus the grace tail, using the
-  ASR's word timestamps. It used to end at the segment (sentence) end.
-  * Why: Parakeet draws segments by punctuation, and that changes with tiny audio
-    differences. One extra comma merged the call with 6 s of later chatter and moved the
-    drill end, and with it the wall score.
-  * Word times stay put across encodings, re-segmentation and streaming passes.
-  * Trade-off: trimmed drill clips now end 0.5 s after "clear", which can be mid-sentence.
-* Segments without word timing fall back to the segment end.
-* The same scan/select core also serves the offline `compute_drill_window`.
+- Two consecutive passes must hear the call at the same time (±0.5 s), so a one-off
+  mis-hearing of "clear" cannot end the drill early.
+- The drill ends at the **word that completes the call**, plus the grace tail. Word
+  timestamps are used because they stay put, while segment boundaries follow the ASR's
+  punctuation, which can merge the call with seconds of later speech.
+- Trimmed drill clips therefore end 0.5 s after "clear", which can be mid-sentence.
+- Segments without word timing fall back to the segment end.
+- The same rule serves the offline `compute_drill_window`.
 
 **Cut-robustness:** if the audio ends (or a live conversation is cut) before a
 confirmed "room clear", the detector reports `end_uncertain` and the pipeline
 runs to the last available frame — never crashes.
 
-**Live stream input** (vmeta location is a `udp://…` / `rtsp://…` URL — see
-[STREAMING.md](STREAMING.md)): the `AudioChunkSource` is the stream's audio
-timeline instead of an ffmpeg file reader. Audio is split from the same
-MPEG-TS as the video and placed on the video clock (t = 0 is frame 1; gaps
-become silence). `read()` blocks until the requested window has arrived and
-returns `None` once the stream has ended. Everything downstream (detector,
-LocalAgreement, frame math, sidecars) is unchanged. `streaming_transcription:
-false` is overridden for streams, because the whole audio isn't available up
-front.
+**Live stream input** (the vmeta location is a `udp://…` / `rtsp://…` URL; see
+[STREAMING.md](STREAMING.md)): the audio comes from the stream instead of an
+ffmpeg file reader. It is split from the same MPEG-TS as the video and placed on
+the video clock (t = 0 is frame 1; gaps become silence). Reads wait until the
+audio has arrived and report the end once the stream has ended; everything after
+that is unchanged. `streaming_transcription: false` is ignored for streams,
+because the whole audio isn't available up front.
 
 ## Optional denoise
 

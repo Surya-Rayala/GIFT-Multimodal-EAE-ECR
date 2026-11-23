@@ -498,6 +498,8 @@ The Output Folder is where generated outputs are written (videos, logs, metrics,
 
 Every artifact is named from the vmeta **title** — `{title}_Analysis.json`, `{title}_Tracking_Overlays.mp4`, `{title}_Metrics.csv`, … — never from the video's file name or URL. The title is made filesystem-safe first (path separators and characters Windows forbids become `_`, whitespace becomes `_`; e.g. `Iguana Run 3: A/B` → `Iguana_Run_3_A_B`). If two vmetas in one request share a title and output folder, the second gets `_2`, and so on. Without a title the video's file stem is used (for a stream, the vmeta file name minus GIFT's `stream-` prefix).
 
+Re-running a session into the same folder replaces that run's files first, so nothing from the previous run is left mixed in. Instructor adjustments (`{title}_AnalysisOverrides.json`) are kept.
+
 ### `.vmeta.xml` format
 
 The engine is driven by a **Vmeta** file (`.vmeta.xml`). This XML contains metadata about a single session/video and points the engine to:
@@ -749,8 +751,12 @@ python run_engine_local.py <path/to/session.vmeta.xml> [options]
 #### Notes
 
 - For legal reasons, example `.vmeta.xml` files are not included in the repository.
-- Processing may take some time; a progress bar is displayed during execution.
+- The terminal shows one progress line (frames, video time, speed; for a stream, how far
+  processing is behind live) and short milestones above it: first entry, drill end,
+  drill window, then the final scores.
 - Outputs (videos/logs/metrics) are written to `--output_path` (default: `output/`).
+- For a live stream, point the vmeta location at the stream URL; see
+  [STREAMING.md](STREAMING.md) for how to try it with a recorded video.
 
 #### Constrained machines (laptops) and the streaming ASR
 

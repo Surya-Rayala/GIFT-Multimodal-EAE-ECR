@@ -1,7 +1,9 @@
 import json
 import logging
 import os
+import sys
 import threading
+import time
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,6 +15,8 @@ warnings.filterwarnings(
     message="Failed to load image Python extension.*",
     category=UserWarning,
 )
+# The vendored tracker imports the deprecated pkg_resources at import time.
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated.*", category=UserWarning)
 
 import cv2
 import numpy as np
@@ -24,6 +28,12 @@ from tqdm import tqdm
 
 from libs.Track import OCSORT
 from libs.Track.processing.utils import load_entry_polygons, load_pixel_mapper
+from loguru import logger as _track_logger
+
+# The vendored tracker logs through loguru at INFO (e.g. "Updated max
+# observations"); keep only its errors so the terminal stays readable.
+_track_logger.remove()
+_track_logger.add(sys.stderr, level="ERROR")
 from src.helper_functions import (
     annotate_camera_videos_combined,
     annotate_map_pod_video,
@@ -96,6 +106,83 @@ def _file_frames(vs: "cv2.VideoCapture", frame_total: int):
         if not ret or frame is None:
             return
         yield frame_num, frame, None
+
+
+# Files a run writes as ``{basename}<suffix>``. A re-run into the same folder
+# removes them first, so nothing a run does not regenerate (no entry → no
+# transcript, no POD → no POD images, overlays switched off) is left behind to
+# be shown with the new results. Instructor edits
+# (``_AnalysisOverrides.json``) and stream files (handled by the stream
+# session) are not in the list.
+_RUN_ARTIFACT_SUFFIXES = (
+    "_Analysis.json", "_DrillWindow.json", "_Transcription.json", "_denoised.wav",
+    "_prepass_audio.wav", "_Metrics.csv", "_RunMetadata.json", "_TrackerOutput.json",
+    "_PositionCache.txt", "_GazeCache.txt", "_OrientationCache.txt", "_PodCache.txt",
+    "_PodOrientation.json", "_RoomCoverageCache.txt", "_ThreatClearanceCache.txt",
+    "_POD_Sectors.png", "_POD_CameraFrame.png",
+    "_Tracking_Overlays.mp4", "_Tracking_Map.mp4", "_Tracking_Map_Orientation.mp4",
+    "_Tracking_WithClearance.mp4", "_Tracking_PodAreas.mp4", "_Tracking_PodAreasWithTrails.mp4",
+    "_Clearance_Callouts.mp4", "_Gaze_Triangles.mp4", "_Gaze_Map.mp4", "_Gaze_MapCleared.mp4",
+    "_Pose3D_Skeletons.mp4",
+)
+
+
+def _clear_previous_run(output_dir: str, basename: str) -> None:
+    removed = 0
+    for suffix in _RUN_ARTIFACT_SUFFIXES:
+        try:
+            os.remove(os.path.join(output_dir, f"{basename}{suffix}"))
+            removed += 1
+        except OSError:
+            pass
+    if removed:
+        logging.info("Removed %d artifact(s) of a previous %s run in %s.", removed, basename, output_dir)
+
+
+def _say(msg: str) -> None:
+    """One line of run progress, printed above an active progress bar rather
+    than through it."""
+    tqdm.write(msg, file=sys.stderr)
+
+
+def _elapsed(sec: float) -> str:
+    m, s = divmod(int(round(sec)), 60)
+    return f"{m}m {s:02d}s" if m else f"{s}s"
+
+
+class _FrameProgress:
+    """The frame loop's one terminal line: frames, media time and processing
+    speed, and for a live stream how far processing runs behind what has
+    arrived (the stream is buffered to disk, so falling behind loses nothing)."""
+
+    def __init__(self, frames, *, title: str, total: Optional[int], fps: float, stream=None) -> None:
+        self.fps = float(fps or 30.0)
+        self.stream = stream
+        self.bar = tqdm(frames, total=total, desc=title, unit=" frames",
+                        dynamic_ncols=True, mininterval=0.5, file=sys.stderr)
+
+    def __iter__(self):
+        return iter(self.bar)
+
+    def update(self, frame_num: int) -> None:
+        if frame_num % 15:
+            return
+        t = frame_num / self.fps
+        info = f"t={t:.1f}s"
+        if self.stream is not None:
+            received = self.stream.timeline.duration_sec
+            if received > 0:
+                info += f", {max(0.0, received - t):.1f}s behind live"
+        self.bar.set_postfix_str(info, refresh=False)
+
+    def close(self, frames_done: int, finished: bool) -> None:
+        self.bar.n = frames_done  # a break skips counting the last frame
+        if finished and self.bar.total and self.bar.n < self.bar.total:
+            # Stopped at the drill end, or the container counted frames its
+            # edit list drops: nothing is left to do, so show it complete.
+            self.bar.total = self.bar.n
+        self.bar.refresh()
+        self.bar.close()
 
 
 def _read_json(path: str) -> Dict[str, Any]:
@@ -797,6 +884,8 @@ class ProcessingEngine:
         if ingest is None:
             ingest = StreamIngest(url, output_path, config["output_basename"], config).start()
         self.stream = ingest
+        _say(f"{config['output_basename']}: waiting for the stream on {redact_url(url)} "
+             f"(up to {ingest.settings.connect_timeout_sec:.0f} s)...")
         try:
             info = ingest.probe()
         except StreamError as exc:
@@ -813,6 +902,9 @@ class ProcessingEngine:
                 "Stream frame rate %.3f differs from the config's frame_rate %.3f; "
                 "all frame/time conversions use the stream's rate.", fps, float(cfg_fps),
             )
+        size = info.get("source_size") or ["?", "?"]
+        _say(f"  receiving {size[0]}x{size[1]} at {fps:.2f} fps "
+             f"(rate from {str(info.get('fps_source') or 'fallback').replace('_', ' ')})")
         config["stream_info"] = info
         config["frame_rate"] = fps
         config["frame_time"] = int((1 / fps) * 1000)
@@ -941,6 +1033,11 @@ class ProcessingEngine:
         self.video_basename = config.get("output_basename") or safe_basename(
             config.get("title") or os.path.splitext(os.path.basename(config["video_path"]))[0]
         )
+        _clear_previous_run(self.output_directory, self.video_basename)
+        run_t0 = time.monotonic()
+        if not is_stream:
+            _say(f"{self.video_basename}: {config['video_path']} "
+                 f"({frame_total} frames at {float(config.get('frame_rate') or 0):.2f} fps)")
 
         role = config.get("role") or "trainee"
         title = config.get("title") or self.video_basename
@@ -1093,6 +1190,37 @@ class ProcessingEngine:
                     "transcription during the frame loop."
                 )
 
+        def _build_speech_models():
+            from .utils.asr_session import build_session
+            session = build_session(config)
+            session.load()
+            denoise_session = None
+            if bool(config.get("enable_denoise", False)):
+                try:
+                    from .utils.denoise import DenoiseSession
+                    denoise_session = DenoiseSession(
+                        model_name="dns48",
+                        dry=float(config.get("denoise_dry", 0.5)),
+                        device=config.get("denoise_device") or config.get("transcription_device", "cpu"),
+                    )
+                    denoise_session.load()
+                except Exception:
+                    logging.warning("Denoise session init failed; continuing without denoise.", exc_info=True)
+                    denoise_session = None
+            return session, denoise_session
+
+        # The drill-end locator's speech models load now, before the frame
+        # loop. Loaded at the first entry (as before), their ~6 s of CPU and
+        # Python work ran in the middle of the drill and stalled the frame loop
+        # for up to half a second per frame. A stream keeps buffering meanwhile.
+        speech_models: Dict[str, Any] = {}
+        if run_locator and prepass_sidecar is None:
+            _say("  loading the speech model...")
+            try:
+                speech_models["asr"], speech_models["denoise"] = _build_speech_models()
+            except Exception:
+                logging.warning("Speech model preload failed; retrying at the first entry.", exc_info=True)
+
         def _locate_drill_end(entry_frame: int) -> None:
             if prepass_sidecar is not None:
                 # Static-video mode: the full transcript already exists —
@@ -1122,21 +1250,10 @@ class ProcessingEngine:
             # the standard Transcription.json sidecar from the accumulated
             # segments. Runs in a background thread from first entry.
             try:
-                from .utils.asr_session import build_session
                 from .utils.drill_stream import locate_drill_end_streaming
-                session = build_session(config)
-                denoise_session = None
-                if bool(config.get("enable_denoise", False)):
-                    try:
-                        from .utils.denoise import DenoiseSession
-                        denoise_session = DenoiseSession(
-                            model_name="dns48",
-                            dry=float(config.get("denoise_dry", 0.5)),
-                            device=config.get("denoise_device") or config.get("transcription_device", "cpu"),
-                        )
-                    except Exception:
-                        logging.warning("Denoise session init failed; continuing without denoise.", exc_info=True)
-                        denoise_session = None
+                session, denoise_session = speech_models.pop("asr", None), speech_models.pop("denoise", None)
+                if session is None:
+                    session, denoise_session = _build_speech_models()
                 try:
                     res = locate_drill_end_streaming(
                         source_path=config["video_path"],
@@ -1210,11 +1327,13 @@ class ProcessingEngine:
         last_instances: Optional[list] = None
         loop_stop_reason: Optional[str] = None
         stream_settings = stream.settings if is_stream else None
+        progress = _FrameProgress(frame_iter, title=self.video_basename, total=frame_total,
+                                  fps=fps_cfg, stream=stream)
+        end_announced = False
 
-        for frame_num, frame, frame_meta in tqdm(
-            frame_iter, total=frame_total, desc="Processing frames", unit="frame",
-        ):
+        for frame_num, frame, frame_meta in progress:
             processed_frames += 1
+            progress.update(frame_num)
 
             if frame_meta is not None and frame_meta.duplicate and last_instances is not None:
                 instances = last_instances
@@ -1427,6 +1546,8 @@ class ProcessingEngine:
                 if any(o.get("is_entry") or o.get("birth_location") == "entry"
                        for o in frame_objects):
                     first_entry_frame_live = frame_num
+                    _say(f"  first entry at {(frame_num - 1) / fps_cfg:.2f} s (frame {frame_num})"
+                         + (" - listening for the clearance call" if run_locator else ""))
                     if run_locator and end_locator_thread is None:
                         end_locator_thread = threading.Thread(
                             target=_locate_drill_end,
@@ -1450,6 +1571,13 @@ class ProcessingEngine:
                 )
                 loop_stop_reason = "max_frames_after_first_entry"
                 break
+            if not end_announced and end_locator_done.is_set():
+                end_announced = True
+                _w = end_locator_result.get("window")
+                if _w is not None and not _w.end_uncertain:
+                    _word = (_w.end_anchor or {}).get("word")
+                    _say(f"  drill end at {int(_w.end_frame) / fps_cfg:.2f} s (frame {int(_w.end_frame)})"
+                         + (f', on "{_word}"' if _word else ""))
             if stop_at_end and end_locator_done.is_set():
                 _w = end_locator_result.get("window")
                 if (_w is not None and not _w.end_uncertain
@@ -1481,9 +1609,25 @@ class ProcessingEngine:
                         loop_stop_reason = "max_after_entry"
                         break
 
+        progress.close(processed_frames, finished=loop_stop_reason in (None, "drill_end"))
+        _say({
+            "drill_end": "  stopped at the drill end",
+            "max_frames_after_first_entry": "  stopped: max_frames_after_first_entry reached",
+            "max_duration": "  stopped: stream_max_duration_sec reached",
+            "max_after_entry": "  stopped: no drill end within stream_max_after_entry_sec",
+        }.get(loop_stop_reason, "  stream ended" if is_stream else "  end of video"))
         if vs is not None:
             vs.release()
         self._release_inferencer()
+        if end_locator_thread is None:
+            # No entry, so the preloaded speech models were never used.
+            for unused in speech_models.values():
+                if unused is not None:
+                    try:
+                        unused.close()
+                    except Exception:
+                        pass
+            speech_models.clear()
 
         stream_report: Optional[Dict[str, Any]] = None
         if is_stream:
@@ -1608,6 +1752,10 @@ class ProcessingEngine:
                 drill_window.decision_reason += (
                     "; clamped_to_stream_end" if is_stream else "; clamped_to_last_frame")
 
+        _dw0, _dw1 = int(drill_window.start_frame), int(drill_window.end_frame)
+        _say(f"  drill window: frames {_dw0}-{_dw1} ({(_dw0 - 1) / fps:.1f}-{_dw1 / fps:.1f} s)"
+             + (f", end uncertain ({drill_window.decision_reason.split(';')[0]})"
+                if drill_window.end_uncertain else ""))
         save_drill_window_sidecar(
             drill_window,
             output_directory=self.output_directory,
@@ -1718,6 +1866,7 @@ class ProcessingEngine:
             )
 
         # ------------------------------------------------------------------
+        _say("  writing videos...")
         # Camera-view overlays — all enabled overlays are drawn in ONE decode
         # pass over the source video (decode dominates annotation cost).
         # ``keypoint_details``/``bbox_details`` and the threat-clearance map
@@ -2042,6 +2191,7 @@ class ProcessingEngine:
             save_threat_clearance_cache(clearance_map, self.output_directory, self.video_basename)
             context.threat_clearance = clearance_map
 
+        _say("  computing metrics...")
         metric_scores = []
         # Stash select metric instances so build_analysis_session can pull
         # per-metric extras (excursion summaries, etc.) without us having to
@@ -2222,6 +2372,7 @@ class ProcessingEngine:
 
         if is_stream:
             self.stream = None  # finalized; nothing left running
+        _say(f"  done in {_elapsed(time.monotonic() - run_t0)} -> {self.output_directory}")
         return metric_scores
 
     def get_assessment(self, timestamp, metric_name):

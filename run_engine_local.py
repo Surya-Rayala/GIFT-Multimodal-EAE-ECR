@@ -28,18 +28,14 @@ def main():
     log_level = logging.DEBUG if args.verbose else logging.ERROR
     logging.basicConfig(format='[%(levelname)s] %(asctime)s : %(message)s', level=log_level)
 
+    print("Loading models...", flush=True)
     engine = ProcessingEngine(args.force_transcode)
     status = engine.mt_initialize(None, paths, args.output_path)
     ######################################################Change End#####################################################
 
-    # engine = ProcessingEngine("tests", "models/crowdhuman.pt", False, True)
-    # status = engine.mt_initialize(None, "tests/001.vmeta.xml")
-
-    print()
-    print(status)
-    print()
+    print(f"\nResult: {status}")
     for metric in engine.metrics:
-        print(metric)
+        print(f"  {metric['metric_name']:<22} {metric['score']}")
 
 if __name__ == "__main__":
     main()
